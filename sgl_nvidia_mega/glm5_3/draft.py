@@ -2,9 +2,10 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """The GLM-5.3 NextN draft on SM103 (B300) and SM107 (Rubin): the megakernel draft spec.
 
-With slot "draft" the draft's forward runs on the plugin's draft step
-(``draft_step.FusedDraft``) inside SGLang's draft-decode and draft-extend CUDA graphs;
-otherwise it stays SGLang's. SGLang checks a draft spec at load only (its ISA, TP
+With slot "draft" the draft's forward runs on the plugin's draft step inside SGLang's
+draft-decode and draft-extend CUDA graphs: at TP8 ``draft_step.FusedDraft``, at the
+TP4 profiles the draft composed from the kernel units (``draft_units``); otherwise it
+stays SGLang's. SGLang checks a draft spec at load only (its ISA, TP
 size, decode graphs, config and environment, and ``model_disable_reasons``); the
 target spec checks the draft's server arguments at argument resolution.
 """
@@ -158,11 +159,20 @@ def _model_disable_reasons(model, hf_config) -> list[str]:
 def _build(model, hf_config, ctx):
     if "draft" not in SLOTS:
         return NoDraftStep()
+    from sgl_nvidia_mega.glm5_3.profile import Profile
+
+    profile = Profile.from_build(model, ctx)
+    if profile.units:
+        # the TP4 profiles: the draft composed from the kernel units
+        from sgl_nvidia_mega.glm5_3 import draft_units
+
+        return draft_units.build(model, profile)
     from sgl_nvidia_mega.glm5_3.draft_step import FusedDraft
 
     return FusedDraft(
         model,
-        widths=ctx.widths,
+        # the TP8 envelope's widths (the spec's max_rows also spans the TP4 profiles)
+        widths=tuple(w for w in ctx.widths if w <= MAX_ROWS),
         deadline_s=ctx.deadline_s,
         # SGLang's runtime state for the draft forward (its megakernel binding)
         binding=getattr(ctx, "binding", None),
@@ -170,8 +180,9 @@ def _build(model, hf_config, ctx):
 
 
 def _max_rows() -> int:
-    """The draft extend's widest step with slot "draft", else 0 (SGLang's forward)."""
-    return MAX_ROWS if "draft" in SLOTS else 0
+    """The draft extend's widest step with slot "draft" (the target spec's: any
+    accepted profile), else 0 (SGLang's forward)."""
+    return target.SPEC.max_rows if "draft" in SLOTS else 0
 
 
 SPEC = MegakernelSpec(

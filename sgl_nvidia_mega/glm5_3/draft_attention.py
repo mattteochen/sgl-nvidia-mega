@@ -32,7 +32,7 @@ from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import dataclass
-from typing import List, Optional
+from typing import List, NamedTuple, Optional
 
 import torch
 
@@ -227,6 +227,16 @@ class DraftAttentionGlue(AttentionGlue):
         return DraftFusedAttention(self, rows)
 
 
+class PreparedInput(NamedTuple):
+    """The draft layer's first input already through its input norm: ``norm`` (the
+    attention input) and ``residual`` (the stream's written residual), as a fused sum +
+    norm (the TP4 row-parallel eh_proj partials summed in the target's LL hop,
+    ``ll.draft``) leaves them; the layer's attention prepare is then skipped."""
+
+    norm: torch.Tensor
+    residual: torch.Tensor
+
+
 def select_rows(hidden_states: torch.Tensor, forward_batch, index: torch.Tensor):
     """Keep only the ``index`` rows of a prepared MLP input and of the residual its
     prepare wrote (slot draft_rowselect: the draft extend reads the layer output on
@@ -272,14 +282,25 @@ def decoder_layer_forward(
     prev_topk_indices: Optional[torch.Tensor] = None,
     view=None,
     ffn_rows: Optional[torch.Tensor] = None,
+    prepared: bool = False,
 ):
     """``DeepseekV2DecoderLayer.forward`` (main af856717) for the draft layer,
     with ``self.self_attn(...)`` replaced by the step group's ``forward`` and
     ``o_proj`` (``forward_absorb_core`` ends with ``self.o_proj``); ``view`` is
     the running forward's ForwardView. With ``attention`` None, SGLang's own
     ``self.self_attn(...)`` call. With ``ffn_rows`` (slot draft_rowselect), the
-    MLP and everything after it run on those rows only (``select_rows``). Returns
-    ``(hidden_states, topk_indices)`` as the stock layer does."""
+    MLP and everything after it run on those rows only (``select_rows``).
+    ``prepared``: ``hidden_states`` is already the normalized attention input and the
+    stream holds its written residual (``PreparedInput``), so the attention prepare is
+    skipped; only with an ``attention`` step group, which sets the attention inputs
+    itself. Returns ``(hidden_states, topk_indices)`` as the stock layer does."""
+    if prepared and attention is None:
+        # SGLang's self_attn reads the attention inputs that the skipped prepare sets
+        raise RuntimeError(
+            "NVIDIA megakernel: GLM-5.3 / GLM-5.2 draft: a prepared draft-layer input "
+            "(the eh_proj sum with the input norm) needs a draft attention step "
+            "group; SGLang's attention runs the layer's attention prepare"
+        )
     from sglang.srt.layers.layer_boundary import get_attn_tp_context
     from sglang.srt.layers.layer_boundary.residual import access as residual_access
     from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
@@ -287,12 +308,13 @@ def decoder_layer_forward(
     hidden_states_orig = residual_access.buffer(hidden_states)
     # The NextN forward passes no captured outputs, GEMM-output allocator or
     # next full-attention layer (its prefetch is then a no-op).
-    hidden_states = layer.attn_boundary.prepare(
-        hidden_states,
-        forward_batch,
-        capture_gathered=None,
-        quant_format=layer._resolve_gfx95_quant_format(),
-    )
+    if not prepared:
+        hidden_states = layer.attn_boundary.prepare(
+            hidden_states,
+            forward_batch,
+            capture_gathered=None,
+            quant_format=layer._resolve_gfx95_quant_format(),
+        )
     if attention is None:
         # SGLang's own attention (slot draft_rowselect at a width the draft
         # attention family does not serve); the NextN layer passes no llama-4
