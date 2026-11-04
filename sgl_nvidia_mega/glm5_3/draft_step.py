@@ -15,7 +15,10 @@ kernels inside the draft-decode and draft-extend CUDA graphs.
   one non-zero contributor; a -0 column comes out +0);
 * the draft top-1 runs as a distributed argmax over each rank's logit shard (one cooperative kernel that exchanges a
   (value, index) candidate per row through a symmetric-memory mailbox) instead of the logits all-gather; the stock
-  ``draft_topk1_postprocess`` then reads a one-hot logits row, so the token it picks is unchanged.
+  ``draft_topk1_postprocess`` then reads a one-hot logits row, so the token it picks is unchanged;
+* slot ``draft_rowselect``: in the draft extend the layer keeps only the ``select_index`` rows (one per request:
+  the rows its LM head reads) after the post-attention norm, so the MLP, its all-reduce and the final norm run on
+  one row per request (the attention still writes every row's KV and indexer key).
 
 The kernels, the derived eh_proj shard and the top-1 mailboxes are built with the draft spec. The target's build
 registers its hop kernels (with the eh gather's unit and the draft's error-record sites) under the embedding table
@@ -96,7 +99,18 @@ SGLANG_READS = {
         "mm_input_embeds",
         "contains_mm_inputs",
         "forward_mode",
+        # slot draft_rowselect: the draft extend's gate
+        "CaptureHiddenMode",
+        "return_logprob",
+        "capture_hidden_mode",
+        "num_token_non_padded",
+        "input_ids",
     ),
+    "srt/model_executor/forward_mode.py|srt/model_executor/forward_batch_info.py": (
+        "FULL",
+    ),
+    "srt/speculative/eagle_info.py|srt/speculative/*.py": ("select_index",),
+    "srt/models/deepseek_v2.py": ("DeepseekV2MoE", "_enable_a2a_moe"),
     # the replaced model's modules and its logits processor (and the residual module
     # as the NextN model imports it)
     "srt/models/deepseek_nextn.py": (
@@ -123,6 +137,7 @@ SGLANG_READS = {
         "_get_hidden_states_to_store",
         "logit_scale",
         "final_logit_softcapping",
+        "draft_extend_select_index",
         "do_tensor_parallel_all_gather_dp_attn",
         "do_tensor_parallel_all_gather",
         "use_attn_tp_group",
@@ -223,6 +238,12 @@ class FusedDraft:
         self._errors = None
         self.widths = tuple(widths)
         self.eh_rows = eh_rows(self.widths)
+        # slot draft_rowselect, decided at build (static, rank-uniform)
+        self.row_select = "draft_rowselect" in runtime.SLOTS and row_select_supported(
+            nextn.model.decoder.mlp
+        )
+        # (mode, rows) of the draft graphs whose parts rank 0 has logged
+        self._reported = set()
         # SGLang's MegakernelBinding for the draft runner (BuildContext.binding)
         self.binding = binding
         # the top-1 wait bound: TOP1_TIMEOUT_S within SGLang's wait deadline
@@ -292,6 +313,8 @@ class FusedDraft:
             f"{TOP1_DECODE_ROWS} / {TOP1_EXTEND_ROWS}; derived eh_proj shard "
             f"{self.eh_weight.numel() * 2 / 2**20:.1f} MiB; attention kernels: "
             + ("MLA prologue + extend q_a / kv_a GEMM" if self._attn_family else "no")
+            + "; draft-extend MLP on the select_index rows: "
+            + ("yes" if self.row_select else "no")
         )
 
     def _arm_attention(self, nextn) -> None:
@@ -540,10 +563,12 @@ class FusedDraft:
             return parity.run_draft(
                 self, step, original, input_ids, positions, forward_batch
             )
-        hidden_states = self.run(
+        hidden_states, metadata = self.run(
             nextn.model, input_ids, positions, forward_batch, step.view
         )
-        return draft_logits(self, nextn, input_ids, hidden_states, forward_batch)
+        return draft_logits(
+            self, nextn, input_ids, hidden_states, forward_batch, metadata
+        )
 
     def run_stock(self, step: Step, input_ids, positions, forward_batch):
         """The draft step on its stock bodies (no kernel; the parity check)."""
@@ -558,19 +583,69 @@ class FusedDraft:
         )
         return draft_logits(self, nextn, input_ids, hidden_states, forward_batch)
 
+    def extend_rows(self, forward_batch: ForwardBatch) -> Optional[torch.Tensor]:
+        """Slot draft_rowselect: ``select_index_rows`` when the slot is on and the
+        NextN MLP supports it, else None."""
+        return select_index_rows(forward_batch) if self.row_select else None
+
     def run(self, model, input_ids, positions, forward_batch: ForwardBatch, view=None):
-        """The served draft forward of an engaged step."""
-        attention = self.attention_for(int(positions.shape[0]), forward_batch, view)
-        return self.forward_steps(
-            model, input_ids, positions, forward_batch, attention, view
+        """The served draft forward of an engaged step: ``(hidden_states, metadata)``
+        for the logits (``draft_logits``). With the row select the hidden states hold
+        only the ``select_index`` rows, so ``metadata`` is the batch's LogitsMetadata
+        without the row selection (the logits processor must not select twice);
+        otherwise it is None (the forward batch's own)."""
+        rows = int(positions.shape[0])
+        attention = self.attention_for(rows, forward_batch, view)
+        ffn_rows = self.extend_rows(forward_batch)
+        hidden_states = self.forward_steps(
+            model, input_ids, positions, forward_batch, attention, view, ffn_rows
+        )
+        self._report(forward_batch, rows, attention is not None, ffn_rows)
+        if ffn_rows is None:
+            return hidden_states, None
+        from sglang.srt.layers.logits_processor import LogitsMetadata
+
+        metadata = LogitsMetadata.from_forward_batch(forward_batch)
+        metadata.draft_extend_select_index = None
+        return hidden_states, metadata
+
+    def _report(self, forward_batch, rows: int, fused_attention: bool, ffn_rows):
+        """Rank 0, once per captured draft graph (mode, rows): its attention and the
+        rows its MLP runs on (the engagement line of slot draft_rowselect)."""
+        if self.rank != 0 or not torch.cuda.is_current_stream_capturing():
+            return
+        mode = "decode" if forward_batch.forward_mode.is_decode() else "extend"
+        if (mode, rows) in self._reported:
+            return
+        self._reported.add((mode, rows))
+        mlp = (
+            f"MLP on all {rows} rows"
+            if ffn_rows is None
+            else f"MLP on the {int(ffn_rows.shape[0])} select_index rows"
+        )
+        logger.info(
+            "NVIDIA megakernel: GLM-5.3 / GLM-5.2 draft: draft %s graph, %d rows: "
+            "%s attention, %s",
+            mode,
+            rows,
+            "fused" if fused_attention else "stock",
+            mlp,
         )
 
     def forward_steps(
-        self, model, input_ids, positions, forward_batch, attention=None, view=None
+        self,
+        model,
+        input_ids,
+        positions,
+        forward_batch,
+        attention=None,
+        view=None,
+        ffn_rows=None,
     ):
         """``DeepseekModelNextN.forward`` (CUDA path) with the fused front and the sharded eh_proj (each
         stock unless engaged), and the decoder layer's attention through ``attention`` (a step group; None:
-        the stock decoder layer) on the running forward's ``view``."""
+        the stock decoder layer) on the running forward's ``view``. With ``ffn_rows`` (slot
+        draft_rowselect) the MLP and the final norm run on those rows only."""
         from sglang.kernels.ops.layernorm.fused_eh_norm import fused_eh_norm
         from sglang.srt.eplb.expert_distribution import (
             get_global_expert_distribution_recorder,
@@ -621,12 +696,13 @@ class FusedDraft:
         index_topk_share = IndexTopKShareState.from_mtp_carry(forward_batch)
         with get_global_expert_distribution_recorder().disable_this_region():
             decoder = model.decoder
-            if attention is not None:
+            if attention is not None or ffn_rows is not None:
                 decoder = partial(
                     draft_attention.decoder_layer_forward,
                     model.decoder,
                     attention,
                     view=view,
+                    ffn_rows=ffn_rows,
                 )
             hidden_states, topk_indices = decoder(
                 positions,
@@ -645,18 +721,27 @@ class FusedDraft:
         return hidden_states
 
 
-def draft_logits(fd: FusedDraft, nextn, input_ids, hidden_states, forward_batch):
+def draft_logits(
+    fd: FusedDraft, nextn, input_ids, hidden_states, forward_batch, metadata=None
+):
     """``nextn``'s logits on the draft step: SGLang's logits processor, unchanged,
     except in an engaged step that takes its plain TP logits path, where the
     LogitsProcessorOutput is built here as ``LogitsProcessor.forward`` builds it for a
     decode / draft-extend batch, with the draft top-1 served by the distributed argmax
-    (a one-hot logits row that SGLang's ``draft_topk1_postprocess`` reads unchanged)."""
+    (a one-hot logits row that SGLang's ``draft_topk1_postprocess`` reads unchanged).
+    ``metadata``: the LogitsMetadata to use instead of the forward batch's (the row
+    select's, without ``draft_extend_select_index``)."""
     from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 
     lp = nextn.logits_processor
-    meta = _plain_tp_logits(fd, lp, forward_batch)
+    meta = _plain_tp_logits(fd, lp, forward_batch, metadata)
     if meta is None:
-        return lp(input_ids, hidden_states, nextn.lm_head, forward_batch)
+        return lp(
+            input_ids,
+            hidden_states,
+            nextn.lm_head,
+            forward_batch if metadata is None else metadata,
+        )
     # LogitsProcessor.forward (main af856717) for a decode / draft-extend-v2 batch
     # without logprobs: the pruned rows (the draft extend's selected rows), the
     # hidden states it stores, then _get_logits' TP path on the pruned rows
@@ -700,11 +785,11 @@ def draft_logits(fd: FusedDraft, nextn, input_ids, hidden_states, forward_batch)
     )
 
 
-def _plain_tp_logits(fd: FusedDraft, lp, forward_batch):
-    """The batch's LogitsMetadata when an engaged draft step's logits take the plain
-    TP path that ``draft_logits`` builds (decode or draft extend v2, no logprobs or
-    scoring, no DP attention or attention-TP lm_head, no lm_head all-to-all, logit
-    scale or softcap, no autotune pass), else None."""
+def _plain_tp_logits(fd: FusedDraft, lp, forward_batch, metadata=None):
+    """The batch's LogitsMetadata (``metadata`` when given) when an engaged draft
+    step's logits take the plain TP path that ``draft_logits`` builds (decode or draft
+    extend v2, no logprobs or scoring, no DP attention or attention-TP lm_head, no
+    lm_head all-to-all, logit scale or softcap, no autotune pass), else None."""
     from sglang.srt.layers.logits_processor import (
         LogitsMetadata,
         get_in_autotune_dummy_run,
@@ -723,7 +808,11 @@ def _plain_tp_logits(fd: FusedDraft, lp, forward_batch):
         or get_in_autotune_dummy_run()
     ):
         return None
-    meta = LogitsMetadata.from_forward_batch(forward_batch)
+    meta = (
+        LogitsMetadata.from_forward_batch(forward_batch)
+        if metadata is None
+        else metadata
+    )
     if (
         not (meta.forward_mode.is_decode() or meta.forward_mode.is_draft_extend_v2())
         or meta.extend_return_logprob
@@ -731,6 +820,45 @@ def _plain_tp_logits(fd: FusedDraft, lp, forward_batch):
     ):
         return None
     return meta
+
+
+def select_index_rows(forward_batch: ForwardBatch) -> Optional[torch.Tensor]:
+    """The draft-extend row select's gate: the rows the draft's LM head reads
+    (``select_index``, one per request) when this draft-extend forward may run its MLP
+    on them alone, else None. Host-only facts, fixed per captured shape and equal on
+    every rank."""
+    from sglang.srt.model_executor.forward_batch_info import CaptureHiddenMode
+
+    if (
+        not forward_batch.forward_mode.is_draft_extend_v2()
+        or forward_batch.return_logprob
+        # LAST (the draft-extend graph) and NULL capture read only the select_index
+        # rows; FULL returns every row's hidden state
+        or forward_batch.capture_hidden_mode == CaptureHiddenMode.FULL
+        # the MoE masks padded rows by position, which a selection moves
+        or forward_batch.num_token_non_padded is not None
+    ):
+        return None
+    select_index = getattr(forward_batch.spec_info, "select_index", None)
+    if (
+        select_index is None
+        or select_index.dim() != 1
+        or forward_batch.input_ids is None
+    ):
+        return None
+    if not 0 < select_index.shape[0] < forward_batch.input_ids.shape[0]:
+        return None
+    return select_index
+
+
+def row_select_supported(mlp) -> bool:
+    """Whether the draft layer's MLP input rows are this rank's tokens in order, so a
+    draft extend may run the MLP on the rows its LM head reads alone: SGLang's NextN
+    MoE without an all-to-all dispatch (the specs already refuse DP attention, context
+    parallelism, PP and LoRA)."""
+    from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
+
+    return isinstance(mlp, DeepseekV2MoE) and not mlp._enable_a2a_moe
 
 
 def _compile(kernel, constexprs, args):

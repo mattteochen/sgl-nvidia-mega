@@ -16,7 +16,9 @@ stream; the served draft runs the fused prologue instead, and the stock bodies
 compute the same values on one stream. ``decoder_layer_forward`` is
 ``DeepseekV2DecoderLayer.forward`` (main af856717) with the attention called
 through a step group; on the stock bodies it is bitwise equal to the stock draft
-layer (the draft replica test checks it in both modes).
+layer (the draft replica test checks it in both modes). With slot
+``draft_rowselect`` it runs the MLP on the draft extend's ``select_index`` rows only
+(``select_rows``), with the attention through a step group or SGLang's own.
 
 ``DraftFusedAttention`` serves the attention family's MLA prologue in every draft
 pass and its q_a / kv_a GEMM (with the indexer key / head-gate projection) in the
@@ -55,6 +57,13 @@ SGLANG_READS = {
     "srt/layers/layer_boundary/__init__.py": ("get_attn_tp_context",),
     "srt/layers/layer_boundary/adapters/attention.py": ("clear_attn_inputs",),
     "srt/layers/layer_boundary/residual/access.py": ("buffer",),
+    # slot draft_rowselect: the residual stream of the draft forward
+    "srt/layers/layer_boundary/residual/batch.py": ("stream_of",),
+    "srt/layers/layer_boundary/residual/stream.py": (
+        "residual",
+        "pending",
+        "write",
+    ),
     "srt/layers/moe/moe_runner/base.py": ("moe_output_buffer_ctx", "inplace"),
     "srt/layers/moe/fused_moe_triton/layer.py": ("moe_runner_config",),
     # the replaced model's modules (and the residual module as the layer imports it)
@@ -76,7 +85,12 @@ SGLANG_READS = {
         "should_run_indexer",
     ),
     "srt/layers/attention/dsa_backend.py": ("cache_seqlens_int32",),
-    "srt/layers/layer_boundary/*.py": ("prepare", "finish", "exit"),
+    "srt/layers/layer_boundary/*.py": (
+        "prepare",
+        "finish",
+        "exit",
+        "input_on_attn_tp_slices",
+    ),
 }
 
 # The SGLang function bodies this module's stock steps copy, by the digest of their
@@ -213,21 +227,59 @@ class DraftAttentionGlue(AttentionGlue):
         return DraftFusedAttention(self, rows)
 
 
+def select_rows(hidden_states: torch.Tensor, forward_batch, index: torch.Tensor):
+    """Keep only the ``index`` rows of a prepared MLP input and of the residual its
+    prepare wrote (slot draft_rowselect: the draft extend reads the layer output on
+    the ``select_index`` rows only). Every later stage (the MLP, its sum, the final
+    add + norm) is row-independent, so the kept rows hold what the full-row stream
+    holds on them.
+
+    The draft-extend gate (``draft_step.select_index_rows``) admits only layouts
+    where the prepare leaves a plain tensor on every token of this rank beside a
+    written residual on the same rows; anything else is a programming error and
+    raises (on every rank alike: the layout is a static fact of the captured
+    shape)."""
+    from sglang.srt.layers.layer_boundary.residual.batch import stream_of
+
+    stream = stream_of(forward_batch)
+    residual = stream.residual
+    num_tokens = forward_batch.input_ids.shape[0]
+    if (
+        not isinstance(hidden_states, torch.Tensor)
+        or stream.pending is not None
+        or not isinstance(residual, torch.Tensor)
+        or hidden_states.shape[0] != num_tokens
+        or residual.shape[0] != num_tokens
+    ):
+        raise RuntimeError(
+            "NVIDIA megakernel: GLM-5.3 / GLM-5.2 draft: the draft-extend row select "
+            f"needs the NextN MLP input as a plain tensor on all {num_tokens} rows "
+            "beside a written residual on the same rows (got "
+            f"{type(hidden_states).__name__}, pending {stream.pending is not None}, "
+            f"residual {getattr(residual, 'shape', None)})"
+        )
+    stream.write(residual.index_select(0, index))
+    return hidden_states.index_select(0, index)
+
+
 def decoder_layer_forward(
     layer,
-    attention: AttentionStep,
+    attention: Optional[AttentionStep],
     positions: torch.Tensor,
     hidden_states: torch.Tensor,
     forward_batch,
     zero_allocator,
     prev_topk_indices: Optional[torch.Tensor] = None,
     view=None,
+    ffn_rows: Optional[torch.Tensor] = None,
 ):
     """``DeepseekV2DecoderLayer.forward`` (main af856717) for the draft layer,
     with ``self.self_attn(...)`` replaced by the step group's ``forward`` and
     ``o_proj`` (``forward_absorb_core`` ends with ``self.o_proj``); ``view`` is
-    the running forward's ForwardView. Returns ``(hidden_states, topk_indices)``
-    as the stock layer does."""
+    the running forward's ForwardView. With ``attention`` None, SGLang's own
+    ``self.self_attn(...)`` call. With ``ffn_rows`` (slot draft_rowselect), the
+    MLP and everything after it run on those rows only (``select_rows``). Returns
+    ``(hidden_states, topk_indices)`` as the stock layer does."""
     from sglang.srt.layers.layer_boundary import get_attn_tp_context
     from sglang.srt.layers.layer_boundary.residual import access as residual_access
     from sglang.srt.models.deepseek_v2 import DeepseekV2MoE
@@ -241,26 +293,49 @@ def decoder_layer_forward(
         capture_gathered=None,
         quant_format=layer._resolve_gfx95_quant_format(),
     )
-    step = DraftStepContext(
-        forward_batch=forward_batch,
-        positions=positions,
-        zero_allocator=zero_allocator,
-        view=view,
-    )
-    # The step group enters the attention's decode-TP context itself and clears
-    # the attention inputs; o_proj then runs in a second entry of that context.
-    # Stock runs both in one entry and clears after o_proj. Equivalent here: the
-    # context only acts with decode context parallelism (refused), and o_proj
-    # reads no attention input.
-    o_input, topk_indices = attention.forward(
-        layer, hidden_states, prev_topk_indices, step
-    )
-    with layer.self_attn.maybe_use_decode_attn_tp(forward_batch):
-        hidden_states, _ = layer.self_attn.o_proj(o_input)
+    if attention is None:
+        # SGLang's own attention (slot draft_rowselect at a width the draft
+        # attention family does not serve); the NextN layer passes no llama-4
+        # scaling, and decode context parallelism is refused
+        with layer.self_attn.maybe_use_decode_attn_tp(forward_batch):
+            hidden_states = layer.self_attn(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+                zero_allocator=zero_allocator,
+                llama_4_scaling=None,
+                input_on_attn_tp_slices=layer.attn_boundary.input_on_attn_tp_slices,
+                prev_topk_indices=prev_topk_indices,
+            )
+        if isinstance(hidden_states, tuple):
+            hidden_states, topk_indices = hidden_states
+        else:
+            topk_indices = None
+    else:
+        step = DraftStepContext(
+            forward_batch=forward_batch,
+            positions=positions,
+            zero_allocator=zero_allocator,
+            view=view,
+        )
+        # The step group enters the attention's decode-TP context itself and
+        # clears the attention inputs; o_proj then runs in a second entry of that
+        # context. Stock runs both in one entry and clears after o_proj.
+        # Equivalent here: the context only acts with decode context parallelism
+        # (refused), and o_proj reads no attention input.
+        o_input, topk_indices = attention.forward(
+            layer, hidden_states, prev_topk_indices, step
+        )
+        with layer.self_attn.maybe_use_decode_attn_tp(forward_batch):
+            hidden_states, _ = layer.self_attn.o_proj(o_input)
     get_attn_tp_context().clear_attn_inputs()
 
     hidden_states = layer.attn_boundary.finish(hidden_states, forward_batch)
     hidden_states = layer.ffn_boundary.prepare(hidden_states, forward_batch)
+    if ffn_rows is not None:
+        # The attention above wrote every row's KV and indexer key; only the rows
+        # the draft's LM head reads go on.
+        hidden_states = select_rows(hidden_states, forward_batch, ffn_rows)
 
     if (
         isinstance(layer.mlp, DeepseekV2MoE)

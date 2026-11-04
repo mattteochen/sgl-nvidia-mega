@@ -92,6 +92,15 @@ NUMERICS = Numerics(
         # the eh gather on the target's mailbox: the all-gather of the column shards,
         # -0 coming out +0 (test_glm5_3_hops.py)
         "draft.eh_gather.max_abs": 0.0,
+        # slot draft_rowselect: the kept rows of the stream are the full-row stream's,
+        # bit for bit (test_glm5_3_draft_rowselect.py, the selection tests) ...
+        "draft.rowselect.select.max_abs": 0.0,
+        # ... while the draft MoE and its router pick their kernels by the row count:
+        # on the rows whose routing is unchanged, BF16 accumulation-order rounding only
+        # (a wrong row is ~1), and a few top-8 near-ties may flip (the MoE test)
+        "draft.rowselect.mlp.row_rel": 2e-2,
+        "draft.rowselect.mlp.row_cos": 0.999,
+        "draft.rowselect.mlp.flip_fraction": 0.05,
     },
 )
 

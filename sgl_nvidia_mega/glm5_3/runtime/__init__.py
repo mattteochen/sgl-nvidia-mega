@@ -41,9 +41,12 @@ SHIPPED_SLOTS = (
     # the NextN draft step (built with the draft spec): the fused embedding + eh norms,
     # the sharded eh_proj, the distributed top-1 and the draft layer's MLA prologue
     "draft",
+    # the NextN draft extend runs its MLP on the rows its LM head reads (select_index,
+    # one per request), not on every verify row
+    "draft_rowselect",
 )
 # the draft's slots, which build with the draft spec
-DRAFT_SLOTS = frozenset({"draft"})
+DRAFT_SLOTS = frozenset({"draft", "draft_rowselect"})
 # A test and bisect override, not a setting: the slots to run in place of
 # SHIPPED_SLOTS, comma-separated ("" runs every step function's stock code)
 SLOTS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
@@ -52,6 +55,7 @@ SLOT_NEEDS = (
     ("qkv_a_small_m_shared", "attention"),
     ("dnorm", "qkv_a_small_m_shared"),
     ("dnorm", "hops"),
+    ("draft_rowselect", "draft"),
 )
 
 
