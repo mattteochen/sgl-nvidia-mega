@@ -17,7 +17,7 @@ The package loads as an SGLang [general plugin](https://github.com/sgl-project/s
 | DeepSeek-V4.1-Flash | GB300 (SM103) | 4 | DSpark target verify steps of 1 to 384 rows (batch 1 to 64 at 6 rows a request) |
 | Qwen3.5-397B-A17B (NVFP4) | GB300 (SM103) | 8 (two trays, one NVLink domain) | MTP target verify steps of 7 rows (batch 1) |
 | Kimi K3 (packed MXFP4) | GB300 (SM103) | 8 | One-token decode steps of 1–8, 16, 32 and 64 rows |
-| GLM-5.3, GLM-5.2 (NVFP4) | B300 / GB300 (SM103), Rubin (SM107) | 8 (one node, or two trays of one NVLink domain) | MTP target verify steps of 4 to 16 rows (batch 1 to 4 at 4 rows a request, batch 1 to 2 at 6); the NextN draft step in its captured graphs |
+| GLM-5.3, GLM-5.2 (NVFP4) | B300 / GB300 (SM103), Rubin (SM107) | 8 (one node, or two trays of one NVLink domain); 4 (one GB300 tray) | TP8: MTP target verify steps of 4 to 16 rows (batch 1 to 4 at 4 rows a request, batch 1 to 2 at 6); TP4: verify steps of up to 48 rows at 4 to 6 rows a request (batch 1 to 8 at 6); the NextN draft step in its captured graphs |
 
 For DeepSeek-V4.1-Flash and Qwen3.5, larger verify steps, prefill and extend run
 SGLang's standard path. Their draft specs provide the DSpark proposal and the
@@ -91,7 +91,9 @@ GLM-5.3 (`glm5_3/`) follows the same layout: the executor's layer loop runs the 
 | NextN draft step (`draft`) | every captured draft-decode and draft-extend graph | The draft's embedding gather + eh norms in one kernel on the replicated table (any row count), the column-sharded `eh_proj` (1–4 rows, and 8, 12 and 16 with 4 draft tokens or 6 and 12 with 6; gathered by the hops' all-reduce on the target's mailbox), the distributed top-1 in place of the logits all-gather (up to 8 rows), and the draft layer's MLA prologue (up to 16 rows); each kernel's other row counts run SGLang's code |
 | NextN draft-extend row select (`draft_rowselect`) | every captured draft-extend graph | After the draft layer's attention (which writes every row's KV and indexer key), the MLP, its all-reduce and the final norm run on the rows the draft's LM head reads (`select_index`, one per request) instead of every verify row; the kept rows are the full-row stream's bit for bit, the draft MoE then picks its kernels by the smaller row count (tolerances in `glm5_3/draft.py`) |
 
-With the megakernel on, all seven slots run; none needs to be listed. `SGLANG_NVIDIA_MEGAKERNEL_SLOTS` (comma-separated) overrides that list for tests and bisecting only; a list without a slot another needs (`dnorm` needs `qkv_a_small_m_shared` and `hops`, `qkv_a_small_m_shared` needs `attention`, `draft_rowselect` needs `draft`) stops the server at startup, naming it. Slot `draft` needs embedding replication, which the flag turns on (SGLang sets `SGLANG_ENABLE_EMBED_REPLICATION` when it is unset), greedy draft acceptance and an SGLang whose EAGLE draft graph runners run a draft spec's capture check; the server stops at startup, naming each one that is missing (an explicit `SGLANG_ENABLE_EMBED_REPLICATION=0` too).
+At TP4 (one GB300 tray, 16 attention heads per rank) the verify step's groups are composed per width from kernel units (`glm5_3/ll/`; `glm5_3/units.py` orders them per step, `glm5_3/registry.py` composes them, `glm5_3/runtime/composed.py` runs them in the executor's layer loop): the sparse MLA as flash decoding over the top-k rows (`ll.sparse_mla_fd`, up to 7 rows a wave), the attention front on the low-latency fused-A GEMM and a one-launch MLA KV half (`ll.attention`), the small-M BF16 GEMMs on PDL split-K and TGV (`ll.gemm.<role>`), the all-reduce + residual + RMSNorm hops on a plugin-owned Lamport buffer with the MoE finalize folded in (`ll.hops`), FlashInfer's TRT-LLM FP4 MoE with that deferred finalize (`ll.moe`), and in the NextN draft the row-parallel `eh_proj` summed in the target's hop (`ll.draft_eh`). Each step runs the first unit that covers its width, SGLang's step body elsewhere; a width no unit covers runs SGLang's forward, and the startup log names why ("stock at N rows: ..."). Each unit is a slot (`runtime.LL_SLOTS`); `ll.moe.alt_stream_priority` runs only when listed. A unit that covers a width but fails to build stops the server on every rank, naming its slots.
+
+With the megakernel on, all shipped slots run; none needs to be listed. `SGLANG_NVIDIA_MEGAKERNEL_SLOTS` (comma-separated) overrides that list for tests and bisecting only; a list without a slot another needs (`dnorm` needs `qkv_a_small_m_shared` and `hops`, `qkv_a_small_m_shared` needs `attention`, `draft_rowselect` needs `draft`) stops the server at startup, naming it. Slot `draft` needs embedding replication, which the flag turns on (SGLang sets `SGLANG_ENABLE_EMBED_REPLICATION` when it is unset), greedy draft acceptance and an SGLang whose EAGLE draft graph runners run a draft spec's capture check; the server stops at startup, naming each one that is missing (an explicit `SGLANG_ENABLE_EMBED_REPLICATION=0` too).
 
 ### Design
 
@@ -115,7 +117,7 @@ With the megakernel on, all seven slots run; none needs to be listed. `SGLANG_NV
 - Kimi K3: 8 x GB300 (SM103), BF16, context length 8192, TP8 and DP1,
   FP8 E4M3 KV cache with page size 64, `trtllm_mla` for prefill and decode,
   `flashinfer_mxfp4` with default precision, and full decode CUDA graphs
-- GLM-5.3, GLM-5.2: 8 x B300, or 8 GPUs over two trays of one NVLink domain (GB300 NVL72, Rubin VR NVL72)
+- GLM-5.3, GLM-5.2: 8 x B300, or 8 GPUs over two trays of one NVLink domain (GB300 NVL72, Rubin VR NVL72), or 4 x GB300 (TP4)
 
 ### Installation
 
@@ -183,9 +185,9 @@ Every GLM-5.3 slot runs with `--enable-nvidia-megakernel` alone; no slot list an
 
 On two trays (GB300 NVL72, Rubin VR NVL72), launch the same command on each tray with `--nnodes 2 --node-rank <0|1> --dist-init-addr <tray-0 host>:<port>`. The covered steps need SGLang's FlashInfer all-reduce + RMSNorm fusion at verify sizes, which needs NVLink multicast; on nodes without it, set `SGLANG_NVIDIA_MEGAKERNEL_GLM_ALLOW_NO_AR_FUSION=1`: the covered steps then run anyway, the stock residual steps on SGLang's unfused all-reduce and slot `hops` on its own symmetric-memory all-reduce.
 
-The GLM-5.3 megakernel serves MTP with 3 draft steps (`--speculative-num-steps 3 --speculative-num-draft-tokens 4`, as above) or 5 (`--speculative-num-steps 5 --speculative-num-draft-tokens 6`); any other draft length stops the server at startup, naming the served values.
+The GLM-5.3 megakernel serves MTP with 3 draft steps (`--speculative-num-steps 3 --speculative-num-draft-tokens 4`, as above) or 5 (`--speculative-num-steps 5 --speculative-num-draft-tokens 6`) at TP8, and 2 to 5 draft steps at TP4 (`--tp-size 4`); any other draft length stops the server at startup, naming the served values.
 
-The GLM-5.3 megakernel covers verify steps of up to 16 rows: 1 to 4 requests with 4 draft tokens, 1 or 2 with 6; larger steps run SGLang's path while its derived weight copies (about 20 GiB per GPU, logged at startup) still take KV-cache memory, so it helps little on high-concurrency servers, and the server warns when `--max-running-requests` is set above 8.
+At TP8 the GLM-5.3 megakernel covers verify steps of up to 16 rows: 1 to 4 requests with 4 draft tokens, 1 or 2 with 6 (at TP4 up to 48 rows); larger steps run SGLang's path while its derived weight copies (about 20 GiB per GPU, logged at startup) still take KV-cache memory, so it helps little on high-concurrency servers, and the server warns when `--max-running-requests` is set above 8.
 
 ## Repository Structure
 

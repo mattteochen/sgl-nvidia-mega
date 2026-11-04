@@ -16,6 +16,10 @@ Stated limits of this spec:
 * The first capture of each width checks, on every rank, that SGLang's attention
   takes the branches the stock step copies; a reason on any rank stops every rank
   (``runtime/executor.py``).
+* TP4 at 3-6 tokens per request, up to 48 rows (``profile.UNITS``), runs the kernel
+  units composed per width (``runtime/composed.py``, ``registry``, ``units``); a width
+  no unit covers runs SGLang's forward. TP8 serves 4 or 6 tokens per request up to 16
+  rows (``plan.py``).
 """
 
 from __future__ import annotations
@@ -39,8 +43,11 @@ except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
         Requirements,
     )
 
-from sgl_nvidia_mega.glm5_3 import HF_CONFIG, MODEL_TYPE, TP_SIZE
-from sgl_nvidia_mega.glm5_3.plan import MAX_ROWS, SERVED_TOKENS_PER_REQUEST
+from sgl_nvidia_mega.glm5_3 import HF_CONFIG, MODEL_TYPE, ll
+from sgl_nvidia_mega.glm5_3.plan import MAX_ROWS
+from sgl_nvidia_mega.glm5_3.profile import ACCEPTED
+from sgl_nvidia_mega.glm5_3.profile import MAX_ROWS as SPEC_MAX_ROWS
+from sgl_nvidia_mega.glm5_3.profile import profile_reasons
 from sgl_nvidia_mega.glm5_3.runtime import SLOTS, parity
 from sgl_nvidia_mega.glm5_3.sm103.hop.constants import CLUSTER, TIMEOUT_NS
 
@@ -155,12 +162,14 @@ SERVER_ARGS = {
     "expert_distribution_recorder_mode": frozenset({None}),
     "moe_dp_size": frozenset({None, 1}),
     "dp_size": frozenset({None, 1}),
-    # MTP / EAGLE with top-1 drafts of 3 or 5 steps: verify steps of 4 or 6 rows a
-    # request (plan.SERVED_TOKENS_PER_REQUEST; NEXTN resolves to EAGLE)
+    # MTP / EAGLE with top-1 drafts: verify steps of tokens = steps + 1 rows a
+    # request, at an accepted (TP size, tokens) pair (profile.ACCEPTED: TP8 at 4 or 6
+    # tokens, TP4 at 3-6; the pair is checked in _config_disable_reasons; NEXTN
+    # resolves to EAGLE)
     "speculative_algorithm": frozenset({"EAGLE", "NEXTN"}),
     "speculative_eagle_topk": frozenset({1}),
-    "speculative_num_draft_tokens": frozenset(SERVED_TOKENS_PER_REQUEST),
-    "speculative_num_steps": frozenset(t - 1 for t in SERVED_TOKENS_PER_REQUEST),
+    "speculative_num_draft_tokens": frozenset(t for _, t in ACCEPTED),
+    "speculative_num_steps": frozenset(t - 1 for _, t in ACCEPTED),
     "speculative_adaptive": frozenset(_OFF),
     "enable_multi_layer_eagle": frozenset(_OFF),
     # layouts and communication variants that change the verify step's op sequence
@@ -217,9 +226,11 @@ def decode_graph_backends() -> frozenset:
 
 
 REQUIREMENTS = Requirements(
-    # B300 / GB300 (SM103) and Rubin / VR NVL72 (SM107): the same kernels
+    # B300 / GB300 (SM103) and Rubin / VR NVL72 (SM107): the same kernels (the TP4
+    # kernel units are measured and served on SM103 only: on SM107 a TP4 build serves
+    # no width and stops, naming them)
     isas=frozenset({"sm_103", "sm_107"}),
-    tp_sizes=frozenset({TP_SIZE}),
+    tp_sizes=frozenset(tp for tp, _ in ACCEPTED),
     resident_blocks=RESIDENT_BLOCKS,
     dtypes=frozenset({"bfloat16"}),
     decode_graph_backends=decode_graph_backends(),
@@ -293,6 +304,8 @@ TOLERANCES = {
     # normed fold bit for bit (test_glm5_3_hops.py)
     "dnorm.qkv_a.gemm_bound": 2**-12,
     "dnorm.block_sums.max_abs": 0.0,
+    # the TP4 kernel units' named tolerances (each commented with its test)
+    **ll.tolerances(),
 }
 # the keys of slot dnorm, declared only when it runs (SLOTS_ENV can leave it out)
 DNORM_KEYS = ("dnorm.qkv_a.gemm_bound", "dnorm.block_sums.max_abs")
@@ -421,7 +434,7 @@ def _config_disable_reasons(cfg, hf_config) -> list[str]:
     from sgl_nvidia_mega.glm5_3 import runtime
 
     reasons = toolchain_reasons() + binding_reasons() + runtime.slot_reasons()
-    reasons += draft_capture_reasons() + deadline_reasons(cfg)
+    reasons += draft_capture_reasons() + deadline_reasons(cfg) + profile_reasons(cfg)
     if (
         cfg.cuda_graph_config.decode.backend == "disabled"
         and not parity.eager_steps_allowed()
@@ -459,8 +472,9 @@ SPEC = MegakernelSpec(
         }
     ),
     numerics=NUMERICS,
-    # whole requests up to 16 verify rows (plan.supported_rows)
-    max_rows=MAX_ROWS,
+    # the widest verify step of any accepted profile: whole requests up to 16 verify
+    # rows at TP8 (plan.supported_rows), up to 48 at TP4 (profile.UNITS)
+    max_rows=SPEC_MAX_ROWS,
     build=_build,
     api_version=API_VERSION,
     model_disable_reasons=_model_disable_reasons,
