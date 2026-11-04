@@ -66,6 +66,18 @@ def _requested_slots() -> frozenset:
 
 SLOTS = _requested_slots()
 
+# Opt-in for nodes without NVLink multicast, where SGLang's FlashInfer all-reduce +
+# RMSNorm fusion does not apply: the covered steps run anyway, the stock residual
+# steps on SGLang's unfused all-reduce (what its boundaries run there) and slot
+# ``hops`` on its own symmetric-memory all-reduce
+ALLOW_NO_AR_FUSION_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_ALLOW_NO_AR_FUSION"
+
+
+def ar_fusion_ok(applies, rows: int) -> bool:
+    """SGLang's FlashInfer all-reduce fusion applies at ``rows``
+    (``flashinfer_ar_fusion_applies``), or ``ALLOW_NO_AR_FUSION_ENV`` is 1."""
+    return applies(rows) or os.environ.get(ALLOW_NO_AR_FUSION_ENV, "0") == "1"
+
 
 def slot_reasons() -> List[str]:
     """Why the requested slots cannot be served ([] when they can)."""
@@ -343,10 +355,11 @@ def model_disable_reasons(model) -> List[str]:
     # boundaries use at verify sizes.
     if uses_cutedsl_ar_fusion():
         reasons.append("the CuTe DSL all-reduce fusion backend is not supported")
-    elif not flashinfer_ar_fusion_applies(MAX_ROWS):
+    elif not ar_fusion_ok(flashinfer_ar_fusion_applies, MAX_ROWS):
         reasons.append(
             "requires the FlashInfer all-reduce + RMSNorm fusion at verify sizes "
-            "(--flashinfer-allreduce-fusion-backend not disabled)"
+            "(--flashinfer-allreduce-fusion-backend not disabled; without NVLink "
+            f"multicast set {ALLOW_NO_AR_FUSION_ENV}=1)"
         )
     if getattr(mm, "llama_4_scaling_config", None) is not None:
         reasons.append("llama-4 attention scaling is not supported")

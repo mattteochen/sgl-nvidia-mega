@@ -4,7 +4,7 @@
 # python/sglang/srt/models/deepseek_nextn.py (DeepseekModelNextN.forward),
 # python/sglang/srt/layers/logits_processor.py (LogitsProcessor.forward and _get_logits: the decode / draft-extend
 # path and its TP logits gather).
-"""The GLM-5.3 NextN draft step (slot ``draft``; SM103, TP8, MTP topk 1): CuTe DSL
+"""The GLM-5.3 NextN draft step (slot ``draft``; SM103 / SM107, TP8, MTP topk 1): CuTe DSL
 kernels inside the draft-decode and draft-extend CUDA graphs.
 
 * the embedding gather and the two eh RMSNorms run as one kernel on the replicated embedding table (needs

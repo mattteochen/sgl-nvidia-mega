@@ -3,7 +3,7 @@
 """GLM-5.3 (NVFP4) megakernel: its spec, the setups it serves (``spec``), the step
 groups per width (``plan``), the build and the executor of a covered MTP verify step
 (``runtime``), the step code per package (``attention``, ``boundary``, ``moe``,
-``logits``), and the SM103 (B300) CuTe DSL kernels (``sm103``).
+``logits``), and the CuTe DSL kernels (``sm103``; they also serve SM107, Rubin).
 
 GLM-5.2 has the same architecture and the same value of every config field the specs
 pin (``HF_CONFIG``), so they serve it as well."""

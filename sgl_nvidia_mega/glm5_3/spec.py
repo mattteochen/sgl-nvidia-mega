@@ -49,6 +49,7 @@ SGLANG_READS = {
     "kernels/plugin_kernels/nvidia/spec.py|srt/megakernels/spec.py": (
         "Feature",
         "SPECULATIVE_DECODING",
+        "MULTI_NODE_TP",
         "KV_OFFLOAD",
         "MegakernelSpec",
         "Numerics",
@@ -216,7 +217,8 @@ def decode_graph_backends() -> frozenset:
 
 
 REQUIREMENTS = Requirements(
-    isas=frozenset({"sm_103"}),
+    # B300 / GB300 (SM103) and Rubin / VR NVL72 (SM107): the same kernels
+    isas=frozenset({"sm_103", "sm_107"}),
     tp_sizes=frozenset({TP_SIZE}),
     resident_blocks=RESIDENT_BLOCKS,
     dtypes=frozenset({"bfloat16"}),
@@ -446,9 +448,16 @@ def _build(model, hf_config, ctx):
 SPEC = MegakernelSpec(
     name="GLM-5.3 / GLM-5.2",
     requires=REQUIREMENTS,
-    # MTP verify steps, also when serving with HiCache (KV offload: the covered steps
-    # read only the running requests' device KV pages)
-    features=frozenset({Feature.SPECULATIVE_DECODING, Feature.KV_OFFLOAD}),
+    features=frozenset(
+        {
+            # MTP verify steps
+            Feature.SPECULATIVE_DECODING,
+            # TP8 spans the two 4-GPU trays of one NVL72 rack (GB300, Rubin)
+            Feature.MULTI_NODE_TP,
+            # HiCache: the covered steps read only the running requests' device KV pages
+            Feature.KV_OFFLOAD,
+        }
+    ),
     numerics=NUMERICS,
     # whole requests up to 16 verify rows (plan.supported_rows)
     max_rows=MAX_ROWS,
