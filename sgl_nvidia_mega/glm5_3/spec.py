@@ -20,6 +20,8 @@ Stated limits of this spec:
   units composed per width (``runtime/composed.py``, ``registry``, ``units``); a width
   no unit covers runs SGLang's forward. TP8 serves 4 or 6 tokens per request up to 16
   rows (``plan.py``).
+* PD disaggregation is served at the TP4 profiles' decode role (``pd_reasons``); the
+  prefill role runs without the flag.
 """
 
 from __future__ import annotations
@@ -58,6 +60,7 @@ SGLANG_READS = {
         "SPECULATIVE_DECODING",
         "MULTI_NODE_TP",
         "KV_OFFLOAD",
+        "PD_DISAGGREGATION",
         "MegakernelSpec",
         "Numerics",
         "NumericsKind",
@@ -430,11 +433,29 @@ def deadline_reasons(cfg) -> list[str]:
     return []
 
 
+def pd_reasons(cfg) -> list[str]:
+    """PD disaggregation is served at the TP4 kernel-unit profiles (their decode
+    role: KV arrives through the transfer backend into pool slots before a request's
+    first verify step, outside the covered step); the TP8 envelope keeps it
+    refused."""
+    from sgl_nvidia_mega.glm5_3.profile import UNITS, tokens_per_request
+
+    mode = getattr(cfg, "disaggregation_mode", None) or "null"
+    tp = int(getattr(cfg, "tp_size", None) or 1)
+    if mode == "null" or (tp, tokens_per_request(cfg)) in UNITS:
+        return []
+    return [
+        f"PD disaggregation ({mode} role) is served at the TP4 profiles only, not at "
+        f"TP{tp}"
+    ]
+
+
 def _config_disable_reasons(cfg, hf_config) -> list[str]:
     from sgl_nvidia_mega.glm5_3 import runtime
 
     reasons = toolchain_reasons() + binding_reasons() + runtime.slot_reasons()
     reasons += draft_capture_reasons() + deadline_reasons(cfg) + profile_reasons(cfg)
+    reasons += pd_reasons(cfg)
     if (
         cfg.cuda_graph_config.decode.backend == "disabled"
         and not parity.eager_steps_allowed()
@@ -469,6 +490,8 @@ SPEC = MegakernelSpec(
             Feature.MULTI_NODE_TP,
             # HiCache: the covered steps read only the running requests' device KV pages
             Feature.KV_OFFLOAD,
+            # the TP4 decode role of a PD-disaggregated deployment (pd_reasons)
+            Feature.PD_DISAGGREGATION,
         }
     ),
     numerics=NUMERICS,

@@ -88,9 +88,10 @@ def reasons(c, isa="sm_103"):
         cfg(8, 6, nnodes=2, enable_hierarchical_cache=True),  # tp8-c1 (2 trays)
         cfg(4, 5, enable_hierarchical_cache=True),  # tp4-c1
         cfg(4, 6),  # the decode role's TP4 5/1/6, standalone
+        cfg(4, 6, disaggregation_mode="decode"),  # 1p5d-c30 / 1p3d-c40 decode
         cfg(4, 4),
     ],
-    ids=["tp8-3-1-4", "tp8-c1", "tp4-c1", "tp4-5-1-6", "tp4-3-1-4"],
+    ids=["tp8-3-1-4", "tp8-c1", "tp4-c1", "tp4-5-1-6", "pd-decode", "tp4-3-1-4"],
 )
 def test_accepted(c):
     assert reasons(c) == []
@@ -110,7 +111,8 @@ def test_accepted(c):
         (cfg(8, 6, steps=3), "--speculative-num-steps"),
         (cfg(8, 3), "TP8 with 3 tokens per request is not served"),
         (cfg(8, 5), "TP8 with 5 tokens per request is not served"),
-        (cfg(4, 6, disaggregation_mode="decode"), "PD disaggregation"),
+        (cfg(8, 6, disaggregation_mode="decode"), "served at the TP4 profiles only"),
+        (cfg(4, 6, disaggregation_mode="prefill", tp_size=1, pp_size=4), "pipeline"),
     ],
     ids=[
         "dep8",
@@ -121,7 +123,8 @@ def test_accepted(c):
         "steps",
         "tp8-3-tokens",
         "tp8-5-tokens",
-        "pd-decode",
+        "pd-decode-tp8",
+        "prefill",
     ],
 )
 def test_refused(c, needle):
@@ -155,7 +158,7 @@ def test_spec_constants():
         glm.NUMERICS.tolerances
     )
     names = {f.name for f in glm.SPEC.features}
-    assert {"KV_OFFLOAD", "MULTI_NODE_TP"} <= names
+    assert {"KV_OFFLOAD", "MULTI_NODE_TP", "PD_DISAGGREGATION"} <= names
     assert "DP_ATTENTION" not in names
     # every unit is a slot (units.KNOWN; the draft front is the draft slot)
     from sgl_nvidia_mega.glm5_3 import units

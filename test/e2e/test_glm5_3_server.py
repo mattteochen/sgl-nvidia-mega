@@ -19,6 +19,11 @@ and every load-back request must hit host. The switch-on outputs are not SGLang'
 bitwise (the fused kernels have their own numerics), so the switch-on vs switch-off
 agreement is printed, not asserted.
 
+``TestGlm53PDDecode``: a running 1P1D disaggregated deployment
+(``SGLANG_NVIDIA_MEGAKERNEL_E2E_PD_URL``, its router) whose decode role runs the switch
+and whose prefill role does not. GSM8K through the router, the decode log engages, the
+prefill log does not, and neither log has a NIXL transfer error.
+
 ``SGLANG_NVIDIA_MEGAKERNEL_E2E_URL`` runs the GSM8K check against a server that is
 already up, so the same check also scores the switch-off arm.
 """
@@ -28,6 +33,7 @@ from __future__ import annotations
 import os
 import re
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 
 import requests
@@ -59,6 +65,11 @@ UNITS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_SLOTS"
 ACTIVE = "NVIDIA megakernel: active ("
 GRAPHS = re.compile(
     r"NVIDIA megakernel: .+? runs the decode graphs of batch sizes \[([\d, ]*)\]"
+)
+# worker-log signatures of a failed NIXL KV transfer
+NIXL_ERROR = re.compile(
+    r"Prefill transfer failed|Decode transfer failed|NIXL_ERR_REMOTE_DISCONNECT|"
+    r"NIXL_ERR_NOT_FOUND|no remote ep address|bootstrap_thread died"
 )
 
 
@@ -265,6 +276,35 @@ class TestGlm53HiCacheLoadBack(CustomTestCase):
             print(
                 f"[{CONFIG}] {case}: switch-on vs switch-off greedy tokens equal {same}/{len(off[0])}"
             )
+
+
+PD_URL = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_E2E_PD_URL")
+PD_DECODE_LOG = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_E2E_PD_DECODE_LOG")
+PD_PREFILL_LOG = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_E2E_PD_PREFILL_LOG")
+
+
+@unittest.skipUnless(
+    PD_URL and PD_DECODE_LOG, "needs a running 1P1D deployment and its decode log"
+)
+class TestGlm53PDDecode(CustomTestCase):
+    def test_decode_role_engages_and_keeps_gsm8k(self):
+        questions = int(
+            os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_E2E_PD_GSM8K_QUESTIONS", "1319")
+        )
+        accuracy = _gsm8k(PD_URL, 4, questions)["accuracy"]
+        decode = Path(PD_DECODE_LOG).read_text(errors="replace")
+        _assert_engaged(self, decode)
+        self.assertGreater(accuracy, GSM8K_BOUND)
+        logs = {"decode": decode}
+        if PD_PREFILL_LOG:
+            logs["prefill"] = Path(PD_PREFILL_LOG).read_text(errors="replace")
+            self.assertNotIn(
+                ACTIVE, logs["prefill"], "the prefill role must not run the megakernel"
+            )
+        for role, text in logs.items():
+            errors = [x for x in text.splitlines() if NIXL_ERROR.search(x)]
+            self.assertEqual(errors[:5], [], f"{role}: NIXL transfer errors")
+            self.assertNotIn("Traceback", text, role)
 
 
 if __name__ == "__main__":
