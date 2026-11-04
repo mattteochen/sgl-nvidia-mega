@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""The GLM-5.3 NextN draft on SM103 (B300): the megakernel draft spec.
+"""The GLM-5.3 NextN draft on SM103 (B300) and SM107 (Rubin): the megakernel draft spec.
 
 With slot "draft" the draft's forward runs on the plugin's draft step
 (``draft_step.FusedDraft``) inside SGLang's draft-decode and draft-extend CUDA graphs;
@@ -38,6 +38,7 @@ SGLANG_READS = {
     "kernels/plugin_kernels/nvidia/spec.py|srt/megakernels/spec.py": (
         "Feature",
         "SPECULATIVE_DECODING",
+        "MULTI_NODE_TP",
         "MegakernelSpec",
         "Numerics",
         "NumericsKind",
@@ -178,7 +179,8 @@ SPEC = MegakernelSpec(
         },
         env=target.SPEC.requires.env,
     ),
-    features=frozenset({Feature.SPECULATIVE_DECODING}),
+    # the target's TP group, also across two trays
+    features=frozenset({Feature.SPECULATIVE_DECODING, Feature.MULTI_NODE_TP}),
     numerics=NUMERICS,
     max_rows=_max_rows(),
     build=_build,

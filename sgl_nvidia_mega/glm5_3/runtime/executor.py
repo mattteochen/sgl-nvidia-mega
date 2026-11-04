@@ -43,7 +43,12 @@ from sgl_nvidia_mega.glm5_3.attention.step import (
     attention_step_reasons,
 )
 from sgl_nvidia_mega.glm5_3.plan import Providers
-from sgl_nvidia_mega.glm5_3.runtime import parity, per_rank, tp_gather
+from sgl_nvidia_mega.glm5_3.runtime import (
+    ar_fusion_ok,
+    parity,
+    per_rank,
+    tp_gather,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -176,7 +181,7 @@ class GlmMegakernelVerify:
             and pp_proxy_tensors is None
             and not getattr(forward_batch, "can_run_tbo", False)
             and not getattr(self.lm, "capture_aux_hidden_states", False)
-            and flashinfer_ar_fusion_applies(rows)
+            and ar_fusion_ok(flashinfer_ar_fusion_applies, rows)
             and absorbed_mla(self.lm, forward_batch)
         )
 
