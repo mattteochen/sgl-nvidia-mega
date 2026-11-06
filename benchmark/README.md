@@ -64,10 +64,10 @@ arm's own band.
 
 ## GLM-5.2 (GLM DSA) decode A/B
 
-The GLM rows run at the InferenceX AgentX point configurations of
-`test/e2e/glm5_3_server.py` (`tp4-416`: aggregated TP4, EAGLE 4/1/5, HiCache;
-`tp8-516`: aggregated TP8 on two trays, EAGLE 5/1/6, HiCache; `tp4-516`: the
-disaggregated decode role, TP4, EAGLE 5/1/6, run standalone). Both arms set
+The GLM rows run at the InferenceX AgentX point configurations (`tp4-416`:
+aggregated TP4, EAGLE 4/1/5, HiCache; `tp8-516`: aggregated TP8 on two trays,
+EAGLE 5/1/6, HiCache; `tp4-516`: the disaggregated decode role, TP4, EAGLE 5/1/6,
+run standalone). Both arms set
 `SGLANG_ENABLE_EMBED_REPLICATION=1` and differ only by `--enable-nvidia-megakernel`.
 Acceptance is pinned at the golden length (3.33 at EAGLE 4/1/5, 3.61 at 5/1/6), so both
 arms run the same verify steps:
