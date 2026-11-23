@@ -93,8 +93,6 @@ PRIORITY_UNIT = "ll.moe.alt_stream_priority"
 # the small-batch routing kernel (stock FlashInfer 0.7.2) it loses at 5 rows (+1.2%) and
 # 6 rows (+2.4%): the shared expert already wins its race there. Hence opt-in.
 PRIORITY_MAX_ROWS = 6
-# On Rubin (SM107, ``ll.device``) the same pieces run (FlashInfer's trtllm-gen MoE has
-# SM107 cubins) under GB300's gate: derived, not measured.
 
 
 def _next_power_of_2(n: int) -> int:
@@ -302,11 +300,12 @@ class LlMoeFamily:
     """The per-layer arguments of ``ll.moe`` on one model."""
 
     def __init__(
-        self, layers: Dict[int, Any], dense: Dict[int, Any], sm=None, sms=None
+        self, layers: Dict[int, Any], dense: Dict[int, Any], target=None, sms=None
     ) -> None:
         self.layers = layers  # layer id -> (mlp, RoutedArgs)
         self.dense = dense  # layer id -> dense mlp
-        self.sm, self.sms = sm, sms  # the GEMM plans' device facts (None: this GPU's)
+        # the GEMM plans' target (``ll.target``; None: no plan) and SMs (None: this GPU's)
+        self.target, self.sms = target, sms
         self.widths: tuple = ()
         # the shared expert's stream (PRIORITY_UNIT), None: each layer's alt stream
         self.shared_stream: Optional[torch.cuda.Stream] = None
@@ -317,7 +316,7 @@ class LlMoeFamily:
         from sgl_nvidia_mega.glm5_3 import ll
 
         self.widths = tuple(sorted(set(int(w) for w in widths)))
-        facts = dict(sm=self.sm, sms=self.sms)
+        facts = dict(target=self.target, sms=self.sms)
         for mlp, _ in self.layers.values():
             ll.build_linear("router", mlp.gate, self.widths, **facts)
         for mlp in self.dense.values():
@@ -460,9 +459,9 @@ def covers(profile, rows: int, mode: str) -> Optional[str]:
         return f"{mode} steps are the draft's"
     if profile.tp != 4:
         return f"TP{profile.tp}: ll.moe serves TP4 (the small-M MoE engine serves TP8)"
-    from sgl_nvidia_mega.glm5_3.ll import device
+    from sgl_nvidia_mega.glm5_3.ll import target
 
-    why = device.reason(profile.sm)
+    why = target.reason(profile)
     if why is not None:
         return why
     if rows > MAX_ROWS:
@@ -477,10 +476,9 @@ def _family(model: Any, derived: Any, profile: Any):
         family = LlMoeFamily.of_model(model)
     except ValueError as e:
         return DeclinedFamily(str(e))
-    from sgl_nvidia_mega.glm5_3.ll import device
-
-    family.sm, family.sms = tuple(profile.sm), profile.sms
-    device.note_derived("ll.moe", profile.sm, "GB300's shared-expert stream gate")
+    family.target, family.sms = profile.target, profile.sms
+    if profile.target is not None:
+        profile.target.note("ll.moe")
     return family
 
 

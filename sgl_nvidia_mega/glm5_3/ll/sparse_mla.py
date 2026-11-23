@@ -28,11 +28,12 @@ agreed over the TP group at build, never on tensor contents, so every rank captu
 same kernels. Built only at ``compile`` (never under capture); a failed build raises on
 every rank.
 
-On Rubin (SM107, ``ll.device``: plans derived, not measured) the row caps are GB300's
-upper bounds, cut to the clusters the device co-schedules (queried at build); a width the
-device cannot launch in one wave declines to TRTLLM-Gen (``Decline``) instead of stopping
-the server: whether a GPC holds a 16-CTA cluster at one CTA per SM (the 16-head kernel
-needs 132 KB of shared memory per CTA) is a fact of the device.
+The row caps below were measured on GB300 (``ll.target``: ``Target.measured``). On a
+target whose plans are derived instead, they are upper bounds cut to the clusters the
+device co-schedules (queried at build), and a width the device cannot launch in one
+wave declines to TRTLLM-Gen (``Decline``) instead of stopping the server: whether a GPC
+holds a 16-CTA cluster at one CTA per SM (the 16-head kernel needs 132 KB of shared
+memory per CTA) is a fact of the device.
 
 Adapted from TensorRT-LLM (Apache-2.0): sparseMlaFlashDecode.cu (Dongfeng Yu) and
 glmLowLatency/w4/sparseMlaDecode.cu (Xiao Wang).
@@ -96,8 +97,6 @@ LOG2E = math.log2(math.e)
 # cluster of each size kept free (MT_HEADROOM), not at 36 or 48. 16 heads: one-tile up
 # to 7 rows; the multi-tile mode loses to TRTLLM-Gen at 8k from 8 to 48 rows. The fold
 # fills an SM per CTA, so its wave is the spread one (7 rows).
-MEASURED_SM = (10, 3)
-MEASURED_SMS = 152
 ONE_TILE_MAX_ROWS = 7
 MT_MAX_ROWS = {8: 35, 16: 0}
 MT_HEADROOM = 1
@@ -304,8 +303,8 @@ def agree_caps(
     """The minimum co-resident clusters over ``group`` (a GroupCoordinator, or None
     alone), so GPUs with different floorsweeping launch one plan; raises on every rank
     when the build or the query failed on any rank (``error`` is this rank's), or when a
-    needed count is 0 unless ``allow_zero`` (a device whose plan is derived: the widths it
-    cannot launch decline instead).
+    needed count is 0 unless ``allow_zero`` (a target whose plans are derived: the widths
+    it cannot launch decline instead).
 
     One MIN all-reduce of a fixed-length vector on the group's CPU group: every rank
     of the group must reach it (the requests depend on the profile and the env only).
@@ -433,24 +432,25 @@ def static_reasons() -> list:
     return reasons
 
 
-def derived_device(profile) -> bool:
-    """Whether ``profile``'s GPU runs this unit on caps derived from GB300's (Rubin)."""
-    from sgl_nvidia_mega.glm5_3.ll import device
-
-    return device.derived(profile.sm)
+def derived_caps(profile) -> bool:
+    """Whether ``profile``'s target runs this unit on row caps derived from another
+    GPU's (``Target.measured`` False): cut by the device's occupancy at build."""
+    target = getattr(profile, "target", None)
+    return target is not None and not target.measured
 
 
 def covers(profile, rows: int, mode: str) -> Optional[str]:
     """None when ``ll.sparse_mla_fd`` serves ``rows`` rows of ``mode`` under ``profile``,
-    else the decline reason (logged once per width). GB300 (SM103) needs its measured
-    152 SMs; on Rubin (SM107) the device's occupancy cuts the caps at build."""
-    if tuple(profile.sm) != MEASURED_SM and not derived_device(profile):
-        return (
-            f"SM {profile.sm[0]}.{profile.sm[1]} (measured on sm_103, derived for "
-            "sm_107 only)"
-        )
-    if tuple(profile.sm) == MEASURED_SM and profile.sms != MEASURED_SMS:
-        return f"{profile.sms} SMs (the row caps are GB300's {MEASURED_SMS})"
+    else the decline reason (logged once per width). A target whose caps were measured
+    needs the SM count they were measured at; a derived one has them cut at build."""
+    from sgl_nvidia_mega.glm5_3.ll import target as ll_target
+
+    why = ll_target.reason(profile)
+    if why is not None:
+        return why
+    target = profile.target
+    if target.measured and profile.sms != target.sms:
+        return f"{profile.sms} SMs (the row caps are {target.name}'s {target.sms})"
     if profile.heads not in NUM_HEADS:
         return f"{profile.heads} heads per rank"
     reasons = static_reasons()
@@ -502,7 +502,7 @@ class SparseMlaFdFamily:
         # the NextN draft (one decoder layer) runs the draft-decode passes the fold serves
         self.draft = getattr(model.model, "layers", None) is None
         self.plan: Optional[Plan] = None
-        # width -> why it declines (a derived device that cannot launch it in one wave)
+        # width -> why it declines (a derived target that cannot launch it in one wave)
         self.declined: Dict[int, str] = {}
 
     def compile(self, widths: Sequence[int]) -> None:
@@ -522,7 +522,7 @@ class SparseMlaFdFamily:
                     _w_uv(layer.self_attn)
         except Exception as e:  # every rank raises after the agreement below
             error = e
-        derived = derived_device(self.profile)
+        derived = derived_caps(self.profile)
         caps = agree_caps(
             caps,
             error,
@@ -538,11 +538,11 @@ class SparseMlaFdFamily:
                 f"{NAME}: the device runs {missing} rows in more than one wave "
                 f"(plan {plan}); the row caps were measured on GB300"
             )
+        sm = self.profile.sm
         self.declined = {
             w: (
-                f"sm_{self.profile.sm[0]}{self.profile.sm[1]} co-schedules "
-                f"{caps.spread_rows} one-tile clusters of 16 CTAs at {self.heads} heads, "
-                f"not {w} rows in one wave"
+                f"sm_{sm[0]}{sm[1]} co-schedules {caps.spread_rows} one-tile clusters "
+                f"of 16 CTAs at {self.heads} heads, not {w} rows in one wave"
             )
             for w in missing
         }
@@ -557,8 +557,8 @@ class SparseMlaFdFamily:
             plan.fold_rows,
             "/".join(FOLD_MODES),
             (
-                f"; caps derived from GB300's on sm_{self.profile.sm[0]}"
-                f"{self.profile.sm[1]} (agreed {caps}); declines {sorted(missing)} rows"
+                f"; caps derived from GB300's on sm_{sm[0]}{sm[1]} (agreed {caps}); "
+                f"declines {sorted(missing)} rows"
                 if derived
                 else ""
             ),

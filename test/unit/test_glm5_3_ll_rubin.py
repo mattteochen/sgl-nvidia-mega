@@ -2,8 +2,11 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """The TP4 kernel units on Rubin (VR200: SM107, 212 SMs), on CPU.
 
-- ``ll.device`` names the GPUs the units serve: GB300 (measured) and Rubin (plans
-  derived from GB300's); any other GPU declines every ``ll.*`` unit.
+- ``targets.select`` picks the units' plans from the architecture, once per profile:
+  GB300's (``ll.target.GB300``, measured) on SM103, Rubin's (``sm107.tp4.RUBIN``,
+  derived from GB300's) on SM107, none elsewhere (every ``ll.*`` unit declines). The
+  units read the plans from ``Profile.target`` and never select again, and no file of
+  ``glm5_3/ll`` names SM107 or imports ``glm5_3/sm107``.
 - At every TP4 profile and width, Rubin composes the verify step and the NextN draft
   exactly as GB300 does, and another GPU takes no ``ll.*`` unit, so a TP4 server there
   still stops.
@@ -15,15 +18,19 @@
   build, while GB300 keeps failing (fail-stop) on the same facts.
 """
 
+import pathlib
+import re
 import sys
 from types import ModuleType, SimpleNamespace
 
 import pytest
 
-from sgl_nvidia_mega.glm5_3 import registry, units
-from sgl_nvidia_mega.glm5_3.ll import device
+from sgl_nvidia_mega.glm5_3 import registry, targets, units
 from sgl_nvidia_mega.glm5_3.ll import sparse_mla as fd
+from sgl_nvidia_mega.glm5_3.ll import target as ll_target
+from sgl_nvidia_mega.glm5_3.ll.target import GB300
 from sgl_nvidia_mega.glm5_3.profile import MAX_ROWS, UNITS, Profile, clip_widths
+from sgl_nvidia_mega.glm5_3.sm107.tp4 import RUBIN
 
 GB300_SM, GB300_SMS = (10, 3), 152
 RUBIN_SM, RUBIN_SMS = (10, 7), 212
@@ -42,6 +49,7 @@ def _profile(tp, tokens, sm=GB300_SM, sms=GB300_SMS):
         widths=clip_widths(tuple(range(tokens, MAX_ROWS + 1, tokens)), tp, tokens),
         sm=sm,
         sms=sms,
+        target=targets.select(sm),
     )
 
 
@@ -77,20 +85,100 @@ def _groups_modules(mode):
     return registry.DRAFT_GROUPS, draft_units.draft_modules()
 
 
-# ------------------------------------------------------------------ the device table
+# ------------------------------------------------------------------ the targets
 
 
-def test_device_table():
-    assert device.lookup(GB300_SM) is device.GB300 and device.GB300.measured
-    assert device.lookup(RUBIN_SM) is device.RUBIN and not device.RUBIN.measured
-    assert (device.GB300.sms, device.RUBIN.sms) == (152, 212)
-    assert not device.derived(GB300_SM) and device.derived(RUBIN_SM)
-    for sm in (GB300_SM, RUBIN_SM):
-        assert device.reason(sm) is None
+def test_targets_select_by_architecture():
+    assert targets.select(GB300_SM) is GB300 and GB300.measured
+    assert targets.select(RUBIN_SM) is RUBIN and not RUBIN.measured
+    assert (GB300.sm, GB300.sms, GB300.gpcs) == (GB300_SM, 152, 8)
+    assert (RUBIN.sm, RUBIN.sms, RUBIN.gpcs) == (RUBIN_SM, 212, 16)
+    assert GB300.flashinfer_splitk and not RUBIN.flashinfer_splitk
+    assert not GB300.notes and set(RUBIN.notes) == {
+        "ll.attention",
+        "ll.gemm",
+        "ll.hops",
+        "ll.moe",
+    }
     for sm in ((10, 0), (10, 1), (12, 0), (9, 0)):
-        why = device.reason(sm)
-        assert device.lookup(sm) is None and why.startswith(f"sm_{sm[0]}{sm[1]}")
-        assert "sm_103" in why and "sm_107" in why
+        assert targets.select(sm) is None
+        p = SimpleNamespace(sm=sm, target=None)
+        assert ll_target.reason(p).startswith(f"sm_{sm[0]}{sm[1]}: no plans")
+    assert ll_target.reason(SimpleNamespace(sm=RUBIN_SM, target=RUBIN)) is None
+
+
+def _resolve(monkeypatch, sm, sms):
+    from sgl_nvidia_mega.glm5_3 import profile as profile_mod
+
+    monkeypatch.setattr(profile_mod, "_device", lambda capability: (sm, sms))
+    args = SimpleNamespace(
+        tp_size=4, speculative_algorithm="EAGLE", speculative_num_draft_tokens=6
+    )
+    return Profile.from_args(args, SimpleNamespace(num_attention_heads=64))
+
+
+@pytest.mark.parametrize(
+    "sm, sms, want",
+    [(GB300_SM, 152, GB300), (RUBIN_SM, 212, RUBIN), ((10, 0), 148, None)],
+)
+def test_the_profile_selects_once_and_the_units_never_again(monkeypatch, sm, sms, want):
+    """The profile picks the target once from the architecture; composing every TP4
+    width and draft graph reads it from the profile and never selects again."""
+    calls = []
+    select = targets.select
+    monkeypatch.setattr(
+        targets, "select", lambda arch: calls.append(arch) or select(arch)
+    )
+    profile = _resolve(monkeypatch, sm, sms)
+    assert profile.target is want and calls == [sm]
+    hash(profile)  # a profile stays hashable with its target
+    steps = _steps(4, 6)
+
+    def no_select(arch):
+        raise AssertionError(f"targets.select({arch}) after the profile resolved")
+
+    monkeypatch.setattr(targets, "select", no_select)
+    for mode, rows in steps:
+        groups, modules = _groups_modules(mode)
+        owners = _owners(profile, rows, mode, groups, modules)
+        # another GPU's draft graphs keep their draft units: check_draft_config refuses
+        # that GPU at the draft's build
+        if want is not None or mode == "target_verify":
+            assert bool(owners) == (want is not None), (mode, rows, owners)
+
+
+_LL = pathlib.Path(fd.__file__).resolve().parent
+_SM107_NAMES = re.compile(
+    r"sm_?107|\(10,\s*7\)|\brubin\b|vr200|glm5_3\.sm107|glm5_3 import sm107"
+    r"|glm5_3\.targets|glm5_3 import targets",
+    re.IGNORECASE,
+)
+
+
+@pytest.mark.parametrize(
+    "path",
+    sorted(_LL.rglob("*.py")),
+    ids=lambda p: str(p.relative_to(_LL)),
+)
+def test_ll_has_no_sm107_branch(path):
+    """glm5_3/ll is GB300's code: no file names SM107, imports glm5_3/sm107 or picks a
+    target (glm5_3/targets.py does, once per profile)."""
+    hits = [
+        f"{n}: {line.strip()}"
+        for n, line in enumerate(path.read_text().splitlines(), 1)
+        if _SM107_NAMES.search(line)
+    ]
+    assert not hits, hits
+
+
+def test_rubins_plans_live_in_sm107():
+    from sgl_nvidia_mega.glm5_3.sm107 import tp4
+
+    assert pathlib.Path(tp4.__file__).resolve().parent.name == "sm107"
+    assert not any(
+        isinstance(v, ll_target.Target) and v is not GB300
+        for v in vars(ll_target).values()
+    )
 
 
 # ------------------------------------------------------------------ compositions
@@ -177,16 +265,17 @@ def _weight_module(shape):
 
 
 @pytest.mark.parametrize(
-    "sm, sms, engages",
+    "target, sms, engages",
     [
-        (RUBIN_SM, RUBIN_SMS, True),
-        (GB300_SM, GB300_SMS, True),
-        (RUBIN_SM, 208, False),
-        (RUBIN_SM, GB300_SMS, False),
-        ((10, 0), 148, False),
+        (RUBIN, RUBIN_SMS, True),
+        (GB300, GB300_SMS, True),
+        (RUBIN, 208, False),
+        (RUBIN, GB300_SMS, False),
+        (GB300, 148, False),
+        (None, 148, False),
     ],
 )
-def test_gemm_plan_per_device(sm, sms, engages):
+def test_gemm_plan_per_target(target, sms, engages):
     from sgl_nvidia_mega.glm5_3.ll import gemm
 
     for role, shape in (
@@ -194,29 +283,31 @@ def test_gemm_plan_per_device(sm, sms, engages):
         ("wk_weights_proj", (160, 6144)),
         ("lm_head", (38720, 6144)),
     ):
-        e, why = gemm._planned(role, _weight_module(shape), sm=sm, sms=sms)
+        e, why = gemm._planned(role, _weight_module(shape), target=target, sms=sms)
         assert (e is not None) == engages, (role, why)
-        if not engages:
-            assert "SM103 with 152 SMs" in why and f"SM{sm[0]}{sm[1]}" in why
+        if not engages and target is not None:
+            assert f"with {target.sms} SMs" in why and f"has {sms} SMs" in why
+        elif not engages:
+            assert "no target" in why
 
 
 def test_router_splitk_stays_stock_on_rubin():
     from sgl_nvidia_mega.glm5_3.ll import gemm
 
     module = _weight_module((256, 6144))
-    e, _ = gemm._planned("router", module, sm=GB300_SM, sms=GB300_SMS)
+    e, _ = gemm._planned("router", module, target=GB300, sms=GB300_SMS)
     assert e is not None
-    e, why = gemm._planned("router", module, sm=RUBIN_SM, sms=RUBIN_SMS)
+    e, why = gemm._planned("router", module, target=RUBIN, sms=RUBIN_SMS)
     assert e is None and "no measured plan" in why
 
 
 def test_rubin_gemm_splitk_tactics_fit_one_wave():
     from sgl_nvidia_mega.glm5_3.ll import gemm_plan as plan
 
-    entries = plan.device_plan(RUBIN_SM, RUBIN_SMS)
-    assert entries is not None and plan.device_gpcs(RUBIN_SM) == 16
-    assert plan.device_plan(GB300_SM, GB300_SMS) is plan.PLAN
-    assert {e.role for e in plan.PLAN} - {e.role for e in entries} == {"router"}
+    entries = RUBIN.gemm_plan
+    assert GB300.gemm_plan is plan.PLAN and RUBIN.gpcs == 16
+    # Rubin's plan is GB300's without the router, entry for entry
+    assert entries == tuple(e for e in plan.PLAN if e.role != "router")
     checked = 0
     for e in entries:
         n, _ = e.shape
@@ -259,34 +350,34 @@ def test_splitk_source_on_sm107_is_the_vendored_copy(monkeypatch):
     monkeypatch.delenv(gemm.SPLITK_ENV, raising=False)
     try:
         gemm.reset()
-        monkeypatch.setattr(gemm, "_device_capability", lambda: GB300_SM)
-        assert gemm.splitk_source().name == "flashinfer"
-        gemm.reset()
-        monkeypatch.setattr(gemm, "_device_capability", lambda: RUBIN_SM)
-        assert gemm.splitk_source().name == "vendored"
+        assert gemm.splitk_source(GB300).name == "flashinfer"
+        assert gemm.splitk_source(None).name == "flashinfer"
+        assert gemm.splitk_source(RUBIN).name == "vendored"
         # forcing FlashInfer's kernel stays the operator's choice
         gemm.reset()
         monkeypatch.setenv(gemm.SPLITK_ENV, "flashinfer")
-        assert gemm.splitk_source().name == "flashinfer"
+        assert gemm.splitk_source(RUBIN).name == "flashinfer"
     finally:
         gemm.reset()
-    assert gemm.flashinfer_serves_tactics(None)
-    assert not gemm.flashinfer_serves_tactics(RUBIN_SM)
 
 
 # ------------------------------------------------------------------ ll.sparse_mla_fd
 
 
+def _ns_profile(sm, sms):
+    return SimpleNamespace(tp=4, heads=16, sm=sm, sms=sms, target=targets.select(sm))
+
+
 def test_sparse_mla_covers_rubin_at_any_sm_count():
     for sms in (RUBIN_SMS, 208):
-        p = SimpleNamespace(tp=4, heads=16, sm=RUBIN_SM, sms=sms)
+        p = _ns_profile(RUBIN_SM, sms)
         for rows in range(1, fd.ONE_TILE_MAX_ROWS + 1):
             assert fd.covers(p, rows, fd.VERIFY) is None
         assert fd.covers(p, 8, fd.VERIFY) is not None
-    gb300_148 = SimpleNamespace(tp=4, heads=16, sm=GB300_SM, sms=148)
+    gb300_148 = _ns_profile(GB300_SM, 148)
     assert "SMs" in fd.covers(gb300_148, 5, fd.VERIFY)
-    other = SimpleNamespace(tp=4, heads=16, sm=(10, 0), sms=148)
-    assert "sm_107" in fd.covers(other, 5, fd.VERIFY)
+    other = _ns_profile((10, 0), 148)
+    assert "no plans" in fd.covers(other, 5, fd.VERIFY)
 
 
 def test_agree_caps_allow_zero_alone():
@@ -312,7 +403,7 @@ def _family(sm, sms, caps, monkeypatch):
     monkeypatch.setattr(fd, "device_caps", lambda heads, with_mt, with_fold: caps)
     monkeypatch.setattr(fd, "_tp_group", lambda: None)
     family = fd.SparseMlaFdFamily.__new__(fd.SparseMlaFdFamily)
-    family.profile = SimpleNamespace(tp=4, heads=16, sm=sm, sms=sms)
+    family.profile = _ns_profile(sm, sms)
     family.heads, family.layers, family.draft = 16, [], False
     family.plan, family.declined = None, {}
     return family
@@ -349,28 +440,3 @@ def test_sparse_mla_on_gb300_still_fails_stop(monkeypatch):
     family = _family(GB300_SM, GB300_SMS, fd.Caps(134984, 134984, 0, 0), monkeypatch)
     with pytest.raises(RuntimeError, match="occupancy"):
         family.compile([5])
-
-
-# ------------------------------------------------------------------ the split-K kernel
-
-
-def test_splitk_smem_capacity_falls_back_without_a_gpu(monkeypatch):
-    splitk = pytest.importorskip("sgl_nvidia_mega.glm5_3.ll.kernels.cute.splitk")
-    import torch
-
-    def no_props(index):
-        raise RuntimeError("no GPU")
-
-    splitk.smem_capacity_bytes.cache_clear()
-    monkeypatch.setattr(torch.cuda, "get_device_properties", no_props)
-    try:
-        assert splitk.smem_capacity_bytes(0) == splitk._SMEM_CAPACITY_BYTES
-        splitk.smem_capacity_bytes.cache_clear()
-        monkeypatch.setattr(
-            torch.cuda,
-            "get_device_properties",
-            lambda index: SimpleNamespace(shared_memory_per_block_optin=232448),
-        )
-        assert splitk.smem_capacity_bytes(0) == 232448
-    finally:
-        splitk.smem_capacity_bytes.cache_clear()

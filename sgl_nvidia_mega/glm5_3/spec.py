@@ -18,7 +18,8 @@ Stated limits of this spec:
   (``runtime/executor.py``).
 * TP4 at 3-6 tokens per request, up to 48 rows (``profile.UNITS``), runs the kernel
   units composed per width (``runtime/composed.py``, ``registry``, ``units``), on GB300
-  (SM103, measured plans) and Rubin (SM107, plans derived from GB300's: ``ll/device.py``);
+  (SM103, measured plans: ``ll/target.py``) and Rubin (SM107, plans derived from GB300's:
+  ``sm107/tp4.py``), picked once per build by ``targets.py``;
   a width no unit covers runs SGLang's forward. TP8 serves 4 or 6 tokens per request up to 16
   rows (``plan.py``).
 * PD disaggregation is served at the TP4 profiles' decode role (``pd_reasons``); the
@@ -242,7 +243,8 @@ SM107_TP_SIZE = 16
 
 REQUIREMENTS = Requirements(
     # B300 / GB300 (SM103) and Rubin / VR NVL72 (SM107): the same kernels (the TP4
-    # kernel units' plans are measured on SM103 and derived for SM107: ll/device.py);
+    # kernel units run ll/target.py's measured plans on SM103 and sm107/tp4.py's derived
+    # ones on SM107, picked by targets.py);
     # TP16 runs glm5_3/sm107, on SM107 only
     isas=frozenset({"sm_103", "sm_107"}),
     tp_sizes=frozenset(tp for tp, _ in ACCEPTED) | {SM107_TP_SIZE},

@@ -132,10 +132,6 @@ LL_MAX_ROWS = 16
 WIDE_MAX_ROWS = 48
 # Verify rows the family serves (profile ACCEPTED at TP4).
 MAX_ROWS = 48
-# The plan was measured on GB300 (SM103). Rubin (SM107, ``ll.device``) runs the same
-# plan: the 1-16-row forms are SGLang's fused-A kernel bit for bit, the split-K form's
-# occupancy gate is queried on the device at compile, and every stage ring fits the
-# 227 KiB per-CTA opt-in both expose; other GPUs decline.
 # The steps the unit claims (atomically: the deferred kv_a norm passes from prologue
 # to rope_cache).
 STEPS = ("qkv_a", "prologue", "index_k", "rope_cache")
@@ -605,11 +601,15 @@ class AttentionFamily:
             if f.q_b is not None:
                 _fused_a_module(Q_LORA, Q_B_SHAPE[0], pdl, f.q_b[1], False)
         # the indexer key / head-gate projection (index_k) at every width
-        sm = self.profile.sm if self.profile is not None else None
+        target = self.profile.target if self.profile is not None else None
         sms = self.profile.sms if self.profile is not None else None
         kw = {
             ll.build_linear(
-                "wk_weights_proj", a.indexer.wk_weights_proj, widths, sm=sm, sms=sms
+                "wk_weights_proj",
+                a.indexer.wk_weights_proj,
+                widths,
+                target=target,
+                sms=sms,
             )
             for a in self.attns
             if getattr(a, "indexer", None) is not None
@@ -617,12 +617,8 @@ class AttentionFamily:
         self.kw_gemm = "; ".join(sorted(d for d in kw if d))
         self.fold = self._decide_fold(widths)
         _kv_half_module(self.fold.fold, False, pdl, self.trigger_at_entry)
-        if self.profile is not None:
-            from sgl_nvidia_mega.glm5_3.ll import device
-
-            device.note_derived(
-                "ll.attention", self.profile.sm, "GB300's fused-A / q_b row ranges"
-            )
+        if target is not None:
+            target.note("ll.attention")
         self._log(widths)
 
     def _decide_fold(self, widths: Sequence[int]) -> norm_backend.NormFold:
@@ -724,14 +720,14 @@ class AttentionFamily:
 
 
 def _covers(profile, rows: int, mode: str) -> Optional[str]:
-    """TP4 (16 heads per rank) on SM103 (measured) or SM107 (derived, ``ll.device``),
-    1-48 rows, every step mode (verify, draft extend, and draft decode on the draft
-    group's one-stream bodies)."""
-    from sgl_nvidia_mega.glm5_3.ll import device
+    """TP4 (16 heads per rank) on a GPU the profile names a target for
+    (``ll.target``), 1-48 rows, every step mode (verify, draft extend, and draft decode
+    on the draft group's one-stream bodies)."""
+    from sgl_nvidia_mega.glm5_3.ll import target
 
     if profile.heads != HEADS:
         return f"needs {HEADS} attention heads per rank (TP4), not {profile.heads}"
-    why = device.reason(profile.sm)
+    why = target.reason(profile)
     if why is not None:
         return why
     if not 1 <= rows <= MAX_ROWS:
