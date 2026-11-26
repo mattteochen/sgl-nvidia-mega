@@ -180,10 +180,13 @@ class HopFamily:
             names |= {"o_proj_produce_router16", "o_proj_consume_router16"}
             names |= {"moe_fold_block_sums16", "rmsnorm_from_block_sums16"}
         compiled, probe = {}, None
+        # SGLANG_NVIDIA_MEGAKERNEL_GLM_HOP16_ROUTER_ROWS: the 9..16-row routing producer
+        rows16 = big and self.api.hop16_router_rows()
         if not reason:
             import cutlass.cute as cute
 
-            for spec in (s for s in self.api.unit_specs() if s.name in names):
+            specs = self.api.unit_specs(router_rows16=rows16)
+            for spec in (s for s in specs if s.name in names):
                 compiled[spec.name] = compile_cached(
                     spec.obj,
                     spec.constexprs,
@@ -242,6 +245,13 @@ class HopFamily:
                 "(split / cluster-free deferred-norm split row limits %s)",
                 ",".join(sorted(kernels.form)),
                 kernels.fold_limits()[:2],
+            )
+        # (the store form changes no address or value: ranks need not agree on it)
+        if rows16:
+            logger.info(
+                "NVIDIA megakernel: GLM-5.3 / GLM-5.2: 9-16-row o_proj hop stores its "
+                "router partials row-contiguous (%s=1)",
+                self.api.HOP16_ROUTER_ROWS_ENV,
             )
         self.kernels = kernels
 

@@ -13,8 +13,14 @@
 * ``HopKernels``: the compiled units with the mailboxes of one tensor-parallel group,
   called with torch tensors; it chooses the fold form for a row count from the
   cooperative occupancy.
+
+``SGLANG_NVIDIA_MEGAKERNEL_GLM_HOP16_ROUTER_ROWS=1`` (read by ``unit_specs``, i.e. at
+build): the 9..16-row routing o_proj producer (mailbox instance B) stores its router
+partials row-contiguous (``o_proj_rc.OProjArProduceRc``); the same outputs, bitwise.
+Instance A (up to 8 rows) keeps the served unit.
 """
 
+import os
 import tempfile
 from dataclasses import dataclass, field
 from typing import Any
@@ -35,6 +41,7 @@ from .moe_fold import (
     RmsnormFromBlockSums,
 )
 from .o_proj import ROUTER_K, OProjArConsume, OProjArProduce, router_partial_bytes
+from .o_proj_rc import OProjArProduceRc
 from .transport import ErrorRecord, HopMailbox
 
 MIN_PTX_ISA = (9, 2)
@@ -54,12 +61,11 @@ FOLD_FORM_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_FOLD_FORM"
 FOLD_FORMS = ("split8dn", "late8")
 SPLIT8_MAX_ROWS = 8
 SPLIT8DN_MIN_ROWS = 4
+HOP16_ROUTER_ROWS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_HOP16_ROUTER_ROWS"
 
 
 def fold_form(raw=None) -> frozenset:
     """The opt-in fold forms of ``FOLD_FORM_ENV`` (or ``raw``)."""
-    import os
-
     if raw is None:
         raw = os.environ.get(FOLD_FORM_ENV, "")
     toks = frozenset(x.strip().lower() for x in raw.split(",") if x.strip())
@@ -82,6 +88,18 @@ def fold_units(form=None) -> dict:
     if "split8dn" in form:
         units["moe_fold_split_dn_nc"] = MoeFoldArNormDn(split=True, nocluster=True)
     return units
+
+
+def hop16_router_rows(value=None) -> bool:
+    """Whether the 9..16-row routing o_proj producer stores its router partials
+    row-contiguous, from ``value`` (default: the
+    ``SGLANG_NVIDIA_MEGAKERNEL_GLM_HOP16_ROUTER_ROWS`` environment value; ``1`` on,
+    empty / ``0`` off)."""
+    raw = os.environ.get(HOP16_ROUTER_ROWS_ENV, "") if value is None else value
+    raw = raw.strip()
+    if raw not in ("", "0", "1"):
+        raise ValueError(f"{HOP16_ROUTER_ROWS_ENV}={raw!r}: expected 0 or 1")
+    return raw == "1"
 
 
 @dataclass(frozen=True)
@@ -197,14 +215,20 @@ def _args_apply():
 
 
 def unit_specs(
-    *, plain_allreduce: bool = False, allreduce_rmsnorm: bool = False, form=None
+    *,
+    plain_allreduce: bool = False,
+    allreduce_rmsnorm: bool = False,
+    form=None,
+    router_rows16=None,
 ):
     """The compile units of the forward hops (instance A: up to 8 rows; instance B:
     9..16). ``plain_allreduce``: also the plain all-reduce (the draft's eh gather);
     ``allreduce_rmsnorm``: also the residual-free all-reduce + RMSNorm (the draft's
     row-parallel eh_proj sum with the draft layer's input norm); ``form``: the opt-in
-    fold forms (default: ``fold_form()``)."""
+    fold forms (default: ``fold_form()``); ``router_rows16``: the 9..16-row routing
+    producer with row-contiguous router-partial stores (default: ``hop16_router_rows()``)."""
     fu = fold_units(form)
+    rows16 = hop16_router_rows() if router_rows16 is None else bool(router_rows16)
     specs = [
         UnitSpec(
             "allreduce_norm", AllreduceNormHop(residual=True, norm=True), _args_ar()
@@ -217,7 +241,7 @@ def unit_specs(
         UnitSpec("moe_fold_plain", fu["moe_fold_plain"], _args_fold()),
         UnitSpec(
             "o_proj_produce_router16",
-            OProjArProduce(router=True, max_rows=16),
+            OProjArProduceRc() if rows16 else OProjArProduce(router=True, max_rows=16),
             _args_produce(),
         ),
         UnitSpec(
