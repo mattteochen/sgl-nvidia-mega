@@ -93,7 +93,6 @@ SGLANG_READS = {
         "complete_output",
         "final_norm",
     ),
-    "srt/utils/common.py": ("BumpAllocator",),
     "srt/model_executor/forward_batch_info.py": (
         "ForwardBatch",
         "spec_info",
@@ -148,6 +147,9 @@ SGLANG_READS = {
         "_copy_logits_to_buffer",
         "vocab_size",
         "next_token_logits",
+        # SGLANG_SPEC_DRAFT_ARGMAX_EXCHANGE: the top-1 partials output
+        "_draft_argmax_requested",
+        "next_token_argmax_partials",
         "hidden_states",
         "mm_input_embeds",
     ),
@@ -219,6 +221,9 @@ EH_NORM_OPTIONS = dict(
 # draft extend: torch.argmax (NaN is the maximum, the first NaN wins)
 NAN_REPLACEMENT_BITS = 0xF149F2CA
 ONE_HOT_FILL = -torch.finfo(torch.float32).max
+# lanes per candidate of SGLang's draft top-1 partials (kernels/ops/speculative/topk1.py:
+# DRAFT_TOPK1_PARTIAL_LANES)
+PARTIAL_LANES = 4
 
 
 def eh_rows(widths) -> tuple:
@@ -467,10 +472,16 @@ class FusedDraft:
             self._hops.allreduce(part[lo:hi], out[lo:hi], site=SITE_EH_GATHER)
         return out
 
-    def top1_one_hot(
-        self, logits_shard: torch.Tensor, n_valid: int, vocab: int, extend: bool
+    def _top1(
+        self,
+        logits_shard: torch.Tensor,
+        n_valid: int,
+        extend: bool,
+        partials: Optional[torch.Tensor] = None,
     ) -> Optional[torch.Tensor]:
-        """A [rows, vocab] fp32 one-hot of the global top-1 (stock NaN rule), or None."""
+        """The global top-1 ids ``[rows]`` int64 (stock NaN rule) by the distributed
+        argmax, also written as SGLang's top-1 partials into ``partials`` (``[rows, 4]``
+        fp32) when given; or None (not engaged / not served)."""
         from cutlass import Int32, Int64, Uint32, Uint64
 
         rows, vloc = logits_shard.shape
@@ -491,6 +502,7 @@ class FusedDraft:
             Int64(ctrl.data_ptr()),
             Int64(ids.data_ptr()),
             Int64(vals.data_ptr()),
+            Int64(0 if partials is None else partials.data_ptr()),
             Int32(rows),
             Int32(vloc),
             Int32(n_valid),
@@ -503,11 +515,38 @@ class FusedDraft:
             Int32(SITE_TOP1_EXTEND if extend else SITE_TOP1_DECODE),
             cu_stream(),
         )
+        return ids
+
+    def top1_one_hot(
+        self, logits_shard: torch.Tensor, n_valid: int, vocab: int, extend: bool
+    ) -> Optional[torch.Tensor]:
+        """A [rows, vocab] fp32 one-hot of the global top-1 (stock NaN rule), or None."""
+        ids = self._top1(logits_shard, n_valid, extend)
+        if ids is None:
+            return None
         one_hot = torch.full(
-            (rows, vocab), ONE_HOT_FILL, dtype=torch.float32, device=logits_shard.device
+            (ids.shape[0], vocab),
+            ONE_HOT_FILL,
+            dtype=torch.float32,
+            device=logits_shard.device,
         )
         one_hot.scatter_(1, ids[:, None], 0.0)
         return one_hot
+
+    def top1_partials(
+        self, logits_shard: torch.Tensor, n_valid: int, extend: bool
+    ) -> Optional[torch.Tensor]:
+        """The global top-1 (stock NaN rule) as SGLang's draft top-1 partials, one
+        candidate per row (``[rows, 4]`` fp32, written by the distributed argmax
+        itself), or None. SGLang's partials finalizers then take the token without a
+        logits row: no one-hot fill and scatter, no logits-buffer copy, no argmax."""
+        rows = logits_shard.shape[0]
+        partials = torch.empty(
+            (rows, PARTIAL_LANES), dtype=torch.float32, device=logits_shard.device
+        )
+        if self._top1(logits_shard, n_valid, extend, partials) is None:
+            return None
+        return partials
 
     def attention_for(self, rows: int, forward_batch: ForwardBatch, view):
         """The draft layer's attention step group served at ``rows`` in this forward mode (a
@@ -670,11 +709,11 @@ class FusedDraft:
         )
         from sglang.srt.layers.attention.index_topk_share import IndexTopKShareState
         from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
-        from sglang.srt.utils import BumpAllocator
 
-        # the zero fill stays the plain launch right before the front kernel (its ids / rows are read after its
-        # grid-dependency wait, which orders it only after the immediately preceding grid)
-        zero_allocator = BumpAllocator(
+        # no eager zero fill (runtime.LazyZeroAllocator): the front kernel's ids / rows are read after its
+        # grid-dependency wait, and the launch before it (the graph's input copies or the previous step's
+        # _small_copy_kernel) is a plain launch, so the wait orders it after every earlier grid
+        zero_allocator = runtime.LazyZeroAllocator(
             buffer_size=2, dtype=torch.float32, device=input_ids.device
         )
         hidden_states = None
@@ -779,16 +818,28 @@ def draft_logits(
     lm_head = nextn.lm_head
     shard = lp._compute_lm_head(pruned, lm_head, None)
     si = lm_head.shard_indices
-    one_hot = None
-    if (
+    extend = meta.forward_mode.is_draft_extend_v2()
+    served = (
         si.num_added_elements == 0
         and si.org_vocab_start_index == fd.rank * shard.shape[1]
-    ):
+    )
+    if served and _argmax_partials_requested(lp):
+        # SGLang's draft_argmax_only forward (SGLANG_SPEC_DRAFT_ARGMAX_EXCHANGE): the
+        # top-1 as its partials, which its draft loop and draft extend finalize
+        partials = fd.top1_partials(shard, si.num_org_elements, extend=extend)
+        if partials is not None:
+            return LogitsProcessorOutput(
+                next_token_logits=None,
+                next_token_argmax_partials=(
+                    partials if sample_indices is None else partials[sample_indices]
+                ),
+                hidden_states=hidden_states_to_store,
+                mm_input_embeds=meta.mm_input_embeds,
+            )
+    one_hot = None
+    if served:
         one_hot = fd.top1_one_hot(
-            shard,
-            si.num_org_elements,
-            lp.vocab_size,
-            extend=meta.forward_mode.is_draft_extend_v2(),
+            shard, si.num_org_elements, lp.vocab_size, extend=extend
         )
     # same ranks, same decision: everyone takes the stock gather
     if one_hot is None:
@@ -801,6 +852,14 @@ def draft_logits(
         hidden_states=hidden_states_to_store,
         mm_input_embeds=meta.mm_input_embeds,
     )
+
+
+def _argmax_partials_requested(lp) -> bool:
+    """Whether SGLang asks this draft LM-head processor for top-1 partials instead of
+    logits (its ``draft_argmax_only`` forward flag on an opted-in processor; the same on
+    every rank)."""
+    requested = getattr(lp, "_draft_argmax_requested", None)
+    return bool(requested is not None and requested())
 
 
 def _plain_tp_logits(fd: FusedDraft, lp, forward_batch, metadata=None):

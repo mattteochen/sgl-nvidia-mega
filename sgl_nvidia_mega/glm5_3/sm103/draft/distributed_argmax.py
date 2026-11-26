@@ -33,6 +33,11 @@ Protocol (one grid of ``max_rows`` CTAs per rank, CTA ``m`` serves row ``m``):
   this grid completes;
 * the grid is launched cooperatively, so all CTAs of a rank are co-resident; no CTA
   waits for another CTA of its own grid.
+
+``out_partials`` (0: none) also takes each row's result as one candidate of SGLang's
+draft top-1 partials (``kernels/ops/speculative/topk1.py``, 4 fp32 lanes: value high /
+low 16 bits, index, first-NaN index): ``(0, 0, index, -1)``, so its finalizers pick
+``index`` (a single candidate wins whatever its value) without a logits row.
 """
 
 import cuda.bindings.driver as cuda
@@ -47,6 +52,7 @@ from . import _draft_ptx as ptx
 _NEG_INF_BITS = 0xFF800000
 _CANONICAL_NAN_BITS = 0x7FC00000
 _INT32_MAX = 0x7FFFFFFF
+_NEG_ONE_BITS = 0xBF800000  # -1.0f: no NaN index in a partials row
 
 
 class DistributedArgmax:
@@ -114,6 +120,7 @@ class DistributedArgmax:
         ctrl: Int64,
         out_ids: Int64,
         out_vals: Int64,
+        out_partials: Int64,
         rows: Int32,
         local_vocab: Int32,
         n_valid: Int32,
@@ -135,6 +142,7 @@ class DistributedArgmax:
             ctrl,
             out_ids,
             out_vals,
+            out_partials,
             rows,
             local_vocab,
             n_valid,
@@ -219,6 +227,7 @@ class DistributedArgmax:
         ctrl: Int64,
         out_ids: Int64,
         out_vals: Int64,
+        out_partials: Int64,
         rows: Int32,
         local_vocab: Int32,
         n_valid: Int32,
@@ -381,5 +390,16 @@ class DistributedArgmax:
                 val = ptx.f32_from_bits(Uint32(_CANONICAL_NAN_BITS))
             core.st_global_u64(out_ids + Int64(row) * Int64(8), Uint64(Int64(idx)))
             core.st_global_f32(out_vals + Int64(row) * Int64(4), val)
+            if out_partials != Int64(0):
+                # (0, 0, index, -1): one candidate of SGLang's top-1 partials
+                core.st_global_v4(
+                    out_partials + Int64(row) * Int64(16),
+                    (
+                        Uint32(0),
+                        Uint32(0),
+                        ptx.bits_from_f32(Float32(idx)),
+                        Uint32(_NEG_ONE_BITS),
+                    ),
+                )
         if tid == 0:
             core.st_global_u32(epoch_addr, epoch + Uint32(1))

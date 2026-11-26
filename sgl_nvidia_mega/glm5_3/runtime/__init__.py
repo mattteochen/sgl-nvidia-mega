@@ -199,6 +199,36 @@ def target_hops(weight):
     return entry[1]()
 
 
+class LazyZeroAllocator:
+    """SGLang's ``BumpAllocator`` (``srt/utils/common.py``: slices of one zeroed fp32
+    buffer) with the buffer made at the first ``allocate``, not at construction.
+
+    A captured step builds one per forward, and only the FP8 ``w_kc`` / ``w_vc`` absorb
+    paths of the stock attention bodies allocate from it; GLM-5.2's are BF16, so the
+    eager zero fill only recorded a memset node per graph forward. A kernel node after a
+    memset node waits for it with a plain edge, which cost 5-15 us of idle GPU per node
+    on GB300 (T81: 15 us at the target-verify graph's start, 5-6 us before each draft
+    forward's front kernel). Without the node, each first kernel follows a non-PDL
+    launch (the graph's input copies, ``_small_copy_kernel``, the embedding gather), so
+    its grid-dependency wait still orders it after all earlier work."""
+
+    def __init__(self, buffer_size: int, dtype, device) -> None:
+        self._size = int(buffer_size)
+        self._dtype, self._device = dtype, device
+        self._buffer: Optional[torch.Tensor] = None
+        self._pointer = 0
+
+    def allocate(self, size: int) -> torch.Tensor:
+        if self._buffer is None:
+            self._buffer = torch.zeros(
+                (self._size,), dtype=self._dtype, device=self._device
+            )
+        assert self._pointer + size <= self._size
+        output = self._buffer[self._pointer : self._pointer + size]
+        self._pointer += size
+        return output
+
+
 def tp_gather(obj) -> list:
     """``obj`` of every tensor-parallel rank (host only, on the CPU group; legal
     inside a graph capture)."""

@@ -47,7 +47,7 @@ def compile_specs(
                 DistributedArgmax(max_rows),
                 {"max_rows": max_rows},
                 (
-                    *(z,) * 6,
+                    *(z,) * 7,
                     *(Int32(1),) * 5,
                     Uint64(1),
                     Int32(0),
