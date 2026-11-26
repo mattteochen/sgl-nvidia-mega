@@ -177,12 +177,17 @@ _PROLOGUE_F32X2 = os.environ.get(PROLOGUE_F32X2_ENV, "0").strip() not in ("", "0
 # end-trigger form of the shared layers: q_b, W_UK, RoPE + FP8 query, MLA rows) on a side stream forked after the q_a /
 # kv_a projection (at 9-16 rows before the stock key / head-gate projection, which moves after the fork) and joined
 # before the sparse MLA. =2 forks P_back after the indexer query projection instead. Same outputs, bit for bit. The
-# layers without their own indexer and the draft are unchanged. Read at build.
+# layers without their own indexer and the draft are unchanged. SGLANG_NVIDIA_MEGAKERNEL_GLM_IDX_SPLIT_MIN_ROWS=n
+# (default 9): only verify widths of n..16 rows split (T94 GB300 microbench: -3..-4.6 us per indexer layer at 12 / 16
+# rows, +0.5..+4 at 4 / 8, where the small-M projection already carries the key / head-gate rows and P_back's CTAs
+# hold the SMs the indexer query projection needs). Read at build.
 IDX_SPLIT_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_IDX_SPLIT"
+IDX_SPLIT_MIN_ROWS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_IDX_SPLIT_MIN_ROWS"
 _IDX_SPLIT = (os.environ.get(IDX_SPLIT_ENV, "0").strip() or "0")
 if _IDX_SPLIT not in ("0", "1", "2"):
     raise ValueError(f"{IDX_SPLIT_ENV}={_IDX_SPLIT!r}: expected 0, 1 or 2")
 _IDX_SPLIT = int(_IDX_SPLIT)
+_IDX_SPLIT_MIN_ROWS = int(os.environ.get(IDX_SPLIT_MIN_ROWS_ENV, "9").strip() or "9")
 # SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE16_ROW_NORM=1 (with PROLOGUE16_OVERLAP): the 16-row prologue's head CTAs load
 # each q row on the warp that sums it, in the strided-sum lane layout, and normalize it from registers (no shared-memory
 # round trip for the sums, no CTA-wide normalize phase; MlaPrologue row_norm).
@@ -350,7 +355,9 @@ class FusedAttention(AttentionStep):
         # (slot dnorm; the composition wires its producer when ``takes_deferred_norm``)
         self.takes_deferred_norm = self.qa_s_dn is not None
         # the indexer-layer prologue split (IDX_SPLIT_ENV; target only): P_front, or None
-        self.front = fn.get(f"front.{cap}") if glue.target and glue.idx_split else None
+        self.front = None
+        if glue.target and glue.idx_split and rows >= glue.idx_split_min_rows:
+            self.front = fn.get(f"front.{cap}")
         self.fork_after_iq = glue.idx_split == 2
         self._rows = rows
         self._split_layers: Dict[int, bool] = {}  # first forward: layer id -> split
@@ -854,6 +861,7 @@ class AttentionGlue:
         # the indexer-layer prologue split (IDX_SPLIT_ENV): the target's only, and only
         # with layers that run their own indexer
         self.idx_split = _IDX_SPLIT if self.target and index_rope_f32 else 0
+        self.idx_split_min_rows = _IDX_SPLIT_MIN_ROWS
         self.rope_f32 = rope_f32.pop()
         self.index_rope_f32 = index_rope_f32.pop() if index_rope_f32 else True
         self.split_stream = (
@@ -890,14 +898,22 @@ class AttentionGlue:
             prologue16_early_arm=_PROLOGUE16_EARLY_ARM,
         )
         if self.idx_split:
+            split_rows = [m for m in sorted(rows) if self.idx_split_min_rows <= m <= 16]
+            fronts = {f"front.{kernel_rows(m)}" for m in split_rows}
+            for name in [k for k in specs if k.startswith("front.") and k not in fronts]:
+                del specs[name]  # no width splits at this capacity
             logger.info(
                 "NVIDIA megakernel: GLM-5.3 / GLM-5.2: indexer-layer prologue split built: "
-                "P_front %s, P_back = %s on a side stream forked after %s (%s=%d)",
-                sorted(k for k in specs if k.startswith("front.")),
-                sorted(k for k in specs if k.startswith("prologue_end.")),
+                "P_front %s, P_back = %s on a side stream forked after %s, at rows %s "
+                "(%s=%d, %s=%d)",
+                sorted(fronts),
+                sorted(f"prologue_end.{kernel_rows(m)}" for m in split_rows),
                 "the indexer query" if self.idx_split == 2 else "q_a / kv_a",
+                split_rows,
                 IDX_SPLIT_ENV,
                 self.idx_split,
+                IDX_SPLIT_MIN_ROWS_ENV,
+                self.idx_split_min_rows,
             )
         if _PROLOGUE16_OVERLAP and "prologue.16" in specs:
             logger.info(
