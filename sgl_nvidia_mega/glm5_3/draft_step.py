@@ -26,6 +26,11 @@ kernels inside the draft-decode and draft-extend CUDA graphs.
 * slot ``draft_rowselect``: in the draft extend the layer keeps only the ``select_index`` rows (one per request:
   the rows its LM head reads) after the post-attention norm, so the MLP, its all-reduce and the final norm run on
   one row per request (the attention still writes every row's KV and indexer key).
+* SGLang's draft top-1 sink (``SGLANG_SPEC_DRAFT_TOPK1_SINK``, a ``DraftTopk1Sink`` in the forward flags of a
+  draft-decode step): the distributed argmax also writes the step's ``topk_index`` / ``topk_p``, its draft-token
+  column and ``positions += 1`` (what SGLang's partials finalizer writes), so SGLang's draft loop does not launch
+  the finalizer (and, with ``SGLANG_SPEC_DRAFT_INPUT_NO_COPY``, reads the step inputs in place). Same token, same
+  writes: bitwise.
 
 The kernels, the derived eh_proj shard and the top-1 mailboxes are built with the draft spec. The target's build
 registers its hop kernels (with the eh gather's unit and the draft's error-record sites) under the embedding table
@@ -100,6 +105,17 @@ SGLANG_READS = {
         "final_norm",
         # DRAFT_FRONT_ENV: the summed eh_proj is the stream's written residual
         "set_written",
+    ),
+    # SGLANG_SPEC_DRAFT_TOPK1_SINK: the draft-decode step's sink in the forward flags
+    "srt/runtime_context.py": ("get_forward", "\"draft_topk1_sink\""),
+    "kernels/ops/speculative/topk1.py": (
+        "DraftTopk1Sink",
+        "topk_p",
+        "topk_index",
+        "positions",
+        "draft_tokens",
+        "column",
+        "filled",
     ),
     # DRAFT_FRONT_ENV: the draft layer's input norm, applied in the hop
     "srt/layers/layernorm.py": ("weight", "variance_epsilon"),
@@ -260,6 +276,41 @@ def draft_front_mode() -> Optional[str]:
     return mode
 
 
+def _topk1_sink():
+    """SGLang's draft top-1 sink of the running draft-decode step (``draft_topk1_sink``
+    in the forward flags, SGLANG_SPEC_DRAFT_TOPK1_SINK), or None (also on an SGLang
+    without the flag)."""
+    try:
+        from sglang.srt.runtime_context import get_forward
+    except ImportError:
+        return None
+    try:
+        return getattr(get_forward(), "draft_topk1_sink", None)
+    except Exception:
+        return None
+
+
+def sink_reason(sink, rows: int) -> str:
+    """Why the distributed argmax cannot write ``sink`` (a ``DraftTopk1Sink``) at
+    ``rows`` rows, or "" (host-only facts, fixed per captured shape)."""
+    ti, tp, pos, tok = sink.topk_index, sink.topk_p, sink.positions, sink.draft_tokens
+    if ti.dtype != torch.int64 or tuple(ti.shape) != (rows, 1) or not ti.is_contiguous():
+        return f"topk_index {tuple(ti.shape)} {ti.dtype}"
+    if tp.dtype != torch.float32 or tuple(tp.shape) != (rows, 1) or not tp.is_contiguous():
+        return f"topk_p {tuple(tp.shape)} {tp.dtype}"
+    if pos.dtype != torch.int64 or tuple(pos.shape) != (rows,) or not pos.is_contiguous():
+        return f"positions {tuple(pos.shape)} {pos.dtype}"
+    if (
+        tok.dtype != torch.int64
+        or tok.dim() != 2
+        or tok.shape[0] != rows
+        or tok.stride(1) != 1
+        or not 0 <= int(sink.column) < tok.shape[1]
+    ):
+        return f"draft tokens {tuple(tok.shape)} {tok.dtype} column {sink.column}"
+    return ""
+
+
 def eh_rows(widths) -> tuple:
     """The eh_proj shard's row counts: the draft decode's (``DECODE_EH_ROWS``) and the
     draft extend's at the covered widths (4 rows a request: 1, 2, 3, 4, 8, 12, 16; 6:
@@ -314,6 +365,8 @@ class FusedDraft:
         self._rp_eps = 0.0
         self._rp_ready = False
         self._rp_why = "off"
+        # the draft top-1 sink: logged once per rank at its first fill
+        self._sink_logged = False
         self._arm(nextn)
 
     def _arm(self, nextn) -> None:
@@ -597,10 +650,13 @@ class FusedDraft:
         n_valid: int,
         extend: bool,
         partials: Optional[torch.Tensor] = None,
+        sink=None,
     ) -> Optional[torch.Tensor]:
         """The global top-1 ids ``[rows]`` int64 (stock NaN rule) by the distributed
         argmax, also written as SGLang's top-1 partials into ``partials`` (``[rows, 4]``
-        fp32) when given; or None (not engaged / not served)."""
+        fp32) when given, and with ``sink`` (a checked ``DraftTopk1Sink``) into its
+        ``topk_index`` / ``topk_p`` / draft-token column with ``positions += 1``; or
+        None (not engaged / not served)."""
         from cutlass import Int32, Int64, Uint32, Uint64
 
         rows, vloc = logits_shard.shape
@@ -612,7 +668,10 @@ class FusedDraft:
         ):
             return None
         k.check_shapes(rows, vloc, n_valid, self.world, self.rank)
-        ids = torch.empty(rows, dtype=torch.int64, device=logits_shard.device)
+        if sink is not None:
+            ids = sink.topk_index.view(rows)
+        else:
+            ids = torch.empty(rows, dtype=torch.int64, device=logits_shard.device)
         vals = torch.empty(rows, dtype=torch.float32, device=logits_shard.device)
         fn(
             Int64(logits_shard.data_ptr()),
@@ -622,6 +681,11 @@ class FusedDraft:
             Int64(ids.data_ptr()),
             Int64(vals.data_ptr()),
             Int64(0 if partials is None else partials.data_ptr()),
+            Int64(0 if sink is None else sink.topk_p.data_ptr()),
+            Int64(0 if sink is None else sink.draft_tokens.data_ptr()),
+            Int32(1 if sink is None else sink.draft_tokens.stride(0)),
+            Int32(0 if sink is None else int(sink.column)),
+            Int64(0 if sink is None else sink.positions.data_ptr()),
             Int32(rows),
             Int32(vloc),
             Int32(n_valid),
@@ -666,6 +730,37 @@ class FusedDraft:
         if self._top1_ids(logits_shard, n_valid, extend, partials) is None:
             return None
         return partials
+
+    def top1_sink(self, logits_shard: torch.Tensor, n_valid: int, sink) -> bool:
+        """SGLang's draft top-1 sink (draft decode): the distributed argmax writes its
+        outputs and ``sink.filled`` is set; False (nothing launched) when the sink's
+        layout does not fit (the caller then takes the partials)."""
+        rows = logits_shard.shape[0]
+        why = sink_reason(sink, rows)
+        if why:
+            if not self._sink_logged:
+                self._sink_logged = True
+                logger.warning(
+                    "NVIDIA megakernel: GLM-5.3 / GLM-5.2 draft: the draft top-1 sink "
+                    "is not written by the distributed argmax (%s); the partials "
+                    "serve (rank %d)",
+                    why,
+                    self.rank,
+                )
+            return False
+        if self._top1_ids(logits_shard, n_valid, False, None, sink) is None:
+            return False
+        sink.filled = True
+        if not self._sink_logged:
+            self._sink_logged = True
+            logger.info(
+                "NVIDIA megakernel: GLM-5.3 / GLM-5.2 draft: the distributed argmax "
+                "writes the draft-decode top-1 sink (topk_index, topk_p, draft-token "
+                "column, positions) at %d rows (rank %d)",
+                rows,
+                self.rank,
+            )
+        return True
 
     def attention_for(self, rows: int, forward_batch: ForwardBatch, view):
         """The draft layer's attention step group served at ``rows`` in this forward mode (a
@@ -955,6 +1050,15 @@ def draft_logits(
         and si.org_vocab_start_index == fd.rank * shard.shape[1]
     )
     if served and _argmax_partials_requested(lp):
+        # SGLANG_SPEC_DRAFT_TOPK1_SINK: in a draft-decode step the argmax writes the
+        # finalizer's outputs itself (SGLang's loop then reads the sink)
+        sink = None if extend or sample_indices is not None else _topk1_sink()
+        if sink is not None and fd.top1_sink(shard, si.num_org_elements, sink):
+            return LogitsProcessorOutput(
+                next_token_logits=None,
+                hidden_states=hidden_states_to_store,
+                mm_input_embeds=meta.mm_input_embeds,
+            )
         # SGLang's draft_argmax_only forward (SGLANG_SPEC_DRAFT_ARGMAX_EXCHANGE): the
         # top-1 as its partials, which its draft loop and draft extend finalize
         partials = fd.top1_partials(shard, si.num_org_elements, extend=extend)

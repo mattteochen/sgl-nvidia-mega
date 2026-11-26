@@ -38,6 +38,12 @@ Protocol (one grid of ``max_rows`` CTAs per rank, CTA ``m`` serves row ``m``):
 draft top-1 partials (``kernels/ops/speculative/topk1.py``, 4 fp32 lanes: value high /
 low 16 bits, index, first-NaN index): ``(0, 0, index, -1)``, so its finalizers pick
 ``index`` (a single candidate wins whatever its value) without a logits row.
+
+The direct outputs (each 0: none) are the writes of SGLang's draft-decode partials
+finalizer (``draft_topk1_postprocess_from_partials``), so the draft loop skips it:
+``out_p[m] = 1.0f``; ``out_tok[m * tok_stride + tok_col] = index`` (int64);
+``positions[m] += 1`` (int64). They are written by the same thread, after the same
+combine, as ``out_ids``, and only for active rows.
 """
 
 import cuda.bindings.driver as cuda
@@ -121,6 +127,11 @@ class DistributedArgmax:
         out_ids: Int64,
         out_vals: Int64,
         out_partials: Int64,
+        out_p: Int64,
+        out_tok: Int64,
+        tok_stride: Int32,
+        tok_col: Int32,
+        positions: Int64,
         rows: Int32,
         local_vocab: Int32,
         n_valid: Int32,
@@ -143,6 +154,11 @@ class DistributedArgmax:
             out_ids,
             out_vals,
             out_partials,
+            out_p,
+            out_tok,
+            tok_stride,
+            tok_col,
+            positions,
             rows,
             local_vocab,
             n_valid,
@@ -228,6 +244,11 @@ class DistributedArgmax:
         out_ids: Int64,
         out_vals: Int64,
         out_partials: Int64,
+        out_p: Int64,
+        out_tok: Int64,
+        tok_stride: Int32,
+        tok_col: Int32,
+        positions: Int64,
         rows: Int32,
         local_vocab: Int32,
         n_valid: Int32,
@@ -401,5 +422,17 @@ class DistributedArgmax:
                         Uint32(_NEG_ONE_BITS),
                     ),
                 )
+            # the draft-decode finalizer's writes (SGLang draft_topk1_postprocess_from_partials)
+            if out_p != Int64(0):
+                core.st_global_f32(out_p + Int64(row) * Int64(4), Float32(1.0))
+            if out_tok != Int64(0):
+                core.st_global_u64(
+                    out_tok
+                    + (Int64(row) * Int64(tok_stride) + Int64(tok_col)) * Int64(8),
+                    Uint64(Int64(idx)),
+                )
+            if positions != Int64(0):
+                pos_addr = positions + Int64(row) * Int64(8)
+                core.st_global_u64(pos_addr, sys_ops.ld_u64(pos_addr) + Uint64(1))
         if tid == 0:
             core.st_global_u32(epoch_addr, epoch + Uint32(1))

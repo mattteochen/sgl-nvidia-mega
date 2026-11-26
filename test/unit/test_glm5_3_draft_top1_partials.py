@@ -36,7 +36,7 @@ def _draft(monkeypatch, calls):
     def fn(*args):
         calls.append(args)
         # the kernel's ids output: token 0 on every row
-        ctypes.memset(_ptr(args[4]), 0, 8 * int(_ptr(args[7])))
+        ctypes.memset(_ptr(args[4]), 0, 8 * int(_ptr(args[12])))
 
     fd._top1 = {name: (_Kernel(), fn, mailbox, ctrl) for name in ("decode", "extend")}
     monkeypatch.setattr(ds.FusedDraft, "engaged", lambda self: True)
