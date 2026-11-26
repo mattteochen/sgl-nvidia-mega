@@ -302,9 +302,14 @@ class MlaPrologue:
         row_norm: bool = False,
         early_arm: bool = False,
         early_arm8: bool = False,
+        heads: int = HEADS,
     ):
         if max_rows not in (8, 16):
             raise ValueError(f"max_rows must be 8 or 16, got {max_rows}")
+        if heads not in (8, 16):
+            raise ValueError(f"heads must be 8 or 16, got {heads}")
+        self.heads = heads
+        self.grid = (heads + 1) * CLUSTER
         if overlap8 and max_rows != 8:
             raise ValueError("overlap8 applies to max_rows 8 only")
         if overlap16 and max_rows != 16:
@@ -440,7 +445,7 @@ class MlaPrologue:
             qc_out,
             qc_out_stride,
         ).launch(
-            grid=[GRID, 1, 1],
+            grid=[self.grid, 1, 1],
             block=[THREADS, 1, 1],
             cluster=[CLUSTER, 1, 1],
             stream=stream,
@@ -511,7 +516,7 @@ class MlaPrologue:
         r = cta % CLUSTER
         if cutlass.const_expr(self.probe):
             self._probe_base = topk
-        if cluster_id < HEADS:
+        if cluster_id < self.heads:
             if cutlass.const_expr(self.overlap16):
                 self.head_cta16o(
                     base,

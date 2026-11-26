@@ -34,6 +34,7 @@ from __future__ import annotations
 
 import functools
 import logging
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -133,8 +134,8 @@ WIDE_MAX_ROWS = 48
 # Verify rows the family serves (profile ACCEPTED at TP4).
 MAX_ROWS = 48
 # The steps the unit claims (atomically: the deferred kv_a norm passes from prologue
-# to rope_cache).
-STEPS = ("qkv_a", "prologue", "index_k", "rope_cache")
+# to rope_cache, and TP4 MlaPrologue16 also absorbs q_nope).
+STEPS = ("qkv_a", "prologue", "index_k", "q_absorb", "rope_cache")
 # the option unit that folds the kv_a norm (units.OPTIONS)
 FOLD_UNIT = "ll.attention.kv_norm_fold"
 
@@ -392,6 +393,91 @@ class LLAttention(AttentionStep):
     ) -> PrologueOut:
         from sglang.srt.model_executor.runner import get_is_capture_mode
 
+        p16 = self.family.prologue16_fn
+        p16_la = (
+            self.family.prologue16_layers.get(attn.layer_id)
+            if p16 is not None
+            else None
+        )
+        rows = qkv_latent.shape[0]
+        if (
+            p16 is not None
+            and p16_la is not None
+            and 1 <= rows <= 8
+            and qkv_latent.dtype == torch.bfloat16
+            and qkv_latent.is_contiguous()
+        ):
+            from cutlass import Float32, Int32, Int64
+            from sglang.srt.utils.async_probe import maybe_detect_oob
+
+            from sgl_nvidia_mega.glm5_3.runtime.compile import cu_stream
+
+            fb = step.forward_batch
+            loc = fb.out_cache_loc
+            pos = step.positions
+            if (
+                isinstance(loc, torch.Tensor)
+                and loc.dtype == torch.int64
+                and loc.dim() == 1
+                and loc.numel() >= rows
+                and loc.stride(0) == 1
+                and isinstance(pos, torch.Tensor)
+                and pos.dtype == torch.int64
+                and pos.dim() == 1
+                and pos.numel() >= rows
+                and pos.stride(0) == 1
+            ):
+                dev = qkv_latent.device
+                mla = step.view.kv_pool.get_key_buffer(attn.layer_id)
+                if mla.dim() == 2:
+                    mla = mla.unsqueeze(1)
+                if (
+                    mla.dim() == 3
+                    and tuple(mla.shape[1:]) == (1, MQA_DIM)
+                    and mla.element_size() == 1
+                ):
+                    maybe_detect_oob(loc[:rows], 0, mla.shape[0], "ll.attention KV append")
+                    mqa = torch.empty(
+                        (rows, HEADS, MQA_DIM), dtype=torch.float8_e4m3fn, device=dev
+                    )
+                    need_qc = getattr(attn, "indexer", None) is not None and not getattr(
+                        attn, "skip_topk", False
+                    )
+                    qc = (
+                        torch.empty((rows, Q_LORA), dtype=torch.bfloat16, device=dev)
+                        if need_qc
+                        else None
+                    )
+                    base, stride = qkv_latent.data_ptr(), qkv_latent.stride(0)
+                    ones = self.family.prologue16_ones.data_ptr()
+                    w_qb, w_uk, q_nw, kv_nw, q_eps, kv_eps, rope = p16_la
+                    z64, z32 = Int64(0), Int32(0)
+                    p16(
+                        Int64(base), Int64(stride),
+                        Int64(base + Q_LORA * 2), Int64(stride),
+                        Int64(base + (Q_LORA + KV_LORA) * 2), Int64(stride),
+                        z64, z64,  # idx_k unused (has_indexer=0; index_k runs via ll.gemm)
+                        Int64(pos.data_ptr()), Int64(loc.data_ptr()),
+                        z64,  # idx_slot_mapping unused
+                        Int32(rows),
+                        z32,  # has_indexer=0
+                        Int64(w_qb), Int64(w_uk),
+                        Int64(q_nw.data_ptr()), Int64(kv_nw.data_ptr()),
+                        Float32(q_eps), Float32(kv_eps),
+                        Int64(rope.data_ptr()), Int64(rope.stride(0)),
+                        Int64(ones), Int64(ones),
+                        z64, z64, Float32(0.0), z64, z64,  # index-K norm & rope unused
+                        Int64(mqa.data_ptr()), Int64(mqa.stride(0)),
+                        Int64(mla.data_ptr()), Int64(mla.stride(0)), Int64(mla.stride(1)), Int64(1),
+                        z64, z64, Int64(1),  # idx_cache unused
+                        z64, z64, z32,  # topk unused
+                        Int64(qc.data_ptr()) if qc is not None else z64,
+                        Int64(qc.stride(0)) if qc is not None else z64,
+                        cu_stream(dev),
+                    )
+                    step.q_fp8 = mqa
+                    return PrologueOut(qc, None, None, None, None)
+
         # AttentionStep.prologue with q_b on _q_b and, when folded, the kv_a norm
         # left to rope_cache (so no side-stream fork / join before q_b).
         q, latent_cache = qkv_latent.split(
@@ -416,6 +502,11 @@ class LLAttention(AttentionStep):
         q_nope, q_pe, k_pe = attn._split_q_nope_pe(q, latent_cache)
         return PrologueOut(q_lora, q_nope, q_pe, k_nope, k_pe)
 
+    def q_absorb(self, attn, q_nope, step: StepContext):
+        if step.q_fp8 is not None:
+            return None
+        return super().q_absorb(attn, q_nope, step)
+
     def _index_kw(self, indexer, x, step: StepContext):
         """(key, raw head gates), projecting ``x`` through ``ll.linear`` unless a
         step already did. The stock ``index_k`` / ``index_q`` (and their two-stream
@@ -427,6 +518,9 @@ class LLAttention(AttentionStep):
     def rope_cache(
         self, attn, q_nope_out, q_pe, k_nope, k_pe, step: StepContext
     ) -> torch.Tensor:
+        if step.q_fp8 is not None:
+            q_fp8, step.q_fp8 = step.q_fp8, None
+            return q_fp8
         from sglang.srt.utils.async_probe import maybe_detect_oob
 
         layer = attn.attn_mqa
@@ -548,6 +642,7 @@ class AttentionFamily:
     def __init__(self, model, derived=None, profile=None) -> None:
         layers = _model_layers(model)
         self.layers = layers
+        self.derived = derived
         self.profile = profile
         self.attns = [layer.self_attn for layer in layers]
         first = self.attns[0]
@@ -572,6 +667,95 @@ class AttentionFamily:
         self.wide_occupancy: Optional[Tuple[int, int]] = None
         self.kw_gemm = ""
         self._served: Dict[int, LLAttention] = {}
+        self.prologue16_fn = None
+        self.prologue16_layers: Dict[int, tuple] = {}
+        self.prologue16_ones: Optional[torch.Tensor] = None
+        self._p16_keep: list = []
+
+    def _compile_prologue16(self, widths: Sequence[int]) -> None:
+        if (
+            os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_PROLOGUE", "0") != "1"
+            or self.profile is None
+            or tuple(self.profile.sm) != SM
+            or not any(1 <= m <= 8 for m in widths)
+        ):
+            return
+        import dataclasses
+        import cutlass.cute as cute
+
+        from sgl_nvidia_mega.glm5_3.attention.fused import _prologue_numerics
+        from sgl_nvidia_mega.glm5_3.runtime.compile import compile_cached
+        from sgl_nvidia_mega.glm5_3.sm103.attention.api import example_args
+        from sgl_nvidia_mega.glm5_3.sm103.attention.mla_prologue import MlaPrologue
+        from sgl_nvidia_mega.glm5_3.sm103.packing import (
+            pack_q_b,
+            pack_w_uk_t,
+            pack_w_uk_t_from_w_kc,
+        )
+
+        la_map: Dict[int, tuple] = {}
+        keep: list = []
+        for attn in self.attns:
+            w_qb = pack_q_b(attn.q_b_proj.weight, heads=HEADS)
+            kv_b_w = getattr(getattr(attn, "kv_b_proj", None), "weight", None)
+            if (
+                isinstance(kv_b_w, torch.Tensor)
+                and kv_b_w.dtype == torch.bfloat16
+                and tuple(kv_b_w.shape) == (HEADS * (NOPE + 256), KV_LORA)
+            ):
+                w_uk = pack_w_uk_t(kv_b_w, heads=HEADS)
+            else:
+                w_kc = getattr(attn, "w_kc", None)
+                if not isinstance(w_kc, torch.Tensor):
+                    return
+                w_uk = pack_w_uk_t_from_w_kc(w_kc)
+            if self.derived is not None:
+                w_qb = self.derived.add("ll.prologue16.q_b", w_qb)
+                w_uk = self.derived.add("ll.prologue16.w_uk_t", w_uk)
+            keep.extend((w_qb, w_uk))
+            la_map[attn.layer_id] = (
+                w_qb.data_ptr(),
+                w_uk.data_ptr(),
+                attn.q_a_layernorm.weight,
+                attn.kv_a_layernorm.weight,
+                float(attn.q_a_layernorm.variance_epsilon),
+                float(attn.kv_a_layernorm.variance_epsilon),
+                attn.rotary_emb.cos_sin_cache,
+            )
+        num = _prologue_numerics()
+        kernel = MlaPrologue(
+            8,
+            num,
+            rope_cache_fp32=True,
+            index_rope_cache_fp32=True,
+            overlap8=True,
+            push=True,
+            f32x2=True,
+            early_arm8=True,
+            heads=HEADS,
+        )
+        key = {
+            "max_rows": 8,
+            "heads": HEADS,
+            **dataclasses.asdict(num),
+            "rope_cache_fp32": True,
+            "index_rope_cache_fp32": True,
+            "overlap8": True,
+            "push": True,
+            "f32x2": True,
+            "early_arm8": True,
+        }
+        args = example_args()["prologue"]
+        self.prologue16_fn = compile_cached(
+            kernel, key, lambda k=kernel, a=args: cute.compile(k, *a)
+        )
+        self.prologue16_layers = la_map
+        self.prologue16_ones = torch.ones(1, dtype=torch.float32, device=self.device)
+        self._p16_keep = keep
+        logger.info(
+            "ll.attention: SM103 TP4 MlaPrologue16 (17x8=136 CTAs, overlap8+push+f32x2+early_arm8) compiled for %d layers (rows <= 8)",
+            len(la_map),
+        )
 
     def compile(self, widths: Sequence[int]) -> None:
         """Every kernel form ``widths`` use, the occupancy gate of the split-K form
@@ -619,6 +803,7 @@ class AttentionFamily:
         _kv_half_module(self.fold.fold, False, pdl, self.trigger_at_entry)
         if target is not None:
             target.note("ll.attention")
+        self._compile_prologue16(widths)
         self._log(widths)
 
     def _decide_fold(self, widths: Sequence[int]) -> norm_backend.NormFold:
