@@ -115,7 +115,7 @@ class OProjArProduceRc(OProjArProduce):
             self.stage16(xs_base + Uint32(2 * (mm * RXS_STRIDE + kc * 8)), src)
             i = i + GEMV_THREADS
         self.stage_done()
-        self.epoch_begin(mb, es, True)
+        self.epoch_begin(mb, es, True, 0, self.epoch_overlap)
         hi0 = Float32(0.0)
         hi1 = Float32(0.0)
         hi2 = Float32(0.0)
