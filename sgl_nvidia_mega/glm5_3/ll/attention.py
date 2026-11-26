@@ -440,9 +440,7 @@ class LLAttention(AttentionStep):
                     mqa = torch.empty(
                         (rows, HEADS, MQA_DIM), dtype=torch.float8_e4m3fn, device=dev
                     )
-                    need_qc = getattr(attn, "indexer", None) is not None and not getattr(
-                        attn, "skip_topk", False
-                    )
+                    need_qc = getattr(attn, "indexer", None) is not None
                     qc = (
                         torch.empty((rows, Q_LORA), dtype=torch.bfloat16, device=dev)
                         if need_qc
