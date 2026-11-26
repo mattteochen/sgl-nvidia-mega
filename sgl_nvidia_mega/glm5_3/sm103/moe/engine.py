@@ -235,12 +235,21 @@ class Nvfp4MoeSmallM:
         shared: bool = True,
         merge: bool = True,
         pre: int = 1,
+        quarters: int = 4,
     ):
         self.mode = mode
         self.g = _Geometry(mode)
         self.shared = shared
         self.merge = merge
         self.pre = int(pre)
+        self.quarters = int(quarters)
+        if self.quarters not in (4, 8):
+            raise ValueError(f"small-M MoE: quarters {quarters} (4 or 8)")
+        self.q_shift = 2 if self.quarters == 4 else 3
+        self.q_mask = self.quarters - 1
+        self.fc1_rows = 128 * self.quarters
+        self.sf13_per_expert = self.fc1_rows * 384
+        self.sh_clusters = self.quarters
         if self.pre not in (1, 3) or (self.pre == 3 and (self.g.two and not merge)):
             raise ValueError(
                 f"small-M MoE: pre {pre} (1, or 3 for g1 / merged g2)"
@@ -249,7 +258,12 @@ class Nvfp4MoeSmallM:
     def knobs(self) -> dict:
         """Build-time choices beyond the unit name (compile-cache key; empty for the
         stock form, so its key is unchanged)."""
-        return {"pre": self.pre} if self.pre != 1 else {}
+        out = {}
+        if self.pre != 1:
+            out["pre"] = self.pre
+        if self.quarters != 4:
+            out["quarters"] = self.quarters
+        return out
 
     @cute.jit
     def __call__(
@@ -277,12 +291,12 @@ class Nvfp4MoeSmallM:
         nclusters: Int32,
         stream: cuda.CUstream,
     ):
-        # processed w13 viewed as {128 B, E * 512 rows, 24 column blocks}: one box = one
+        # processed w13 viewed as {128 B, E * fc1_rows, 24 column blocks}: one box = one
         # FC1 chunk (two 128 x 128 slots)
         tmap = create_tensor_map_tiled(
             w13,
             Uint8,
-            [128, NUM_EXPERTS * 512, 24],
+            [128, NUM_EXPERTS * self.fc1_rows, 24],
             [3072 // 16, 128 // 16],
             [128, 128, 2],
             swizzle=TensorMapSwizzle.s128b,
@@ -369,14 +383,14 @@ class Nvfp4MoeSmallM:
             dst,
             tmap_ptr,
             0,
-            expert * 512 + 128 * quarter,
+            expert * self.fc1_rows + 128 * quarter,
             crank * 6 + 2 * c,
             bar,
             policy,
         )
         src = (
             sf13
-            + Int64(expert) * SF13_PER_EXPERT
+            + Int64(expert) * self.sf13_per_expert
             + Int64(96 * quarter + 24 * crank + 8 * c) * 512
         )
         C.bulk_copy_g2s(dst + 32768, src, 4096, bar, policy)
@@ -496,7 +510,10 @@ class Nvfp4MoeSmallM:
                         uj = Int32(self.unit_field(misc, i, self.g.u_j))
                         src2 = (
                             fc2pack
-                            + ((Int64(u_e_idx) * 4 + Int64(uj)) * 4 + Int64(crank))
+                            + (
+                                (Int64(u_e_idx) * self.quarters + Int64(uj)) * 4
+                                + Int64(crank)
+                            )
                             * FC2_RECORD
                         )
                         c0 = Int32(3)
@@ -579,7 +596,7 @@ class Nvfp4MoeSmallM:
         if P.ld_shared_s16(row0) > 0:
             code0 = P.ld_shared_s16(row0 + 2)
         if code0 >= 0:
-            idx = code0 >> 2
+            idx = code0 >> self.q_shift
             mine = (idx >= incl - cnt) & (idx < incl)
             who = Uint32(cute.arch.vote_ballot_sync(mine))
             e0 = Int32(0)
@@ -599,14 +616,14 @@ class Nvfp4MoeSmallM:
                     sf13,
                     base + OFF_RING,
                     e0,
-                    code0 & 3,
+                    code0 & self.q_mask,
                     crank,
                     0,
                     misc + g.b_full,
                     policy,
                 )
                 self.unit0_rest(
-                    tmap_ptr, sf13, base, misc, crank, e0, code0 & 3, policy
+                    tmap_ptr, sf13, base, misc, crank, e0, code0 & self.q_mask, policy
                 )
                 issued = Int32(3)
             issued = cute.arch.shuffle_sync(issued, 0)
@@ -687,9 +704,10 @@ class Nvfp4MoeSmallM:
                 C.st_shared_u32(unit + g.u_sh, Int32(1))
             else:
                 C.st_shared_u32(
-                    unit + g.u_e, C.ld_shared_u32(misc + g.m_elist + 4 * (code >> 2))
+                    unit + g.u_e,
+                    C.ld_shared_u32(misc + g.m_elist + 4 * (code >> self.q_shift)),
                 )
-                C.st_shared_u32(unit + g.u_j, code & 3)
+                C.st_shared_u32(unit + g.u_j, code & self.q_mask)
                 C.st_shared_u32(unit + g.u_sh, Int32(0))
         cute.arch.sync_warp()
         pre0 = Int32(0)
@@ -833,7 +851,7 @@ class Nvfp4MoeSmallM:
             if P.ld_shared_s16(row0) > 0:
                 code0 = P.ld_shared_s16(row0 + 2)
             if code0 >= 0:
-                idx = code0 >> 2
+                idx = code0 >> self.q_shift
                 mine = (idx >= incl - cnt) & (idx < incl)
                 who = Uint32(cute.arch.vote_ballot_sync(mine))
                 e0 = Int32(0)
@@ -853,7 +871,7 @@ class Nvfp4MoeSmallM:
                         sf13,
                         base + OFF_RING,
                         e0,
-                        code0 & 3,
+                        code0 & self.q_mask,
                         crank,
                         0,
                         misc + g.b_full,
@@ -862,7 +880,14 @@ class Nvfp4MoeSmallM:
                     pre0 = Int32(1)
                     if cutlass.const_expr(self.pre == 3):
                         self.unit0_rest(
-                            tmap_ptr, sf13, base, misc, crank, e0, code0 & 3, policy
+                            tmap_ptr,
+                            sf13,
+                            base,
+                            misc,
+                            crank,
+                            e0,
+                            code0 & self.q_mask,
+                            policy,
                         )
                         pre0 = Int32(3)
                 pre0 = cute.arch.shuffle_sync(pre0, 0)
@@ -897,11 +922,14 @@ class Nvfp4MoeSmallM:
                     gmu = Int32(3)
             else:
                 C.st_shared_u32(
-                    unit + g.u_e, C.ld_shared_u32(misc + g.m_elist + 4 * (code >> 2))
+                    unit + g.u_e,
+                    C.ld_shared_u32(misc + g.m_elist + 4 * (code >> self.q_shift)),
                 )
-                C.st_shared_u32(unit + g.u_j, code & 3)
+                C.st_shared_u32(unit + g.u_j, code & self.q_mask)
                 C.st_shared_u32(unit + g.u_sh, Int32(0))
-                gmu = Int32(C.ld_shared_u32(misc + g.m_egm + 4 * (code >> 2)))
+                gmu = Int32(
+                    C.ld_shared_u32(misc + g.m_egm + 4 * (code >> self.q_shift))
+                )
             C.st_shared_u32(unit + g.u_gm, gmu)
         # exchanges of this cluster (one per (unit, group)), the same in its four CTAs
         nx = P.popc(gmu)
@@ -2100,7 +2128,7 @@ class Nvfp4MoeSmallM:
         # TMEM base, read by every thread once the allocation is visible
         tm = Int32(C.ld_shared_u32(misc + g.m_tmem))
         my_sh = Int32(0)
-        if cl < SH_CLUSTERS:
+        if cl < self.sh_clusters:
             my_sh = Int32(1)
         if warp == 0:
             if cutlass.const_expr(g.two):

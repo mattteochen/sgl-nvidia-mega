@@ -307,9 +307,185 @@ class LlMoeFamily:
         self.dense = dense  # layer id -> dense mlp
         # the GEMM plans' target (``ll.target``; None: no plan) and SMs (None: this GPU's)
         self.target, self.sms = target, sms
+        self.sm = None
         self.widths: tuple = ()
         # the shared expert's stream (PRIORITY_UNIT), None: each layer's alt stream
         self.shared_stream: Optional[torch.cuda.Stream] = None
+        # SM103 TP4 (quarters=8, INTER=512, rows <= 8) persistent NVFP4 MoE engine
+        self.derived: Any = None
+        self.tp: int = 0
+        self.sm103_engine = None
+        self.sm103_layers: Dict[int, object] = {}
+        self.sm103_fn: Dict[str, object] = {}
+        self._sm103_keep: list = []
+
+    def _compile_sm103(self) -> None:
+        if (
+            os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_SM103_HOP_MOE", "1") != "1"
+            or self.tp != 4
+            or self.sm != (10, 3)
+            or not self.layers
+            or not any(1 <= w <= 8 for w in self.widths)
+        ):
+            return
+        import cutlass.cute as cute
+
+        from sgl_nvidia_mega.glm5_3.moe import (
+            EXPERTS,
+            HIDDEN,
+            TOP_K,
+            _bad,
+            _process_like_server,
+            _u8,
+            moe_split,
+        )
+        from sgl_nvidia_mega.glm5_3.runtime.compile import compile_cached
+        from sgl_nvidia_mega.glm5_3.sm103.moe import api
+        from sgl_nvidia_mega.glm5_3.sm103.moe import weights as W
+
+        inter = 512
+        quarters = 8
+        for lid, (mlp, _) in self.layers.items():
+            ex = mlp.experts
+            for name, shape in (
+                ("w13_weight", (EXPERTS, 2 * inter, HIDDEN // 2)),
+                ("w2_weight", (EXPERTS, HIDDEN, inter // 2)),
+            ):
+                if _bad(getattr(ex, name, None), torch.uint8, shape):
+                    logger.warning(
+                        "GLM LL MoE SM103 TP4 declined (layer %d: %s not uint8 %s)",
+                        lid,
+                        name,
+                        shape,
+                    )
+                    return
+            for name, n in (
+                ("w13_weight_scale", EXPERTS * 2 * inter * HIDDEN // 16),
+                ("w2_weight_scale", EXPERTS * HIDDEN * inter // 16),
+            ):
+                if _bad(getattr(ex, name, None), torch.float8_e4m3fn, numel=n):
+                    logger.warning(
+                        "GLM LL MoE SM103 TP4 declined (layer %d: %s bad scale)",
+                        lid,
+                        name,
+                    )
+                    return
+            for name in ("g1_alphas", "g1_alphas_up", "g2_alphas"):
+                if _bad(
+                    getattr(ex, name, None),
+                    torch.float32,
+                    (EXPERTS,),
+                    contiguous=False,
+                ):
+                    return
+            if not torch.equal(ex.g1_alphas, ex.g1_alphas_up):
+                return
+            for name in ("w13_input_scale_quant", "w2_input_scale_quant"):
+                t = getattr(ex, name, None)
+                if t is None or t.numel() != 1:
+                    return
+            cfg = ex.moe_runner_config
+            if (
+                getattr(cfg, "activation", "silu") != "silu"
+                or getattr(cfg, "gemm1_clamp_limit", None)
+                or getattr(cfg, "swiglu_limit", None)
+                or getattr(cfg, "gemm1_alpha", None) is not None
+            ):
+                return
+            gu = mlp.shared_experts.gate_up_proj.weight
+            dn = mlp.shared_experts.down_proj.weight
+            if _bad(gu, torch.bfloat16, (2 * inter, HIDDEN), contiguous=False):
+                return
+            if _bad(dn, torch.bfloat16, (HIDDEN, inter), contiguous=False):
+                return
+            bias = mlp.gate.e_score_correction_bias
+            if _bad(bias, torch.float32, (EXPERTS,), contiguous=False):
+                return
+
+        first_mlp = next(iter(self.layers.values()))[0]
+        dev = first_mlp.experts.w13_weight.device
+        try:
+            specs = api.compile_specs(
+                shared=True,
+                quarters=quarters,
+                include_g4=False,
+                pre3_default=True,
+            )
+            W.layout_self_test(_process_like_server, dev, inter=inter)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("GLM LL MoE SM103 TP4 declined: %s", e)
+            return
+
+        sm103_layers: Dict[int, object] = {}
+        keep: list = []
+        for lid, (mlp, _) in self.layers.items():
+            ex, sh = mlp.experts, mlp.shared_experts
+            records = W.fc2_records(
+                _u8(ex.w2_weight.data).reshape(EXPERTS, HIDDEN, inter // 2),
+                _u8(ex.w2_weight_scale.data).reshape(EXPERTS, -1),
+                inter=inter,
+            )
+            pack = W.shared_pack(
+                sh.gate_up_proj.weight.data, sh.down_proj.weight.data, inter=inter
+            )
+            if self.derived is not None:
+                records = self.derived.add("ll.moe.fc2_records", records)
+                pack = self.derived.add("ll.moe.shared_pack", pack)
+            keep.extend((records, pack))
+            lt = api.LayerTensors(
+                w13=ex.w13_weight.data,
+                w13_scales=_u8(ex.w13_weight_scale.data).reshape(EXPERTS, -1),
+                fc2_records=records.view(EXPERTS, quarters, 4, -1),
+                shared_pack=pack,
+                g1_alpha=ex.g1_alphas.data,
+                g2_alpha=ex.g2_alphas.data,
+                gs1=float(ex.w13_input_scale_quant.item()),
+                gs2=float(ex.w2_input_scale_quant.item()),
+            )
+            lt.check(quarters=quarters)
+            sm103_layers[lid] = lt
+
+        modes = {api.mode_for(moe_split(w)) for w in self.widths if 1 <= w <= 8}
+        fn: Dict[str, object] = {}
+        for name in sorted({"route", "finalize"} | modes):
+            kernel, args = specs[name]
+            constexprs = {"unit": name, "shared": True}
+            if hasattr(kernel, "knobs"):
+                constexprs.update(kernel.knobs())
+            fn[name] = compile_cached(
+                kernel,
+                constexprs,
+                lambda k=kernel, a=args: cute.compile(k, *a),
+            )
+        nclusters = api.default_clusters(dev)
+        self.sm103_fn = fn
+        self.sm103_layers = sm103_layers
+        self.sm103_engine = api.SmallMMoe(
+            fn, nclusters, dev, shared=True, quarters=quarters
+        )
+        self._sm103_keep = keep
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            logger.info(
+                "GLM LL MoE: SM103 TP4 persistent Nvfp4MoeSmallM (quarters=%d, inter=%d, modes=%s, nclusters=%d) compiled for %d layers (rows <= 8)",
+                quarters,
+                inter,
+                sorted(modes),
+                nclusters,
+                len(sm103_layers),
+            )
+
+    def sm103_records(self, m: int):
+        from sgl_nvidia_mega.glm5_3.moe import HIDDEN, TOP_K, MoeRecords
+
+        sc = self.sm103_engine.scratch
+        q = 8
+        return MoeRecords(
+            pq=sc.partials[: q * m * TOP_K * HIDDEN].view(q, m, TOP_K, HIDDEN),
+            shpartials=sc.shared_partials[: q * m * HIDDEN].view(q, m, HIDDEN),
+            ids_fin=sc.slot_ids[: m * TOP_K].view(m, TOP_K),
+            w_fin=sc.slot_weights[: m * TOP_K].view(m, TOP_K),
+            g2s=sc.slot_scales[: m * TOP_K].view(m, TOP_K),
+        )
 
     def compile(self, widths) -> None:
         """Prepare the GEMM roles (``ll.build_linear``) at every width (outside
@@ -322,6 +498,7 @@ class LlMoeFamily:
             ll.build_linear("router", mlp.gate, self.widths, **facts)
         for mlp in self.dense.values():
             ll.build_linear("dense_down", mlp.down_proj, self.widths, **facts)
+        self._compile_sm103()
         from sgl_nvidia_mega.glm5_3 import units
 
         # listed in units.KNOWN (OPTIONS) and switched on (slot or additive env)
@@ -446,6 +623,13 @@ class LlMlp(MlpSteps):
         # the shared expert's stream at this width: the priority stream up to
         # PRIORITY_MAX_ROWS rows (when on), else the layer's alternate stream
         self.shared_stream = family.shared_stream if rows <= PRIORITY_MAX_ROWS else None
+        self.use_sm103 = rows <= 8 and family.sm103_engine is not None
+        if self.use_sm103:
+            from sgl_nvidia_mega.glm5_3.moe import moe_split
+
+            self.sm103_split = moe_split(rows)
+        else:
+            self.sm103_split = ()
 
     def forward(self, layer, x, buffer: Optional[torch.Tensor], step):
         lid = layer.layer_id
@@ -455,6 +639,14 @@ class LlMlp(MlpSteps):
             return dense_forward(self.f.dense[lid], x)
         if lid not in self.f.layers:
             return super().forward(layer, x, buffer, step)
+        if self.use_sm103 and lid in self.f.sm103_layers:
+            routing, step.routing = step.routing, None
+            if routing is not None:
+                ids, weights = routing
+                self.f.sm103_engine(
+                    self.f.sm103_layers[lid], x, ids, weights, self.sm103_split, what=1
+                )
+                return self.f.sm103_records(x.shape[0])
         mlp, args = self.f.layers[lid]
         if nvfp4 is not None and (nvfp4.layer_id != lid or nvfp4.norm is not x):
             raise RuntimeError(
@@ -492,6 +684,11 @@ def _family(model: Any, derived: Any, profile: Any):
     except ValueError as e:
         return DeclinedFamily(str(e))
     family.target, family.sms = profile.target, profile.sms
+    family.sm, family.tp, family.derived = (
+        tuple(profile.sm),
+        int(profile.tp),
+        derived,
+    )
     if profile.target is not None:
         profile.target.note("ll.moe")
     return family

@@ -26,35 +26,39 @@ G1_BLOCK_BYTES = 2256  # 33 x 34 int16 = 2244 B, padded to a multiple of 16
 
 
 def g1_table(
-    nclusters: int, shared: bool, shared_weight: int = G12_SHARED_WEIGHT
+    nclusters: int,
+    shared: bool,
+    shared_weight: int = G12_SHARED_WEIGHT,
+    quarters: int = 4,
 ) -> torch.Tensor:
     """int16 [nclusters][G1_BLOCK_BYTES / 2]. Without the shared expert, unit u goes to
-    cluster u % nclusters. With it (nclusters >= 8), clusters 0..3 run one shared
-    quarter each first; routed units fill clusters 4.. round-robin up to a per-cluster
-    cap, the remainder going round-robin to clusters 0..3."""
+    cluster u % nclusters. With it (nclusters >= 2 * quarters), clusters 0..quarters-1
+    run one shared quarter each first; routed units fill clusters quarters.. round-robin
+    up to a per-cluster cap, the remainder going round-robin to clusters 0..quarters-1."""
     nc = nclusters
-    with_shared = shared and nc >= 2 * SH_CLUSTERS
+    sh_clusters = quarters
+    with_shared = shared and nc >= 2 * sh_clusters
     tab = torch.zeros(nc, G1_D, G1_ROW, dtype=torch.int16)
     for d in range(G1_D):
-        units = 4 * d
+        units = quarters * d
         lists: list[list[int]] = [[] for _ in range(nc)]
         if not with_shared:
             for u in range(units):
                 lists[u % nc].append(u)
             parts = min(nc, units)
         else:
-            routed_clusters = nc - SH_CLUSTERS
+            routed_clusters = nc - sh_clusters
             cap = min(
-                (units + shared_weight * SH_CLUSTERS + nc - 1) // nc, G1_MAX_UNITS
+                (units + shared_weight * sh_clusters + nc - 1) // nc, G1_MAX_UNITS
             )
             lim = min(units, routed_clusters * cap)
-            for cl in range(SH_CLUSTERS):
+            for cl in range(sh_clusters):
                 lists[cl].append(-1)
             for u in range(lim):
-                lists[SH_CLUSTERS + u % routed_clusters].append(u)
+                lists[sh_clusters + u % routed_clusters].append(u)
             for u in range(lim, units):
-                lists[(u - lim) % SH_CLUSTERS].append(u)
-            parts = SH_CLUSTERS + min(routed_clusters, units)
+                lists[(u - lim) % sh_clusters].append(u)
+            parts = sh_clusters + min(routed_clusters, units)
         for cl in range(nc):
             if len(lists[cl]) > G1_MAX_UNITS:
                 raise ValueError(
@@ -79,31 +83,35 @@ G2_BLOCK_BYTES = G2_D * G2_ROW * 2  # 2080
 
 
 def g2_table(
-    nclusters: int, shared: bool, shared_weight: int = G12_SHARED_WEIGHT
+    nclusters: int,
+    shared: bool,
+    shared_weight: int = G12_SHARED_WEIGHT,
+    quarters: int = 4,
 ) -> torch.Tensor:
     """int16 [nclusters][G2_BLOCK_BYTES / 2]: the G1 assignment rule over D <= 64
     entries with a 15-unit cluster cap."""
     nc = nclusters
-    with_shared = shared and nc >= 2 * SH_CLUSTERS
+    sh_clusters = quarters
+    with_shared = shared and nc >= 2 * sh_clusters
     tab = torch.zeros(nc, G2_D, G2_ROW, dtype=torch.int16)
     for d in range(G2_D):
-        units = 4 * d
+        units = quarters * d
         lists: list[list[int]] = [[] for _ in range(nc)]
         if not with_shared:
             for u in range(units):
                 lists[u % nc].append(u)
         else:
-            routed_clusters = nc - SH_CLUSTERS
+            routed_clusters = nc - sh_clusters
             cap = min(
-                (units + shared_weight * SH_CLUSTERS + nc - 1) // nc, G2_MAX_UNITS
+                (units + shared_weight * sh_clusters + nc - 1) // nc, G2_MAX_UNITS
             )
             lim = min(units, routed_clusters * cap)
-            for cl in range(SH_CLUSTERS):
+            for cl in range(sh_clusters):
                 lists[cl].append(-1)
             for u in range(lim):
-                lists[SH_CLUSTERS + u % routed_clusters].append(u)
+                lists[sh_clusters + u % routed_clusters].append(u)
             for u in range(lim, units):
-                lists[(u - lim) % SH_CLUSTERS].append(u)
+                lists[(u - lim) % sh_clusters].append(u)
         for cl in range(nc):
             if len(lists[cl]) > G2_MAX_UNITS:
                 raise ValueError(
