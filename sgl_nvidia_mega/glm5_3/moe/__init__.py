@@ -368,4 +368,11 @@ def build(model, derived) -> Optional[MoeGlue]:
     logger.info(
         "NVIDIA megakernel: GLM-5.3 / GLM-5.2: MoE engine on %d layers", len(layers)
     )
+    from sgl_nvidia_mega.glm5_3.sm103.moe import api as _moe_api
+
+    logger.info(
+        "NVIDIA megakernel: GLM-5.3 / GLM-5.2: four-request MoE engine form %s, schedule %s",
+        _moe_api.g4_knobs(),
+        _moe_api.g4_schedule_knobs(),
+    )
     return MoeGlue(api, layers, specs)
