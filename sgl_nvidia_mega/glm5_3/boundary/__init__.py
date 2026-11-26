@@ -79,7 +79,7 @@ SGLANG_READS = {
 O_PROJ_IN = 2048
 TOP_K = 8  # routed experts per row
 SMALL_ROWS = 8  # mailbox instance A (instance B: 9..16 rows)
-DENSE_MAX_ROWS = 6  # plain hops on the dense layers beside the fold; stock above
+DENSE_MAX_ROWS = 8  # plain hops on the dense layers beside the fold (up to 8 rows for K=6/7)
 # Error sites: layer * 4 + {0: o_proj, 1: MLP output, 2: final}; sites from
 # EXTERNAL_SITES on are other kernels' (named with ``HopFamily.register_sites``).
 HOPS_PER_LAYER = 4

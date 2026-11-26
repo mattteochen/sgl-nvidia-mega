@@ -51,8 +51,9 @@ from .o_proj_rc import OProjArProduceRc
 from .transport import ErrorRecord, HopMailbox
 
 MIN_PTX_ISA = (9, 2)
-# The split fold serves 1..6 rows (the plain fold above): the rows it is tested at.
-SPLIT_MAX_ROWS = 6
+# The split fold serves 1..7 rows (dynamically checked via _split_rows() cooperative
+# occupancy: 2*7+1 = 15 clusters of 8 CTAs = 120 CTAs <= 152 SMs on GB300).
+SPLIT_MAX_ROWS = 7
 MIN_PTX_COMPILER = (13, 2)
 # Opt-in fold forms, a comma list (unset / empty: the served units, unchanged):
 #   split8dn  the deferred-norm fold runs its split form without clusters (unit

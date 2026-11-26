@@ -33,6 +33,7 @@ Dense layers (0-2): the stock ``gate_up_proj`` and SiLU-and-mul, then
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
@@ -92,7 +93,7 @@ PRIORITY_UNIT = "ll.moe.alt_stream_priority"
 # GEMM preempts FC1 / FC2's later blocks (gated, those widths are unchanged). Without
 # the small-batch routing kernel (stock FlashInfer 0.7.2) it loses at 5 rows (+1.2%) and
 # 6 rows (+2.4%): the shared expert already wins its race there. Hence opt-in.
-PRIORITY_MAX_ROWS = 6
+PRIORITY_MAX_ROWS = 8
 
 
 def _next_power_of_2(n: int) -> int:
@@ -323,10 +324,14 @@ class LlMoeFamily:
             ll.build_linear("dense_down", mlp.down_proj, self.widths, **facts)
         from sgl_nvidia_mega.glm5_3 import units
 
-        # listed in units.KNOWN (OPTIONS) and switched on (an opt-in slot: only when listed)
+        # listed in units.KNOWN (OPTIONS) and switched on (slot or additive env)
         if (
             PRIORITY_UNIT in units.KNOWN
-            and units.enabled(PRIORITY_UNIT)
+            and (
+                units.enabled(PRIORITY_UNIT)
+                or os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_GLM_ALT_STREAM_PRIORITY", "0")
+                == "1"
+            )
             and any(w <= PRIORITY_MAX_ROWS for w in self.widths)
         ):
             self.shared_stream = priority_stream()

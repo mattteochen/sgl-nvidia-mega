@@ -217,9 +217,9 @@ def kernel_rows(rows: int) -> Optional[int]:
 
 
 def sparse_warps(rows: int) -> int:
-    """Warps per CTA of the sparse MLA form: one CTA per SM up to 6 rows (one request
-    of up to 6 verify rows), two above."""
-    return 16 if rows <= 6 else 8
+    """Warps per CTA of the sparse MLA form: one CTA per SM up to 7 rows (7*16=112 CTAs
+    <= 152 SMs on GB300, covering K=6 c1), two above."""
+    return 16 if rows <= 7 else 8
 
 
 def _f32(x: float) -> float:

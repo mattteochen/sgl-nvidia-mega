@@ -222,7 +222,7 @@ class Nvfp4MoeSmallM:
     split, err, schedule, shared_partials, partials, slot_ids, slot_weights,
     slot_scales, w13_scales, fc2_records, nclusters, stream)``; addresses are device
     pointers, ``gs1`` / ``gs2`` the FC1 / FC2 activation global scales (1 / input
-    scale), ``split`` the rows of the first request (g2; ignored by g1)."""
+    scale), ``split`` the rows of the first request (g2; ignored by g1).
 
     ``pre`` = 3 (opt-in; g1, or g2 with ``merge``): unit 0's three
     FC1 chunks issue as soon as unit 0 is resolved from the bitmap words and the schedule
