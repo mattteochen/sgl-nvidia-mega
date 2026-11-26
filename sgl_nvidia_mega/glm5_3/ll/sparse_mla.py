@@ -43,6 +43,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from dataclasses import dataclass, replace
 from typing import Any, Dict, Optional, Sequence, Tuple
 
@@ -497,6 +498,7 @@ class SparseMlaFdFamily:
 
     def __init__(self, model, derived, profile) -> None:
         self.profile = profile
+        self.derived = derived
         self.heads = int(profile.heads)
         self.layers = _model_layers(model)
         # the NextN draft (one decoder layer) runs the draft-decode passes the fold serves
@@ -504,6 +506,55 @@ class SparseMlaFdFamily:
         self.plan: Optional[Plan] = None
         # width -> why it declines (a derived target that cannot launch it in one wave)
         self.declined: Dict[int, str] = {}
+        # SM103 TP4 (16 heads, rows <= 8) PDL CuTe DSL uv_proj (replaces cuBLAS torch.bmm)
+        self.uv16_fn = None
+        self.uv16_weights: Dict[int, int] = {}
+        self._uv16_keep: list = []
+
+    def _compile_uv16(self) -> None:
+        if (
+            self.heads != 16
+            or tuple(self.profile.sm) != (10, 3)
+            or os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_UV_PROJ", "1") == "0"
+        ):
+            return
+        import cutlass.cute as cute
+
+        from sgl_nvidia_mega.glm5_3.runtime.compile import compile_cached
+        from sgl_nvidia_mega.glm5_3.sm103.attention.api import example_args
+        from sgl_nvidia_mega.glm5_3.sm103.attention.mla_uv_proj import MlaUvProj
+        from sgl_nvidia_mega.glm5_3.sm103.packing import pack_uv_proj_from_w_vc
+
+        weights: Dict[int, int] = {}
+        keep: list = []
+        for layer in self.layers:
+            attn = layer.self_attn
+            w_vc = getattr(attn, "w_vc", None)
+            if (
+                not isinstance(w_vc, torch.Tensor)
+                or w_vc.dtype != torch.bfloat16
+                or tuple(w_vc.shape) != (16, HEAD_DIM_V, V_HEAD_DIM)
+            ):
+                return
+            packed = pack_uv_proj_from_w_vc(w_vc, values_per_cta=32)
+            if self.derived is not None:
+                packed = self.derived.add("ll.uv_proj_16", packed)
+            keep.append(packed)
+            weights[attn.layer_id] = packed.data_ptr()
+        kernel = MlaUvProj(max_rows=8, heads=16, values_per_cta=32)
+        args = example_args()["uv"]
+        self.uv16_fn = compile_cached(
+            kernel,
+            {"max_rows": 8, "heads": 16, "values_per_cta": 32},
+            lambda k=kernel, a=args: cute.compile(k, *a),
+        )
+        self.uv16_weights = weights
+        self._uv16_keep = keep
+        logger.info(
+            "%s: SM103 TP4 MlaUvProj16 (128 CTAs, PDL) compiled for %d layers (rows <= 8)",
+            NAME,
+            len(weights),
+        )
 
     def compile(self, widths: Sequence[int]) -> None:
         """Build the kernels ``widths`` need and agree on the launch plan over the TP
@@ -547,6 +598,7 @@ class SparseMlaFdFamily:
             for w in missing
         }
         self.plan = plan
+        self._compile_uv16()
         logger.info(
             "%s: %d heads, one-tile <= %d rows (spread <= %d), multi-tile %s, v_b fold <= %d rows in %s%s",
             NAME,
@@ -717,6 +769,44 @@ class SparseMlaFdSteps:
                     "uv_proj got another tensor than the folded sparse_mla output"
                 )
             return folded
+        uv_fn = self.family.uv16_fn
+        w_ptr = self.family.uv16_weights.get(attn.layer_id) if uv_fn is not None else None
+        rows = attn_output.shape[0]
+        if (
+            uv_fn is not None
+            and w_ptr is not None
+            and 1 <= rows <= 8
+            and attn_output.dtype == torch.bfloat16
+            and attn_output.dim() == 3
+            and tuple(attn_output.shape[1:]) == (16, HEAD_DIM_V)
+            and attn_output.stride(2) == 1
+            and attn_output.data_ptr() % 16 == 0
+            and attn_output.stride(0) % 8 == 0
+            and attn_output.stride(1) % 8 == 0
+        ):
+            from cutlass import Int32, Int64
+
+            from sgl_nvidia_mega.glm5_3.runtime.compile import cu_stream
+
+            out = torch.empty(
+                (rows, 16 * V_HEAD_DIM),
+                dtype=torch.bfloat16,
+                device=attn_output.device,
+            )
+            z64, z32 = Int64(0), Int32(0)
+            uv_fn(
+                Int64(w_ptr),
+                Int64(attn_output.data_ptr()),
+                Int64(attn_output.stride(0)),
+                Int64(attn_output.stride(1)),
+                Int64(out.data_ptr()),
+                Int64(out.stride(0)),
+                Int32(rows),
+                z64, z64, z64, z64, z32,
+                z64, z64, z64, z64, z32,
+                cu_stream(attn_output.device),
+            )
+            return out
         # the stock v_b BMM (forward_absorb_core)
         return AttentionStep.uv_proj(self, attn, attn_output)
 
