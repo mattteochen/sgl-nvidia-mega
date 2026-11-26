@@ -472,7 +472,7 @@ class FusedDraft:
             self._hops.allreduce(part[lo:hi], out[lo:hi], site=SITE_EH_GATHER)
         return out
 
-    def _top1(
+    def _top1_ids(
         self,
         logits_shard: torch.Tensor,
         n_valid: int,
@@ -521,7 +521,7 @@ class FusedDraft:
         self, logits_shard: torch.Tensor, n_valid: int, vocab: int, extend: bool
     ) -> Optional[torch.Tensor]:
         """A [rows, vocab] fp32 one-hot of the global top-1 (stock NaN rule), or None."""
-        ids = self._top1(logits_shard, n_valid, extend)
+        ids = self._top1_ids(logits_shard, n_valid, extend)
         if ids is None:
             return None
         one_hot = torch.full(
@@ -544,7 +544,7 @@ class FusedDraft:
         partials = torch.empty(
             (rows, PARTIAL_LANES), dtype=torch.float32, device=logits_shard.device
         )
-        if self._top1(logits_shard, n_valid, extend, partials) is None:
+        if self._top1_ids(logits_shard, n_valid, extend, partials) is None:
             return None
         return partials
 
