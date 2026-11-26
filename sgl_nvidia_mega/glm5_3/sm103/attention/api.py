@@ -66,6 +66,7 @@ def compile_specs(
     idx_front: bool = False,
     prologue16_row_norm: bool = False,
     prologue16_early_arm: bool = False,
+    prologue8_early_arm: bool = False,
 ) -> dict[str, tuple]:
     """The attention units for row capacities ``caps`` and sparse-MLA warp counts
     ``warps``. ``numerics`` is the engine's ``PrologueNumerics`` value table and
@@ -94,7 +95,9 @@ def compile_specs(
     the 16-row prologues with the q rows summed and normalized by the warp that loads
     them (``MlaPrologue(row_norm=True)``); ``prologue16_early_arm`` (with
     ``prologue16_overlap`` and ``prologue_push``) arms their QN barrier before the weight
-    copies (``MlaPrologue(early_arm=True)``). Same outputs."""
+    copies (``MlaPrologue(early_arm=True)``). ``prologue8_early_arm`` arms the 8-row overlapped
+    pushed form's QN barrier before its weight copies (``early_arm8=True``; same
+    outputs; only with ``prologue8_overlap`` and ``prologue_push``)."""
     from .indexer_front import IndexerFront
     from .indexer_q_proj import IndexerQProj
     from .mla_prologue import MlaPrologue
@@ -136,10 +139,13 @@ def compile_specs(
             and numerics.norm_order == "strided_8x256"
         )
         early_arm = bool(prologue16_early_arm and overlap16 and push)
+        arm8 = bool(prologue8_early_arm and overlap8 and push)
         if row_norm:
             key["row_norm"] = True
         if early_arm:
             key["early_arm"] = True
+        if arm8:
+            key["early_arm8"] = True
         specs[f"prologue.{cap}"] = (
             MlaPrologue(
                 cap,
@@ -154,6 +160,7 @@ def compile_specs(
                 f32x2=f32x2,
                 row_norm=row_norm,
                 early_arm=early_arm,
+                early_arm8=arm8,
             ),
             key,
             args["prologue"],
@@ -174,6 +181,7 @@ def compile_specs(
                     f32x2=f32x2,
                     row_norm=row_norm,
                     early_arm=early_arm,
+                    early_arm8=arm8,
                 ),
                 {**key, "trigger_at_end": True},
                 args["prologue"],

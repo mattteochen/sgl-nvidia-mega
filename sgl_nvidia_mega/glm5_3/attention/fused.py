@@ -178,9 +178,7 @@ _PROLOGUE_F32X2 = os.environ.get(PROLOGUE_F32X2_ENV, "0").strip() not in ("", "0
 # kv_a projection (at 9-16 rows before the stock key / head-gate projection, which moves after the fork) and joined
 # before the sparse MLA. =2 forks P_back after the indexer query projection instead. Same outputs, bit for bit. The
 # layers without their own indexer and the draft are unchanged. SGLANG_NVIDIA_MEGAKERNEL_GLM_IDX_SPLIT_MIN_ROWS=n
-# (default 9): only verify widths of n..16 rows split (T94 GB300 microbench: -3..-4.6 us per indexer layer at 12 / 16
-# rows, +0.5..+4 at 4 / 8, where the small-M projection already carries the key / head-gate rows and P_back's CTAs
-# hold the SMs the indexer query projection needs). Read at build.
+# (default 9): only verify widths of n..16 rows split. Read at build.
 IDX_SPLIT_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_IDX_SPLIT"
 IDX_SPLIT_MIN_ROWS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_IDX_SPLIT_MIN_ROWS"
 _IDX_SPLIT = (os.environ.get(IDX_SPLIT_ENV, "0").strip() or "0")
@@ -188,16 +186,15 @@ if _IDX_SPLIT not in ("0", "1", "2"):
     raise ValueError(f"{IDX_SPLIT_ENV}={_IDX_SPLIT!r}: expected 0, 1 or 2")
 _IDX_SPLIT = int(_IDX_SPLIT)
 _IDX_SPLIT_MIN_ROWS = int(os.environ.get(IDX_SPLIT_MIN_ROWS_ENV, "9").strip() or "9")
-# SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE16_ROW_NORM=1 (with PROLOGUE16_OVERLAP): the 16-row prologue's head CTAs load
-# each q row on the warp that sums it, in the strided-sum lane layout, and normalize it from registers (no shared-memory
-# round trip for the sums, no CTA-wide normalize phase; MlaPrologue row_norm).
-# SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE16_EARLY_ARM=1 (with PROLOGUE16_OVERLAP and PROLOGUE_PUSH): the 16-row prologue
-# arms its QN barrier with a CTA-scope arrive before the weight bulk copies, not with a cluster-scope release after
-# them (which waited for the copies before the PDL wait; MlaPrologue early_arm). Same outputs. Read at build.
 PROLOGUE16_ROW_NORM_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE16_ROW_NORM"
 PROLOGUE16_EARLY_ARM_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE16_EARLY_ARM"
 _PROLOGUE16_ROW_NORM = os.environ.get(PROLOGUE16_ROW_NORM_ENV, "0").strip() not in ("", "0")
 _PROLOGUE16_EARLY_ARM = os.environ.get(PROLOGUE16_EARLY_ARM_ENV, "0").strip() not in ("", "0")
+# SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE8_EARLY_ARM=1 (with PROLOGUE8_OVERLAP and PROLOGUE_PUSH): the 8-row prologue's
+# head CTA arms its QN barrier with a CTA-scope arrive before the weight copies (MlaPrologue early_arm8), not with a
+# cluster-scope release arrive after them. Same outputs. Read at build.
+PROLOGUE8_EARLY_ARM_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE8_EARLY_ARM"
+_PROLOGUE8_EARLY_ARM = os.environ.get(PROLOGUE8_EARLY_ARM_ENV, "0").strip() not in ("", "0")
 
 
 def _env_bytes(name: str, default: int, full: int) -> int:
@@ -896,6 +893,7 @@ class AttentionGlue:
             idx_front=bool(self.idx_split),
             prologue16_row_norm=_PROLOGUE16_ROW_NORM,
             prologue16_early_arm=_PROLOGUE16_EARLY_ARM,
+            prologue8_early_arm=_PROLOGUE8_EARLY_ARM,
         )
         if self.idx_split:
             split_rows = [m for m in sorted(rows) if self.idx_split_min_rows <= m <= 16]
@@ -926,6 +924,12 @@ class AttentionGlue:
                 "NVIDIA megakernel: GLM-5.3 / GLM-5.2: the 9-16-row prologue writes the "
                 "kv rows 8-15 on their own CTAs (%s)",
                 "target" if self.target else "draft",
+            )
+        if "prologue.8" in specs and getattr(specs["prologue.8"][0], "early_arm8", False):
+            logger.info(
+                "NVIDIA megakernel: GLM-5.3 / GLM-5.2: 8-row MLA prologue's QN barrier "
+                "armed before its weight copies (%s=1)",
+                PROLOGUE8_EARLY_ARM_ENV,
             )
         if _PROLOGUE8_OVERLAP and "prologue.8" in specs:
             logger.info(
