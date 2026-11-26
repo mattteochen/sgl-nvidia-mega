@@ -84,6 +84,20 @@ def g4_schedule_knobs() -> dict:
     }
 
 
+G12_SHARED_WEIGHT_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_MOE_SHARED_WEIGHT_G"
+
+
+def g12_schedule_knobs(mode: str) -> dict:
+    """The g1 / g2 schedule's shared-quarter weight in routed units from
+    ``SGLANG_NVIDIA_MEGAKERNEL_GLM_MOE_SHARED_WEIGHT_G1`` / ``..._G2`` (default: served,
+    ``schedule.G12_SHARED_WEIGHT``); only the unit-to-cluster assignment changes."""
+    raw = os.environ.get(G12_SHARED_WEIGHT_ENV + mode[1:], "").strip()
+    w = int(raw) if raw else S.G12_SHARED_WEIGHT
+    if not 0 <= w <= 8:
+        raise ValueError(f"{G12_SHARED_WEIGHT_ENV}{mode[1:]}={raw!r}: expected 0..8")
+    return {"shared_weight": w}
+
+
 @dataclass
 class LayerTensors:
     """One layer's tensors as the engines read them (views of the engine's processed
@@ -279,7 +293,7 @@ class SmallMMoe:
         sk = g4_schedule_knobs()
         self.tables = {}
         for mode, build in (("g1", S.g1_table), ("g2", S.g2_table), ("g4", S.g4_table)):
-            kw = sk if mode == "g4" else {}
+            kw = sk if mode == "g4" else g12_schedule_knobs(mode)
             for nc in sorted({nclusters, min(nclusters, 32)}):
                 self.tables[(mode, nc)] = build(nc, shared, **kw).to(device)
 

@@ -375,4 +375,10 @@ def build(model, derived) -> Optional[MoeGlue]:
         _moe_api.g4_knobs(),
         _moe_api.g4_schedule_knobs(),
     )
+    logger.info(
+        "NVIDIA megakernel: GLM-5.3 / GLM-5.2: one- / two-request MoE engine schedule "
+        "shared weight g1 %d, g2 %d",
+        _moe_api.g12_schedule_knobs("g1")["shared_weight"],
+        _moe_api.g12_schedule_knobs("g2")["shared_weight"],
+    )
     return MoeGlue(api, layers, specs)
