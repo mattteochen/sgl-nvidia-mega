@@ -132,13 +132,22 @@ NEXT_QKV_A_PREFETCH_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_NEXT_QKV_A_PREFETCH"
 
 
 _OPROJ_STAGE_MIN_ROWS = int(os.environ.get(OPROJ_STAGE_MIN_ROWS_ENV, "1") or "1")
-# SGLANG_NVIDIA_MEGAKERNEL_GLM_SPARSE_MT_MIN_ROWS=n (0 = off): verify rows n..16 run the sparse MLA core on the
-# multi-tile flash decode (ll.sparse_mla_fd: clusters of 8 / 6 / 4 CTAs streaming several 128-position tiles, so
-# 9-16 rows fit one wave instead of the 16-CTA clusters' two or three). Its P rounding and merge order are
-# TRTLLM-Gen's (the stock decode's), not the 16-CTA kernel's: numerics change. Row counts the device cannot hold
-# in one wave of multi-tile clusters keep the 16-CTA kernel. Read at build.
+# SGLANG_NVIDIA_MEGAKERNEL_GLM_SPARSE_LL_MIN_ROWS=n (0 = off): the target's verify rows n..16 run the sparse MLA core
+# on the flash decode of ll.sparse_mla_fd instead of the 16-CTA SparseMlaDecode: its one-tile kernel (16-CTA
+# clusters, one CTA per SM, early gather) up to its one-wave rows (capped by ..._SPARSE_LL_ONE_TILE_MAX, default
+# ll's measured 7), its multi-tile kernel (clusters of 8 / 6 / 4 CTAs over several 128-position tiles) above, so
+# 9-16 rows fit one wave instead of the 16-CTA clusters' two or three. Its P rounding and merge order are
+# TRTLLM-Gen's (the stock decode's), not SparseMlaDecode's: numerics change. Co-resident clusters are agreed
+# over the TP group (MIN); a row count neither kernel holds in one wave keeps SparseMlaDecode. Read at build.
+# SGLANG_NVIDIA_MEGAKERNEL_GLM_SPARSE_MT_MIN_ROWS=n is the same switch from max(n, 9) rows (the multi-tile rows).
+SPARSE_LL_MIN_ROWS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_SPARSE_LL_MIN_ROWS"
+SPARSE_LL_ONE_TILE_MAX_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_SPARSE_LL_ONE_TILE_MAX"
 SPARSE_MT_MIN_ROWS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_SPARSE_MT_MIN_ROWS"
+_SPARSE_LL_MIN_ROWS = int(os.environ.get(SPARSE_LL_MIN_ROWS_ENV, "0") or "0")
 _SPARSE_MT_MIN_ROWS = int(os.environ.get(SPARSE_MT_MIN_ROWS_ENV, "0") or "0")
+if _SPARSE_LL_MIN_ROWS <= 0 and _SPARSE_MT_MIN_ROWS > 0:
+    _SPARSE_LL_MIN_ROWS = max(_SPARSE_MT_MIN_ROWS, 9)
+_SPARSE_LL_ONE_TILE_MAX = int(os.environ.get(SPARSE_LL_ONE_TILE_MAX_ENV, "0") or "0")
 
 
 def _env_bytes(name: str, default: int, full: int) -> int:
@@ -282,8 +291,9 @@ class FusedAttention(AttentionStep):
         self.max_rows = cap = kernel_rows(rows)
         self.uv = fn[f"uv.{cap}"]
         self.sparse = fn[f"sparse.{sparse_warps(rows)}"]
-        # multi-tile CTAs per row (0: the 16-CTA kernel above)
-        self.mt_splits = getattr(glue, "sparse_mt", {}).get(rows, 0)
+        # ll flash decode (CTAs per row, one-tile shared memory), or None: the
+        # 16-CTA kernel above
+        self.ll_fd = getattr(glue, "sparse_ll", {}).get(rows)
         self.pro = fn[f"prologue.{cap}"]
         # the target's layers that reuse the previous top-k: the end-trigger prologue
         self.pro_end = fn.get(f"prologue_end.{cap}")
@@ -497,18 +507,20 @@ class FusedAttention(AttentionStep):
         out = torch.empty(
             (rows, HEADS, KV_LORA), dtype=torch.bfloat16, device=q_fp8.device
         )
-        if self.mt_splits:
+        if self.ll_fd is not None:
             from sgl_nvidia_mega.glm5_3.ll import sparse_mla as fd
 
+            splits, smem = self.ll_fd
             # physical rows, every position used (masks: id < 0, id >= cache rows)
             return fd.flash_decode(
                 q_fp8,
                 kv.view(-1, MQA_DIM),
                 ids,
-                self.glue.mt_lens,
+                self.glue.ll_lens,
                 _f32(bmm1_scale * LOG2E),
                 out=out,
-                splits=self.mt_splits,
+                smem_bytes=smem,
+                splits=splits,
                 out_scale=1.0,
             )
         self.sparse(
@@ -723,7 +735,7 @@ class AttentionGlue:
             qkv_a_shared=shared,
             qkv_a_shared_dn=bool(shared) and "dnorm" in SLOTS,
         )
-        self.sparse_mt = self._sparse_mt_plan(rows)
+        self.sparse_ll = self._sparse_ll_plan(rows)
         for name, (kernel, key, args) in specs.items():
             fn = compile_cached(
                 kernel, key, lambda k=kernel, a=args: cute.compile(k, *a)
@@ -743,31 +755,45 @@ class AttentionGlue:
                     "epilogue-scaled q_a / kv_a projection built"
                 )
 
-    def _sparse_mt_plan(self, rows: Tuple[int, ...]) -> Dict[int, int]:
-        """{verify rows: multi-tile CTAs per row} for the rows the multi-tile flash
-        decode serves (SPARSE_MT_MIN_ROWS_ENV); the device's co-resident clusters set
-        the split (one wave with one cluster of headroom), the same on every rank of
-        one device type."""
-        lo = _SPARSE_MT_MIN_ROWS
+    def _sparse_ll_plan(self, rows: Tuple[int, ...]) -> Dict[int, Tuple[int, Optional[int]]]:
+        """{verify rows: (ll flash-decode CTAs per row, one-tile shared memory or
+        None)} for the rows SPARSE_LL_MIN_ROWS_ENV moves to ll.sparse_mla_fd: the
+        one-tile kernel up to its one-wave (spread) rows, the multi-tile kernel above;
+        co-resident clusters agreed over the TP group, so every rank builds one plan."""
+        lo = _SPARSE_LL_MIN_ROWS
         # the target's verify only (the draft layer keeps its stock sparse MLA)
-        want = sorted(m for m in rows if self.target and lo > 0 and max(lo, 9) <= m <= 16)
+        want = sorted(m for m in rows if self.target and lo > 0 and lo <= m <= 16)
         if not want:
             return {}
         from sgl_nvidia_mega.glm5_3.ll import sparse_mla as fd
 
-        caps = fd.device_caps(HEADS, with_mt=True, with_fold=False)
-        plan = {m: fd.mt_splits_for_rows(m, caps.mt_rows) for m in want}
-        plan = {m: s for m, s in plan.items() if s}
+        caps = err = None
+        try:
+            caps = fd.device_caps(HEADS, with_mt=True, with_fold=False)
+        except Exception as e:  # noqa: BLE001 (agreed: raises on every rank)
+            err = e
+        caps = fd.agree_caps(caps, err, fd._tp_group(), with_mt=True, with_fold=False)
+        one_max = min(caps.spread_rows, _SPARSE_LL_ONE_TILE_MAX or fd.ONE_TILE_MAX_ROWS)
+        plan: Dict[int, Tuple[int, Optional[int]]] = {}
+        for m in want:
+            if m <= one_max:
+                plan[m] = (fd.ONE_TILE_SPLITS, caps.spread_smem_bytes)
+            else:
+                sp = fd.mt_splits_for_rows(m, caps.mt_rows)
+                if sp:
+                    plan[m] = (sp, None)
         if plan:
             dev = torch.device("cuda", torch.cuda.current_device())
-            self.mt_lens = torch.full((16,), TOPK, dtype=torch.int32, device=dev)
+            self.ll_lens = torch.full((16,), TOPK, dtype=torch.int32, device=dev)
         logger.info(
-            "NVIDIA megakernel: GLM-5.3 / GLM-5.2: sparse MLA on the multi-tile flash "
-            "decode at rows %s (CTAs per row %s; co-resident clusters %s) (%s)",
+            "NVIDIA megakernel: GLM-5.3 / GLM-5.2: sparse MLA on ll.sparse_mla_fd at "
+            "rows %s (CTAs per row %s; one-tile <= %d rows, spread clusters %d, "
+            "multi-tile co-resident %s) (target)",
             sorted(plan),
-            [plan[m] for m in sorted(plan)],
+            [plan[m][0] for m in sorted(plan)],
+            one_max,
+            caps.spread_rows,
             list(zip(fd.MT_SPLITS, caps.mt_rows)),
-            "target",
         )
         return plan
 
