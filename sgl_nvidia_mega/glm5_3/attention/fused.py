@@ -125,7 +125,13 @@ O_PROJ_STAGE_PREFIX_BYTES = 122_880
 # SGLANG_NVIDIA_MEGAKERNEL_GLM_OPROJ_STAGE_PREFIX bytes of each o_proj slab (0 .. 196,608; "full" = the whole slab) and
 # SGLANG_NVIDIA_MEGAKERNEL_GLM_NEXT_QKV_A_PREFETCH bytes of the next layer's q_a / kv_a weight.
 OPROJ_STAGE_PREFIX_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_OPROJ_STAGE_PREFIX"
+# ... applied from this row count on (fewer rows keep O_PROJ_STAGE_PREFIX_BYTES): at 4 rows the attention core is short,
+# and the longer staging delays the up-projection itself (T84: +0.9 us per layer at 4 rows, -1.5 us at 8 rows)
+OPROJ_STAGE_MIN_ROWS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_OPROJ_STAGE_MIN_ROWS"
 NEXT_QKV_A_PREFETCH_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_NEXT_QKV_A_PREFETCH"
+
+
+_OPROJ_STAGE_MIN_ROWS = int(os.environ.get(OPROJ_STAGE_MIN_ROWS_ENV, "1") or "1")
 
 
 def _env_bytes(name: str, default: int, full: int) -> int:
@@ -521,12 +527,16 @@ class FusedAttention(AttentionStep):
             (rows, HEADS * VALUE_DIM), dtype=torch.bfloat16, device=attn_output.device
         )
         la = self.glue.layers[attn.layer_id]
+        stage0 = la.stage0
+        if rows < _OPROJ_STAGE_MIN_ROWS and stage0[2] == O_PROJ_STAGE_SLAB_BYTES:
+            # below OPROJ_STAGE_MIN_ROWS the o_proj slot stages the default prefix
+            stage0 = (*stage0[:3], O_PROJ_STAGE_PREFIX_BYTES, stage0[4])
         self.uv(
             *_i64(la.w_uv),  # weights
             *_i64(attn_output.data_ptr(), *attn_output.stride()[:2]),  # attn, strides
             *_i64(*_addr(out)),  # out, out_row_stride
             Int32(rows),
-            *_slot_args(la.stage0),
+            *_slot_args(stage0),
             *_slot_args(la.stage1),
             cu_stream(attn_output.device),
         )
