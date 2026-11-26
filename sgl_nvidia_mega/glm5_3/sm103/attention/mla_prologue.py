@@ -25,7 +25,10 @@ writes the MLA rows, CTA 1 the index-K rows, CTAs 2..7 the top-k fill.
 Option fields (compile time): ``max_rows`` (8 or 16), ``overlap16`` (16 rows only: the
 head CTA issues every load of a phase before the stores of that phase, so the rows'
 latencies overlap instead of adding up; per row the same operations in the same order,
-so the same outputs), ``numerics``
+so the same outputs), ``kv_split`` (16 rows only: the
+kv cluster's rows 8..15 run on CTAs 2 (MLA rows) and 3 (index-K rows) beside rows 0..7 on
+CTAs 0 and 1, instead of a second pass of the same warps; the top-k fill moves to CTAs
+4..7; per row the same operations, so the same outputs), ``numerics``
 (``PrologueNumerics``: the sum orders, rounding points and scale rule, each named by
 the arithmetic it selects), ``rope_cache_fp32`` and ``index_rope_cache_fp32`` (cos /
 sin caches FP32, else BF16; layout [positions, 64] = cos | sin),
@@ -188,13 +191,17 @@ class MlaPrologue:
         index_scale_ue8m0x4: bool = False,
         trigger_at_end: bool = False,
         overlap16: bool = False,
+        kv_split: bool = False,
     ):
         if max_rows not in (8, 16):
             raise ValueError(f"max_rows must be 8 or 16, got {max_rows}")
         if overlap16 and max_rows != 16:
             raise ValueError("overlap16 applies to max_rows 16 only")
+        if kv_split and max_rows != 16:
+            raise ValueError("kv_split applies to max_rows 16 only")
         self.max_rows = max_rows
         self.overlap16 = overlap16
+        self.kv_split = kv_split
         self.num = numerics
         self.rope_cache_fp32 = rope_cache_fp32
         self.index_rope_cache_fp32 = index_rope_cache_fp32
@@ -1523,7 +1530,22 @@ class MlaPrologue:
     ):
         lane = tid % 32
         warp = tid // 32
-        if r == 0:
+        # kv_split: CTA 2 (MLA) / 3 (index-K) take rows 8..15; else one CTA each, all rows
+        nsplit = 2 if self.kv_split else 0
+        mla_grp = Int32(-1)
+        idx_grp = Int32(-1)
+        is_mla = r == 0
+        is_idx = r == 1
+        if cutlass.const_expr(self.kv_split):
+            is_mla = (r == 0) | (r == 2)
+            is_idx = (r == 1) | (r == 3)
+            mla_grp = Int32(0)
+            idx_grp = Int32(0)
+            if r == 2:
+                mla_grp = Int32(1)
+            if r == 3:
+                idx_grp = Int32(1)
+        if is_mla:
             self.mla_rows(
                 lane,
                 warp,
@@ -1543,6 +1565,7 @@ class MlaPrologue:
                 mla_block_stride,
                 mla_entry_stride,
                 mla_block_size,
+                mla_grp,
             )
         else:
             if has_indexer == 0:
@@ -1550,7 +1573,7 @@ class MlaPrologue:
                 # wait
                 ptx.pdl_wait()
             else:
-                if r == 1:
+                if is_idx:
                     self.index_k_rows(
                         lane,
                         warp,
@@ -1568,14 +1591,19 @@ class MlaPrologue:
                         idx_cache,
                         idx_block_stride,
                         idx_block_size,
+                        idx_grp,
                     )
                 else:
                     self.wait_inputs()
                     per_row = topk_width // 4
                     end = rows * per_row
                     neg = Uint32(0xFFFFFFFF)
+                    first = 2 + nsplit
                     for idx in cutlass.range(
-                        (r - 2) * THREADS + tid, end, (CLUSTER - 2) * THREADS, unroll=1
+                        (r - first) * THREADS + tid,
+                        end,
+                        (CLUSTER - first) * THREADS,
+                        unroll=1,
                     ):
                         n = idx // per_row
                         cc = idx % per_row
@@ -1605,6 +1633,7 @@ class MlaPrologue:
         mla_block_stride: Int64,
         mla_entry_stride: Int64,
         mla_block_size: Int64,
+        only_grp: Int32,
     ):
         """The kv RMSNorm + BF16 + per-tensor FP8 of the latent and the k_pe RoPE: one
         MLA row per token (warp n = row n). Lane l owns elements 8 l + [0, 8) and
@@ -1619,29 +1648,30 @@ class MlaPrologue:
         ksc = ptx.ld_global_nc_f32(k_scale)
         self.wait_kv_inputs()
         for grp in cutlass.range_constexpr(self.max_rows // 8):
-            self.mla_rows_row(
-                warp + grp * 8,
-                lane,
-                kv_c,
-                kv_c_stride,
-                k_pe,
-                k_pe_stride,
-                positions,
-                slot_mapping,
-                rows,
-                kv_eps,
-                rope_cache,
-                rope_stride,
-                mla_cache,
-                mla_block_stride,
-                mla_entry_stride,
-                mla_block_size,
-                e0,
-                e1,
-                w0,
-                w1,
-                ksc,
-            )
+            if (only_grp < 0) | (only_grp == grp):
+                self.mla_rows_row(
+                    warp + grp * 8,
+                    lane,
+                    kv_c,
+                    kv_c_stride,
+                    k_pe,
+                    k_pe_stride,
+                    positions,
+                    slot_mapping,
+                    rows,
+                    kv_eps,
+                    rope_cache,
+                    rope_stride,
+                    mla_cache,
+                    mla_block_stride,
+                    mla_entry_stride,
+                    mla_block_size,
+                    e0,
+                    e1,
+                    w0,
+                    w1,
+                    ksc,
+                )
 
     @cute.jit
     def mla_rows_row(
@@ -1767,6 +1797,7 @@ class MlaPrologue:
         idx_cache: Int64,
         idx_block_stride: Int64,
         idx_block_size: Int64,
+        only_grp: Int32,
     ):
         """Index-K: LayerNorm(128) + interleaved RoPE (dims < 64) + BF16 + FP8 with an
         FP32 scale, one row per token
@@ -1776,24 +1807,25 @@ class MlaPrologue:
         lb = ptx.ld_global_nc_v4(ik_b + Int64(lane) * 16)
         self.wait_inputs()
         for grp in cutlass.range_constexpr(self.max_rows // 8):
-            self.index_k_rows_row(
-                warp + grp * 8,
-                lane,
-                idx_k,
-                idx_k_stride,
-                positions,
-                slot_mapping,
-                idx_slot_mapping,
-                rows,
-                ik_eps,
-                rope_cache,
-                rope_stride,
-                idx_cache,
-                idx_block_stride,
-                idx_block_size,
-                lw,
-                lb,
-            )
+            if (only_grp < 0) | (only_grp == grp):
+                self.index_k_rows_row(
+                    warp + grp * 8,
+                    lane,
+                    idx_k,
+                    idx_k_stride,
+                    positions,
+                    slot_mapping,
+                    idx_slot_mapping,
+                    rows,
+                    ik_eps,
+                    rope_cache,
+                    rope_stride,
+                    idx_cache,
+                    idx_block_stride,
+                    idx_block_size,
+                    lw,
+                    lb,
+                )
 
     @cute.jit
     def index_k_rows_row(

@@ -58,6 +58,7 @@ def compile_specs(
     qkv_a_shared: int | None = None,
     qkv_a_shared_dn: bool = False,
     prologue16_overlap: bool = False,
+    prologue16_kv_split: bool = False,
 ) -> dict[str, tuple]:
     """The attention units for row capacities ``caps`` and sparse-MLA warp counts
     ``warps``. ``numerics`` is the engine's ``PrologueNumerics`` value table and
@@ -71,7 +72,9 @@ def compile_specs(
     (``MlaPrologue(overlap16=True)``: same outputs). ``qkv_a_shared = n_rows`` adds
     ``qkv_a_shared.8``: the skinny projection of the q_a / kv_a rows alone (the layers
     without their own indexer), at 8 rows on ``grid`` CTAs; ``qkv_a_shared_dn`` adds
-    its epilogue-scaled form ``qkv_a_shared_dn.8`` (deferred input norm)."""
+    its epilogue-scaled form ``qkv_a_shared_dn.8`` (deferred input norm).
+    ``prologue16_kv_split`` builds ``prologue[_end].16`` with the kv cluster's rows
+    8..15 on their own CTAs (same outputs)."""
     from .indexer_q_proj import IndexerQProj
     from .mla_prologue import MlaPrologue
     from .mla_uv_proj import MlaUvProj
@@ -94,6 +97,9 @@ def compile_specs(
         overlap16 = prologue16_overlap and cap == 16
         if overlap16:
             key["overlap16"] = True
+        kvs = bool(prologue16_kv_split and cap == 16)
+        if kvs:
+            key["kv_split"] = True
         specs[f"prologue.{cap}"] = (
             MlaPrologue(
                 cap,
@@ -102,6 +108,7 @@ def compile_specs(
                 index_rope_cache_fp32,
                 index_scale_ue8m0x4,
                 overlap16=overlap16,
+                kv_split=kvs,
             ),
             key,
             args["prologue"],
@@ -116,6 +123,7 @@ def compile_specs(
                     index_scale_ue8m0x4,
                     trigger_at_end=True,
                     overlap16=overlap16,
+                    kv_split=kvs,
                 ),
                 {**key, "trigger_at_end": True},
                 args["prologue"],

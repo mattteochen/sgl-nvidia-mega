@@ -153,6 +153,11 @@ _SPARSE_LL_ONE_TILE_MAX = int(os.environ.get(SPARSE_LL_ONE_TILE_MAX_ENV, "0") or
 # Read at build.
 PROLOGUE16_OVERLAP_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE16_OVERLAP"
 _PROLOGUE16_OVERLAP = os.environ.get(PROLOGUE16_OVERLAP_ENV, "0").strip() not in ("", "0")
+# SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE16_KV_SPLIT=1: the 9-16-row prologue writes the MLA / index-K rows 8..15 on
+# their own CTAs of the kv cluster (CTAs 2 / 3, idle with the target's top-k width 0) beside rows 0..7, instead of a
+# second pass of the same warps; the same outputs. Read at build.
+PROLOGUE16_KV_SPLIT_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE16_KV_SPLIT"
+_PROLOGUE16_KV_SPLIT = os.environ.get(PROLOGUE16_KV_SPLIT_ENV, "0").strip() == "1"
 
 
 def _env_bytes(name: str, default: int, full: int) -> int:
@@ -740,12 +745,19 @@ class AttentionGlue:
             qkv_a_shared=shared,
             qkv_a_shared_dn=bool(shared) and "dnorm" in SLOTS,
             prologue16_overlap=_PROLOGUE16_OVERLAP,
+            prologue16_kv_split=_PROLOGUE16_KV_SPLIT,
         )
         if _PROLOGUE16_OVERLAP and "prologue.16" in specs:
             logger.info(
                 "NVIDIA megakernel: GLM-5.3 / GLM-5.2: 16-row MLA prologue in the "
                 "overlapped issue order (%s=1)",
                 PROLOGUE16_OVERLAP_ENV,
+            )
+        if _PROLOGUE16_KV_SPLIT and "prologue.16" in specs:
+            logger.info(
+                "NVIDIA megakernel: GLM-5.3 / GLM-5.2: the 9-16-row prologue writes the "
+                "kv rows 8-15 on their own CTAs (%s)",
+                "target" if self.target else "draft",
             )
         self.sparse_ll = self._sparse_ll_plan(rows)
         for name, (kernel, key, args) in specs.items():
