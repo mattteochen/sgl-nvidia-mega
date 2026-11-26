@@ -24,6 +24,20 @@ CTA streams half the fp32 inputs; the main CTA still consumes the whole slice. E
 must be co-resident (the main CTAs wait on records written by helper CTAs of the same
 grid), so the split form is used only where the cooperative occupancy allows 2 * rows +
 1 clusters.
+
+Opt-in knobs (``HopKernels`` serves them under ``SGLANG_NVIDIA_MEGAKERNEL_GLM_FOLD_FORM``;
+the outputs are bitwise those of the served forms, the protocol is unchanged):
+
+* ``nocluster`` (deferred-norm fold only): its consumer exchanges nothing in the cluster,
+  so the grid is launched without clusters. The split form then needs ``16 * rows + 8``
+  co-resident CTAs instead of ``2 * rows + 1`` co-resident 8-CTA clusters (15 on GB300),
+  so it fits at 7..8 rows. The cooperative launch still makes every CTA co-resident (the
+  main CTAs wait on records of helper CTAs of the same grid).
+* ``trigger_late``: ``griddepcontrol.launch_dependents`` after part 1 (the epoch barrier)
+  instead of right after the wait, so the dependent grid's CTAs (the q_a / kv_a
+  projection, which stages its weights before its own wait) do not start their weight
+  stream while part 1 loads the partials. The dependent still waits for this grid's
+  completion; only its launch moves.
 """
 
 import cuda.bindings.driver as cuda
@@ -53,10 +67,29 @@ class MoeFoldArNorm(Consumer):
     """Fold of the MoE finalize + all-reduce + residual + RMSNorm for up to ``max_rows``
     rows."""
 
-    def __init__(self, *, split: bool, max_rows: int = 8):
+    # opt-in knobs: class defaults, set on an instance only when enabled (the served
+    # units' constexprs and compile keys are unchanged)
+    nocluster = False
+    trigger_late = False
+    deferred_norm = False
+
+    def __init__(
+        self,
+        *,
+        split: bool,
+        max_rows: int = 8,
+        nocluster: bool = False,
+        trigger_late: bool = False,
+    ):
         if max_rows != 8:
             raise ValueError("this fold is provided for up to 8 rows")
         self.split, self.max_rows = split, max_rows
+        if nocluster:
+            if not self.deferred_norm:
+                raise ValueError("only the deferred-norm fold runs without clusters")
+            self.nocluster = True
+        if trigger_late:
+            self.trigger_late = True
 
     @cute.jit
     def __call__(
@@ -211,7 +244,8 @@ class MoeFoldArNorm(Consumer):
         if bx < nmain:
             self.cons_prologue(cs)
         cute.arch.griddepcontrol_wait()
-        cute.arch.griddepcontrol_launch_dependents()
+        if cutlass.const_expr(not self.trigger_late):
+            cute.arch.griddepcontrol_launch_dependents()
         # the engine's outputs may come from an async-proxy writer
         sys_ops.fence_proxy_async_global()
         if is_ack:
@@ -254,6 +288,10 @@ class MoeFoldArNorm(Consumer):
                 fwk[k] = P.bits_f32(sys_ops.ld_cg_u32(wfin + Int64(4 * (m * TOPK + k))))
         # the epoch warp reads the controls
         self.epoch_begin(mb, cs.es, True, POLL_THREADS)
+        if cutlass.const_expr(self.trigger_late):
+            # this CTA's part 1 is done (the barrier above); the acknowledgement CTAs
+            # exit without it (an exit counts as the trigger)
+            cute.arch.griddepcontrol_launch_dependents()
         pz = cs.es.pz[0]
         em = cs.es.erow[m]
         buf = self.buffer_of(em)
@@ -489,6 +527,8 @@ class MoeFoldArNormDn(MoeFoldArNorm):
     not exchange the block sums. ``inv = rsqrt(fma(sum_c bsum[m][c], rcp(HIDDEN), eps))``
     (sum from 0 in ``c`` order) gives the normed row as ``(x * inv) * gamma``."""
 
+    deferred_norm = True
+
     @cute.jit
     def __call__(
         self,
@@ -519,7 +559,7 @@ class MoeFoldArNormDn(MoeFoldArNorm):
         nct = rows * 8 + 8
         if cutlass.const_expr(self.split):
             nct = rows * 16 + 8
-        self.kernel_dn(
+        k = self.kernel_dn(
             pq,
             shp,
             ids,
@@ -542,15 +582,26 @@ class MoeFoldArNormDn(MoeFoldArNorm):
             rank,
             err_host,
             site,
-        ).launch(
-            grid=[nct, 1, 1],
-            block=[CONSUMER_THREADS, 1, 1],
-            max_number_threads=[CONSUMER_THREADS, 1, 1],
-            cluster=[8, 1, 1],
-            cooperative=True,
-            use_pdl=True,
-            stream=stream,
         )
+        if cutlass.const_expr(self.nocluster):
+            k.launch(
+                grid=[nct, 1, 1],
+                block=[CONSUMER_THREADS, 1, 1],
+                max_number_threads=[CONSUMER_THREADS, 1, 1],
+                cooperative=True,
+                use_pdl=True,
+                stream=stream,
+            )
+        else:
+            k.launch(
+                grid=[nct, 1, 1],
+                block=[CONSUMER_THREADS, 1, 1],
+                max_number_threads=[CONSUMER_THREADS, 1, 1],
+                cluster=[8, 1, 1],
+                cooperative=True,
+                use_pdl=True,
+                stream=stream,
+            )
 
     @cute.kernel
     def kernel_dn(

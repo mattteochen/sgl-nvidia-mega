@@ -41,6 +41,47 @@ MIN_PTX_ISA = (9, 2)
 # The split fold serves 1..6 rows (the plain fold above): the rows it is tested at.
 SPLIT_MAX_ROWS = 6
 MIN_PTX_COMPILER = (13, 2)
+# Opt-in fold forms, a comma list (unset / empty: the served units, unchanged):
+#   split8dn  the deferred-norm fold runs its split form without clusters (unit
+#             moe_fold_split_dn_nc) from SPLIT8DN_MIN_ROWS rows up to the rows whose
+#             16 * rows + 8 CTAs are co-resident (4..8 on GB300); fewer rows keep the
+#             served cluster split (T90a k2 foldbench, fold -> q_a: -0.2 us at 4 rows,
+#             -1.3 at 7, -0.9 at 8, but +0.5 at 1..2 rows)
+#   late8     the normed fold above the split limit (7..8 rows) triggers its dependent
+#             after part 1
+# Outputs are bitwise those of the served forms.
+FOLD_FORM_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_FOLD_FORM"
+FOLD_FORMS = ("split8dn", "late8")
+SPLIT8_MAX_ROWS = 8
+SPLIT8DN_MIN_ROWS = 4
+
+
+def fold_form(raw=None) -> frozenset:
+    """The opt-in fold forms of ``FOLD_FORM_ENV`` (or ``raw``)."""
+    import os
+
+    if raw is None:
+        raw = os.environ.get(FOLD_FORM_ENV, "")
+    toks = frozenset(x.strip().lower() for x in raw.split(",") if x.strip())
+    bad = sorted(toks - set(FOLD_FORMS))
+    if bad:
+        raise ValueError(f"{FOLD_FORM_ENV}={raw!r}: unknown forms {bad} (of {FOLD_FORMS})")
+    return toks
+
+
+def fold_units(form=None) -> dict:
+    """The fold units up to 8 rows (served names -> kernel objects) for the opt-in
+    forms ``form`` (default: ``fold_form()``); the served objects when empty."""
+    form = fold_form() if form is None else frozenset(form)
+    units = {
+        "moe_fold_split": MoeFoldArNorm(split=True),
+        "moe_fold_plain": MoeFoldArNorm(split=False, trigger_late="late8" in form),
+        "moe_fold_split_dn": MoeFoldArNormDn(split=True),
+        "moe_fold_plain_dn": MoeFoldArNormDn(split=False),
+    }
+    if "split8dn" in form:
+        units["moe_fold_split_dn_nc"] = MoeFoldArNormDn(split=True, nocluster=True)
+    return units
 
 
 @dataclass(frozen=True)
@@ -155,11 +196,15 @@ def _args_apply():
     return (*[_z()] * 4, Float32(1e-5), Int32(1), cu.CUstream(0))
 
 
-def unit_specs(*, plain_allreduce: bool = False, allreduce_rmsnorm: bool = False):
+def unit_specs(
+    *, plain_allreduce: bool = False, allreduce_rmsnorm: bool = False, form=None
+):
     """The compile units of the forward hops (instance A: up to 8 rows; instance B:
     9..16). ``plain_allreduce``: also the plain all-reduce (the draft's eh gather);
     ``allreduce_rmsnorm``: also the residual-free all-reduce + RMSNorm (the draft's
-    row-parallel eh_proj sum with the draft layer's input norm)."""
+    row-parallel eh_proj sum with the draft layer's input norm); ``form``: the opt-in
+    fold forms (default: ``fold_form()``)."""
+    fu = fold_units(form)
     specs = [
         UnitSpec(
             "allreduce_norm", AllreduceNormHop(residual=True, norm=True), _args_ar()
@@ -168,8 +213,8 @@ def unit_specs(*, plain_allreduce: bool = False, allreduce_rmsnorm: bool = False
         UnitSpec("o_proj_consume", OProjArConsume(), _args_consume()),
         UnitSpec("o_proj_produce_router", OProjArProduce(router=True), _args_produce()),
         UnitSpec("o_proj_consume_router", OProjArConsume(router=True), _args_consume()),
-        UnitSpec("moe_fold_split", MoeFoldArNorm(split=True), _args_fold()),
-        UnitSpec("moe_fold_plain", MoeFoldArNorm(split=False), _args_fold()),
+        UnitSpec("moe_fold_split", fu["moe_fold_split"], _args_fold()),
+        UnitSpec("moe_fold_plain", fu["moe_fold_plain"], _args_fold()),
         UnitSpec(
             "o_proj_produce_router16",
             OProjArProduce(router=True, max_rows=16),
@@ -181,9 +226,14 @@ def unit_specs(*, plain_allreduce: bool = False, allreduce_rmsnorm: bool = False
             _args_consume(),
         ),
         UnitSpec("moe_fold_block_sums16", MoeFoldArBsum(), _args_bsum()),
-        UnitSpec("moe_fold_split_dn", MoeFoldArNormDn(split=True), _args_fold_dn()),
-        UnitSpec("moe_fold_plain_dn", MoeFoldArNormDn(split=False), _args_fold_dn()),
+        UnitSpec("moe_fold_split_dn", fu["moe_fold_split_dn"], _args_fold_dn()),
+        UnitSpec("moe_fold_plain_dn", fu["moe_fold_plain_dn"], _args_fold_dn()),
         UnitSpec("rmsnorm_from_block_sums16", RmsnormFromBlockSums(), _args_apply()),
+        *[
+            UnitSpec(name, fu[name], _args_fold_dn())
+            for name in ("moe_fold_split_dn_nc",)
+            if name in fu
+        ],
     ]
     if plain_allreduce:
         specs.append(
@@ -278,6 +328,10 @@ class HopKernels:
     eps: float
     rscale: float
     split_max_rows: int = 0
+    # rows up to which the cluster-free deferred-norm split serves ("split8dn"; from
+    # SPLIT8DN_MIN_ROWS rows; 0: not served)
+    split8dn_rows: int = 0
+    form: frozenset = frozenset()
     _peers: dict = field(default_factory=dict)
 
     @classmethod
@@ -320,7 +374,26 @@ class HopKernels:
             self.split_max_rows = self._split_rows(
                 device_index, probe or compiled["moe_fold_split"]
             )
+        self.form = fold_form()
+        if "split8dn" in self.form and "moe_fold_split_dn_nc" in compiled:
+            self.split8dn_rows = _split8_rows(device_index)
         return self
+
+    def fold_limits(self):
+        """What every rank must agree on: the split-fold row limit (served forms), or
+        (it, the cluster-free deferred-norm split limit, the forms) with an opt-in
+        form."""
+        if not self.form:
+            return self.split_max_rows
+        return (self.split_max_rows, self.split8dn_rows, tuple(sorted(self.form)))
+
+    def dn_fold_unit(self, rows: int) -> str:
+        """The deferred-norm fold unit at ``rows`` (<= 8)."""
+        if SPLIT8DN_MIN_ROWS <= rows <= self.split8dn_rows:
+            return "moe_fold_split_dn_nc"
+        if rows <= self.split_max_rows:
+            return "moe_fold_split_dn"
+        return "moe_fold_plain_dn"
 
     def reset(self):
         """Collective. Re-initialize the mailboxes and zero the router-partial words
@@ -554,10 +627,7 @@ class HopKernels:
         rows = int(out_res.shape[0])
         assert rows <= 8, "the deferred-norm fold serves up to 8 rows"
         mb = self.mbox_a
-        unit = (
-            "moe_fold_split_dn" if rows <= self.split_max_rows else "moe_fold_plain_dn"
-        )
-        self.compiled[unit](
+        self.compiled[self.dn_fold_unit(rows)](
             _p(pq),
             _p(shp),
             _p(ids),
@@ -582,6 +652,14 @@ def _fold_smem():
     """Dynamic shared memory of the fold units (consumer block + y[8][768] + sh[768]
     fp32)."""
     return 21664 + 4 * (8 * ELEMS_PER_CTA + ELEMS_PER_CTA)
+
+
+def _split8_rows(device_index) -> int:
+    """Rows up to which the cluster-free split fold (``16 * rows + 8`` CTAs, at least
+    one per SM: the unit launches) is co-resident."""
+    sms = torch.cuda.get_device_properties(device_index).multi_processor_count
+    rows = [r for r in range(1, SPLIT8_MAX_ROWS + 1) if 16 * r + 8 <= sms]
+    return max(rows, default=0)
 
 
 @dataclass

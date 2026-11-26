@@ -547,6 +547,10 @@ class Consumer(Transport):
     cluster-rank-order total, ``rsqrt(fma(total, rcp(HIDDEN), eps))``, ``y = bf16((x *
     inv) * (0 + g))``."""
 
+    # launched without clusters (only the deferred-norm consumer, which exchanges nothing
+    # in the cluster): no cluster barrier in the prologue / epilogue
+    nocluster = False
+
     @cute.jit
     def cons_prologue(self, cs: ConsSmem):
         """Initialize the mbarrier, then cluster arrive (before cluster accesses)."""
@@ -558,7 +562,8 @@ class Consumer(Transport):
         # the cluster-scope release arrive is issued by the idle epoch-warp thread
         if t == 512:
             P.mbar_arrive_expect_tx_release_cluster(cs.mbar_addr(), 8 * 4)
-        P.cluster_arrive_relaxed()
+        if cutlass.const_expr(not self.nocluster):
+            P.cluster_arrive_relaxed()
 
     def block_reduce(self, v0, v1, v2):
         """Block sum of the three warp sums: ``(w0 + w2) + w1``."""
@@ -675,7 +680,8 @@ class Consumer(Transport):
                         sys_ops.st_global_u32(row + Int64(4 * k), u)
                     sys_ops.fence_proxy_async_global()  # thread 0 is in group 0
                 # completes the cluster barrier phase the consumer prologue opened
-                P.cluster_wait()
+                if cutlass.const_expr(not self.nocluster):
+                    P.cluster_wait()
             else:
                 # cluster exchange of the 8 block sums (st.async + mbarrier complete_tx)
                 crank = Int32(cute.arch.block_idx_in_cluster())

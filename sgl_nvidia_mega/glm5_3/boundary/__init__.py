@@ -174,6 +174,8 @@ class HopFamily:
             names |= {"moe_fold_split", "moe_fold_plain"}
             if self.dnorm_layers:
                 names |= {"moe_fold_split_dn", "moe_fold_plain_dn"}
+                if "split8dn" in self.api.fold_form():
+                    names |= {"moe_fold_split_dn_nc"}
         if big:
             names |= {"o_proj_produce_router16", "o_proj_consume_router16"}
             names |= {"moe_fold_block_sums16", "rmsnorm_from_block_sums16"}
@@ -231,7 +233,7 @@ class HopFamily:
             barrier_group=self.group.cpu_group,
         )
         megakernel_agree(
-            kernels.split_max_rows, what="GLM-5.3 / GLM-5.2 split-fold row limits"
+            kernels.fold_limits(), what="GLM-5.3 / GLM-5.2 split-fold row limits"
         )
         self.kernels = kernels
 
