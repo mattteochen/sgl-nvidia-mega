@@ -149,7 +149,15 @@ XS_STRIDE = Q_LORA * 2 + 64
 QN_STRIDE = NOPE * 2 + 64
 
 
-def layout(max_rows):
+# overlap16 partials, one FP32 row per (warp or half, token tile, token): q_b 32 output
+# rows + 4 pad, absorb 64 columns + 4 pad, so a reader warp's 32 lanes read consecutive
+# words and a writer warp's lanes (8 t + g) hit distinct banks
+RED_QB_ROW = 32 + 4
+RED_UK_ROW = 64 + 4
+RED16O_BYTES = 8 * 2 * 8 * RED_QB_ROW * 4  # 18,432 (the absorb partials: 8,704)
+
+
+def layout(max_rows, overlap16=False):
     off = {"wqb": 0, "wuk": WQB_BYTES}
     off["xs"] = off["wuk"] + WUK_BYTES
     if max_rows == 8:
@@ -161,7 +169,7 @@ def layout(max_rows):
         # 16 rows: the partials and the gathered q_nope rows alias the token rows,
         # which are dead once the q_b products are done (a CTA barrier separates them)
         off["red"] = off["xs"]
-        off["qn"] = off["red"] + 8 * 2 * 2 * 32 * 16
+        off["qn"] = off["red"] + (RED16O_BYTES if overlap16 else 8 * 2 * 2 * 32 * 16)
         off["pub"] = off["xs"] + max_rows * XS_STRIDE
         off["ssq"] = off["pub"] + max_rows * 32 * 2
     off["mbar"] = off["ssq"] + 8 * max_rows * 4
@@ -211,7 +219,7 @@ class MlaPrologue:
             )
         self.index_scale_ue8m0x4 = index_scale_ue8m0x4
         self.trigger_at_end = trigger_at_end
-        self.off = layout(max_rows)
+        self.off = layout(max_rows, overlap16)
 
     @cute.jit
     def __call__(
@@ -1041,7 +1049,10 @@ class MlaPrologue:
         slots); each warp's two strided sum rows interleaved; every row's sum and raw row
         before any normalized row is stored; both reduction slots' partials, both gather
         slots' remote loads and all four absorb slots' partials before their stores;
-        token-tile operands loaded predicated (no lane-divergent branch)."""
+        token-tile operands loaded predicated (no lane-divergent branch); the q_b and
+        absorb partials stored as one padded FP32 row per (warp or half, token tile,
+        token) (``RED_QB_ROW`` / ``RED_UK_ROW``), so the reduction's reads are free of
+        the 8-way bank conflicts of head_cta16's fragment layout."""
         off = self.off
         max_rows = self.max_rows
         lane = tid % 32
@@ -1182,36 +1193,37 @@ class MlaPrologue:
                     )
         # the partials reuse the token rows: every warp must be done reading them
         self.rows_dead()
+        # each accumulator to its (warp, token tile, token, q_b row) word: the C fragment
+        # holds rows g / g + 8 of tile j, tokens 2 t / 2 t + 1 (no bank conflict)
         for j in cutlass.range_constexpr(2):
             for tt in cutlass.range_constexpr(2):
                 cc = c[j * 2 + tt]
-                ptx.st_shared_v4(
-                    s_red + (((warp * 2 + j) * 2 + tt) * 32 + lane) * 16,
-                    (
-                        ptx.f32_bits(cc[0]),
-                        ptx.f32_bits(cc[1]),
-                        ptx.f32_bits(cc[2]),
-                        ptx.f32_bits(cc[3]),
-                    ),
-                )
+                for e in cutlass.range_constexpr(4):
+                    ptx.st_shared_f32(
+                        s_red
+                        + (
+                            ((warp * 2 + tt) * 8 + 2 * t + e % 2) * RED_QB_ROW
+                            + j * 16
+                            + g
+                            + 8 * (e // 2)
+                        )
+                        * 4,
+                        cc[e],
+                    )
         self.sync_partials()
-        # both (row, column) slots' partials first, then the sums in warp order
+        # both (row, column) slots' partials first (a warp reads 32 consecutive words),
+        # then the sums in warp order
         parts = []
         for it in cutlass.range_constexpr(2):
             idx = tid + THREADS * it
             rho = idx % 32
             n = idx // 32
-            tt = n // 8
-            nn = n % 8
-            jt = rho // 16
-            rr_ = rho % 16
-            ln = (rr_ % 8) * 4 + nn // 2
-            reg = (rr_ // 8) * 2 + nn % 2
             p = []
             for w in cutlass.range_constexpr(8):
                 p.append(
                     _lds_f32_if(
-                        s_red + (((w * 2 + jt) * 2 + tt) * 32 + ln) * 16 + reg * 4,
+                        s_red
+                        + (((w * 2 + n // 8) * 8 + n % 8) * RED_QB_ROW + rho) * 4,
                         idx < 32 * rows,
                     )
                 )
@@ -1269,38 +1281,38 @@ class MlaPrologue:
                 cw[tt] = ptx.mma_m16n8k16_bf16(
                     (lo[2], hi[2], lo[3], hi[3]), (bq[2], bq[3]), c1
                 )
+        # each accumulator to its (half, token tile, token, absorbed column) word
         for tt in cutlass.range_constexpr(2):
-            ptx.st_shared_v4(
-                s_red + ((warp * 2 + tt) * 32 + lane) * 16,
-                (
-                    ptx.f32_bits(cw[tt][0]),
-                    ptx.f32_bits(cw[tt][1]),
-                    ptx.f32_bits(cw[tt][2]),
-                    ptx.f32_bits(cw[tt][3]),
-                ),
-            )
+            for e in cutlass.range_constexpr(4):
+                ptx.st_shared_f32(
+                    s_red
+                    + (
+                        ((half * 2 + tt) * 8 + 2 * t + e % 2) * RED_UK_ROW
+                        + tile * 16
+                        + g
+                        + 8 * (e // 2)
+                    )
+                    * 4,
+                    cw[tt][e],
+                )
         self.sync_partials()
         nk = (64 * max_rows + THREADS - 1) // THREADS
         pa = []
         pb = []
         for k in cutlass.range_constexpr(nk):
             idx = tid + k * THREADS
-            rho = idx % 64
+            col = idx % 64
             n = idx // 64
-            tt = n // 8
-            nn = n % 8
-            tl = rho // 16
-            rr_ = rho % 16
-            ln = (rr_ % 8) * 4 + nn // 2
-            reg = (rr_ // 8) * 2 + nn % 2
+            # half 0 (K steps 0..2) + half 1 (K steps 3..5), as head_cta16
             pa.append(
                 _lds_f32_if(
-                    s_red + ((tl * 2 + tt) * 32 + ln) * 16 + reg * 4, idx < 64 * rows
+                    s_red + ((((0 * 2 + n // 8) * 8 + n % 8) * RED_UK_ROW) + col) * 4,
+                    idx < 64 * rows,
                 )
             )
             pb.append(
                 _lds_f32_if(
-                    s_red + (((tl + 4) * 2 + tt) * 32 + ln) * 16 + reg * 4,
+                    s_red + ((((1 * 2 + n // 8) * 8 + n % 8) * RED_UK_ROW) + col) * 4,
                     idx < 64 * rows,
                 )
             )
