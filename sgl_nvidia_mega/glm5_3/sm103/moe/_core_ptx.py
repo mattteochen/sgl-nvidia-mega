@@ -254,14 +254,7 @@ def st_async_v4_f32(remote, remote_bar, a, b, c, d):
     )
 
 
-# ------------------------------------------- L2 prefetch, trace counters (side-effecting)
-
-
-@ptx_op()
-def tma_prefetch_3d(tmap, x, y, z):
-    """L2 prefetch of one 3D tensor-map box (a hint; no output depends on it)."""
-    code = "cp.async.bulk.prefetch.tensor.3d.L2.global.tile [$0, {$1, $2, $3}];"
-    return code, "l,r,r,r", (Int64(tmap), Int32(x), Int32(y), Int32(z))
+# ------------------------------------------------ trace counters (side-effecting)
 
 
 @ptx_op(Uint64)
