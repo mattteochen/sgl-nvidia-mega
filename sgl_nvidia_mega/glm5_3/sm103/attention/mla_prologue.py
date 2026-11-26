@@ -56,6 +56,20 @@ from cutlass import Boolean, Float32, Int32, Int64, Uint32, Uint64
 from ..primitives import ptx_core as ptx
 from ..primitives import ptx_sys
 
+@ptx.ptx_op()
+def _sts_v4_if(addr, words, valid):
+    """``st.shared.v4.u32`` where ``valid`` holds (predicated, no branch)."""
+    code = "{ .reg .pred p; setp.ne.b32 p, $5, 0; @p st.shared.v4.u32 [$0], {$1, $2, $3, $4}; }"
+    return code, "r,r,r,r,r,r", (addr, *words, Int32(Boolean(valid)))
+
+
+@ptx.ptx_op()
+def _stg_v4_if(addr, words, valid):
+    """``st.global.v4.u32`` where ``valid`` holds (predicated, no branch)."""
+    code = "{ .reg .pred p; setp.ne.b32 p, $5, 0; @p st.global.v4.u32 [$0], {$1, $2, $3, $4}; }"
+    return code, "l,r,r,r,r,r", (addr, *words, Int32(Boolean(valid)))
+
+
 # probe builds (benchmarks only): per CTA, PROBE_MARKS x {clock64, globaltimer} u64 slots
 PROBE_MARKS = 16
 
@@ -1116,10 +1130,11 @@ class MlaPrologue:
                     is_rope & (tid + THREADS * it < 32 * rows),
                 )
             )
+        # rows are predicated, not branched, so the scheduler can interleave them
         qv = []
         for n in cutlass.range_constexpr(max_rows):
             qv.append(
-                self.load16(
+                ptx.ld_global_v4_if(
                     q_c + (Int64(n) * q_c_stride + Int64(tid * 8)) * 2, n < rows
                 )
             )
@@ -1134,8 +1149,7 @@ class MlaPrologue:
                 rope_stride,
             )
         for n in cutlass.range_constexpr(max_rows):
-            if n < rows:
-                ptx.st_shared_v4(s_xs + n * XS_STRIDE + tid * 16, qv[n])
+            _sts_v4_if(s_xs + n * XS_STRIDE + tid * 16, qv[n], n < rows)
         self.mark(3, tid)
         if cutlass.const_expr(strided):
             ptx.sync_threads()
@@ -1164,14 +1178,27 @@ class MlaPrologue:
                 ss.append(_lds_f32_if(s_ssq + n * 4, n < rows))
             for n in cutlass.range_constexpr(max_rows):
                 raw.append(_lds_v4_if(s_xs + n * XS_STRIDE + tid * 16, n < rows))
+            # every row computed (an unused row's arithmetic is never stored), the
+            # stores predicated: no per-row branch, so the rows' latencies overlap
+            qc_on = (qc_out != Int64(0)) & (h == 0) & (r == 0)
             for n in cutlass.range_constexpr(max_rows):
-                if n < rows:
-                    rr = ptx.rsqrt_approx(
-                        ptx.fma_rn(ss[n], Float32(1.0 / Q_LORA), q_eps)
+                rr = ptx.rsqrt_approx(ptx.fma_rn(ss[n], Float32(1.0 / Q_LORA), q_eps))
+                words = []
+                for e in cutlass.range_constexpr(4):
+                    x0, x1 = ptx.bf16x2_to_f32x2(raw[n][e])
+                    words.append(
+                        ptx.cvt_rn_bf16x2_f32(
+                            ptx.mul_rn(ptx.mul_rn(x0, rr), wv[2 * e]),
+                            ptx.mul_rn(ptx.mul_rn(x1, rr), wv[2 * e + 1]),
+                        )
                     )
-                    self.store_normed(
-                        s_xs, raw[n], rr, wv, n, tid, h, r, qc_out, qc_out_stride
-                    )
+                packed = (words[0], words[1], words[2], words[3])
+                _sts_v4_if(s_xs + n * XS_STRIDE + tid * 16, packed, n < rows)
+                _stg_v4_if(
+                    qc_out + (Int64(n) * qc_out_stride + Int64(tid * 8)) * 2,
+                    packed,
+                    qc_on & (n < rows),
+                )
         else:
             for n in cutlass.range_constexpr(max_rows):
                 if n < rows:
@@ -1256,7 +1283,7 @@ class MlaPrologue:
         # q_nope ranks publish their BF16 rows; the RoPE ranks keep their FP8 q_pe bytes
         # in registers and store them with the absorbed columns at the end, so no global
         # store is outstanding at the cluster barriers' release
-        rope_b = []
+        qbs = []
         for it in cutlass.range_constexpr(2):
             idx = tid + THREADS * it
             rho = idx % 32
@@ -1268,22 +1295,27 @@ class MlaPrologue:
             if r < NOPE // 32:
                 if idx < 32 * rows:
                     ptx.st_shared_b16(s_pub + (n * 32 + rho) * 2, qb)
-            rope_b.append(
-                self.q_rope_byte(
-                    r >= NOPE // 32,
-                    (r - NOPE // 32) * 32 + rho,
-                    qb,
-                    rope_c[it],
-                    rope_s[it],
-                    inv_qs,
-                )
-            )
+            qbs.append(qb)
         self.mark(9, tid)
         self.publish()
         self.mark(10, tid)
         gv = []
         for it in cutlass.range_constexpr(2):
             gv.append(self.gather_load(base, tid + THREADS * it, rows))
+        # the RoPE ranks' q_pe bytes after the hand-off (they take no part in it), while
+        # the remote loads are in flight
+        rope_b = []
+        for it in cutlass.range_constexpr(2):
+            rope_b.append(
+                self.q_rope_byte(
+                    r >= NOPE // 32,
+                    (r - NOPE // 32) * 32 + (tid + THREADS * it) % 32,
+                    qbs[it],
+                    rope_c[it],
+                    rope_s[it],
+                    inv_qs,
+                )
+            )
         for it in cutlass.range_constexpr(2):
             self.gather_store(base, tid + THREADS * it, rows, gv[it])
         self.done_reading()
