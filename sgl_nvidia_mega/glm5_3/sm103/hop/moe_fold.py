@@ -57,6 +57,7 @@ from .constants import (
     POLL_THREADS,
     TAG_MASK,
     TOPK,
+    WORLD,
 )
 from .transport import ConsSmem, Consumer, Mbox
 
@@ -72,6 +73,8 @@ class MoeFoldArNorm(Consumer):
     nocluster = False
     trigger_late = False
     deferred_norm = False
+    world = WORLD
+    quarters = 4
 
     def __init__(
         self,
@@ -80,9 +83,15 @@ class MoeFoldArNorm(Consumer):
         max_rows: int = 8,
         nocluster: bool = False,
         trigger_late: bool = False,
+        world: int = WORLD,
+        quarters: int = 4,
     ):
         if max_rows != 8:
             raise ValueError("this fold is provided for up to 8 rows")
+        if world not in (4, 8):
+            raise ValueError(f"MoeFoldArNorm: world {world} (4 or 8)")
+        if quarters not in (4, 8):
+            raise ValueError(f"MoeFoldArNorm: quarters {quarters} (4 or 8)")
         self.split, self.max_rows = split, max_rows
         if nocluster:
             if not self.deferred_norm:
@@ -90,6 +99,10 @@ class MoeFoldArNorm(Consumer):
             self.nocluster = True
         if trigger_late:
             self.trigger_late = True
+        if world != WORLD:
+            self.world = world
+        if quarters != 4:
+            self.quarters = quarters
 
     @cute.jit
     def __call__(
@@ -224,7 +237,9 @@ class MoeFoldArNorm(Consumer):
     ):
         """The fold kernel's body; ``dn_bsum`` selects the deferred-norm consumer
         epilogue (``Consumer.consume_cta``)."""
-        mb = Mbox(peers, rank, self.max_rows, err_host, site)
+        mb = Mbox(
+            peers[: self.world], rank, self.max_rows, err_host, site, self.world
+        )
         t = P.thread_index()
         bx = P.block_index()
         smem = cutlass.utils.SmemAllocator()
@@ -328,7 +343,8 @@ class MoeFoldArNorm(Consumer):
     ):
         """Part 1, plain form: thread t handles (slot, chunk) pairs p = t + 512 i, i <
         3; the last 192 polling threads also sum the shared-expert quarters. Every load
-        before any use."""
+        before any use (for quarters=8, two 4-quarter passes keep register footprint
+        identical to quarters=4 while preserving exact sequential FP32 sum order)."""
         t = P.thread_index()
         if t < POLL_THREADS:
             v = cute.make_rmem_tensor((3, 4, 4), Float32)
@@ -364,13 +380,64 @@ class MoeFoldArNorm(Consumer):
                     sv[q, 1] = x1
                     sv[q, 2] = x2
                     sv[q, 3] = x3
-            for i in cutlass.range_constexpr(3):
-                p = t + POLL_THREADS * i
-                k = p // CHUNKS
-                ch = p - k * CHUNKS
-                self.store_y(fy, v, i, ik[i], gk[i], k, ch)
-            if t >= POLL_THREADS - CHUNKS:
-                self.store_sh(fsh, sv, t - (POLL_THREADS - CHUNKS))
+            if cutlass.const_expr(self.quarters == 4):
+                for i in cutlass.range_constexpr(3):
+                    p = t + POLL_THREADS * i
+                    k = p // CHUNKS
+                    ch = p - k * CHUNKS
+                    self.store_y(fy, v, i, ik[i], gk[i], k, ch)
+                if t >= POLL_THREADS - CHUNKS:
+                    self.store_sh(fsh, sv, t - (POLL_THREADS - CHUNKS))
+            else:
+                acc = cute.make_rmem_tensor((3, 4), Float32)
+                for i in cutlass.range_constexpr(3):
+                    for l in cutlass.range_constexpr(4):
+                        acc[i, l] = C.add_rn(
+                            C.add_rn(C.add_rn(v[i, 0, l], v[i, 1, l]), v[i, 2, l]),
+                            v[i, 3, l],
+                        )
+                sacc = cute.make_rmem_tensor((4,), Float32)
+                sacc.fill(0.0)
+                if t >= POLL_THREADS - CHUNKS:
+                    for l in cutlass.range_constexpr(4):
+                        sacc[l] = C.add_rn(
+                            C.add_rn(C.add_rn(sv[0, l], sv[1, l]), sv[2, l]),
+                            sv[3, l],
+                        )
+                for i in cutlass.range_constexpr(3):
+                    p = t + POLL_THREADS * i
+                    k = p // CHUNKS
+                    ch = p - k * CHUNKS
+                    for q in cutlass.range_constexpr(4):
+                        a = pq + Int64(4) * (
+                            ((Int64(q + 4) * Int64(rows) + Int64(m)) * TOPK + Int64(k))
+                            * HIDDEN
+                            + Int64(col + 4 * ch)
+                        )
+                        x0, x1, x2, x3 = sys_ops.ld_cg_v4_f32(a)
+                        v[i, q, 0] = x0
+                        v[i, q, 1] = x1
+                        v[i, q, 2] = x2
+                        v[i, q, 3] = x3
+                if t >= POLL_THREADS - CHUNKS:
+                    ch = t - (POLL_THREADS - CHUNKS)
+                    for q in cutlass.range_constexpr(4):
+                        a = shp + Int64(4) * (
+                            (Int64(q + 4) * Int64(rows) + Int64(m)) * HIDDEN
+                            + Int64(col + 4 * ch)
+                        )
+                        x0, x1, x2, x3 = sys_ops.ld_cg_v4_f32(a)
+                        sv[q, 0] = x0
+                        sv[q, 1] = x1
+                        sv[q, 2] = x2
+                        sv[q, 3] = x3
+                for i in cutlass.range_constexpr(3):
+                    p = t + POLL_THREADS * i
+                    k = p // CHUNKS
+                    ch = p - k * CHUNKS
+                    self.store_y_acc(fy, acc, v, i, ik[i], gk[i], k, ch)
+                if t >= POLL_THREADS - CHUNKS:
+                    self.store_sh_acc(fsh, sacc, sv, t - (POLL_THREADS - CHUNKS))
 
     @cute.jit
     def fold_part1_half(
@@ -422,14 +489,72 @@ class MoeFoldArNorm(Consumer):
                     sv[q, 1] = x1
                     sv[q, 2] = x2
                     sv[q, 3] = x3
-            for i in cutlass.range_constexpr(2):
-                p = t + POLL_THREADS * i
-                if p < TOPK * hch:
-                    k = p // hch
-                    ch = hch * half + (p - k * hch)
-                    self.store_y(fy, v, i, ik[i], gk[i], k, ch)
-            if t >= POLL_THREADS - hch:
-                self.store_sh(fsh, sv, hch * half + (t - (POLL_THREADS - hch)))
+            if cutlass.const_expr(self.quarters == 4):
+                for i in cutlass.range_constexpr(2):
+                    p = t + POLL_THREADS * i
+                    if p < TOPK * hch:
+                        k = p // hch
+                        ch = hch * half + (p - k * hch)
+                        self.store_y(fy, v, i, ik[i], gk[i], k, ch)
+                if t >= POLL_THREADS - hch:
+                    self.store_sh(fsh, sv, hch * half + (t - (POLL_THREADS - hch)))
+            else:
+                acc = cute.make_rmem_tensor((2, 4), Float32)
+                for i in cutlass.range_constexpr(2):
+                    for l in cutlass.range_constexpr(4):
+                        acc[i, l] = C.add_rn(
+                            C.add_rn(C.add_rn(v[i, 0, l], v[i, 1, l]), v[i, 2, l]),
+                            v[i, 3, l],
+                        )
+                sacc = cute.make_rmem_tensor((4,), Float32)
+                sacc.fill(0.0)
+                if t >= POLL_THREADS - hch:
+                    for l in cutlass.range_constexpr(4):
+                        sacc[l] = C.add_rn(
+                            C.add_rn(C.add_rn(sv[0, l], sv[1, l]), sv[2, l]),
+                            sv[3, l],
+                        )
+                for i in cutlass.range_constexpr(2):
+                    p = t + POLL_THREADS * i
+                    if p < TOPK * hch:
+                        k = p // hch
+                        ch = hch * half + (p - k * hch)
+                        for q in cutlass.range_constexpr(4):
+                            a = pq + Int64(4) * (
+                                (
+                                    (Int64(q + 4) * Int64(rows) + Int64(m)) * TOPK
+                                    + Int64(k)
+                                )
+                                * HIDDEN
+                                + Int64(col + 4 * ch)
+                            )
+                            x0, x1, x2, x3 = sys_ops.ld_cg_v4_f32(a)
+                            v[i, q, 0] = x0
+                            v[i, q, 1] = x1
+                            v[i, q, 2] = x2
+                            v[i, q, 3] = x3
+                if t >= POLL_THREADS - hch:
+                    ch = hch * half + (t - (POLL_THREADS - hch))
+                    for q in cutlass.range_constexpr(4):
+                        a = shp + Int64(4) * (
+                            (Int64(q + 4) * Int64(rows) + Int64(m)) * HIDDEN
+                            + Int64(col + 4 * ch)
+                        )
+                        x0, x1, x2, x3 = sys_ops.ld_cg_v4_f32(a)
+                        sv[q, 0] = x0
+                        sv[q, 1] = x1
+                        sv[q, 2] = x2
+                        sv[q, 3] = x3
+                for i in cutlass.range_constexpr(2):
+                    p = t + POLL_THREADS * i
+                    if p < TOPK * hch:
+                        k = p // hch
+                        ch = hch * half + (p - k * hch)
+                        self.store_y_acc(fy, acc, v, i, ik[i], gk[i], k, ch)
+                if t >= POLL_THREADS - hch:
+                    self.store_sh_acc(
+                        fsh, sacc, sv, hch * half + (t - (POLL_THREADS - hch))
+                    )
 
     @cute.jit
     def store_y(self, fy, v, i, ik, gk, k, ch):
@@ -486,6 +611,93 @@ class MoeFoldArNorm(Consumer):
         s1 = C.add_rn(C.add_rn(C.add_rn(sv[0, 1], sv[1, 1]), sv[2, 1]), sv[3, 1])
         s2 = C.add_rn(C.add_rn(C.add_rn(sv[0, 2], sv[1, 2]), sv[2, 2]), sv[3, 2])
         s3 = C.add_rn(C.add_rn(C.add_rn(sv[0, 3], sv[1, 3]), sv[2, 3]), sv[3, 3])
+        P.st_shared_v4_u32(
+            Uint32((fsh.iterator + 4 * ch).toint()),
+            P.f32_bits(s0),
+            P.f32_bits(s1),
+            P.f32_bits(s2),
+            P.f32_bits(s3),
+        )
+
+    @cute.jit
+    def store_y_acc(self, fy, acc, v, i, ik, gk, k, ch):
+        """8-quarter variant of ``store_y``: continue sequential sum from ``acc``
+        (quarters 0..3) through ``v`` (quarters 4..7), then scale and round to bf16."""
+        px = C.mul_rn(
+            C.add_rn(
+                C.add_rn(
+                    C.add_rn(C.add_rn(acc[i, 0], v[i, 0, 0]), v[i, 1, 0]), v[i, 2, 0]
+                ),
+                v[i, 3, 0],
+            ),
+            gk,
+        )
+        py = C.mul_rn(
+            C.add_rn(
+                C.add_rn(
+                    C.add_rn(C.add_rn(acc[i, 1], v[i, 0, 1]), v[i, 1, 1]), v[i, 2, 1]
+                ),
+                v[i, 3, 1],
+            ),
+            gk,
+        )
+        pz = C.mul_rn(
+            C.add_rn(
+                C.add_rn(
+                    C.add_rn(C.add_rn(acc[i, 2], v[i, 0, 2]), v[i, 1, 2]), v[i, 2, 2]
+                ),
+                v[i, 3, 2],
+            ),
+            gk,
+        )
+        pw = C.mul_rn(
+            C.add_rn(
+                C.add_rn(
+                    C.add_rn(C.add_rn(acc[i, 3], v[i, 0, 3]), v[i, 1, 3]), v[i, 2, 3]
+                ),
+                v[i, 3, 3],
+            ),
+            gk,
+        )
+        w0 = C.cvt_rn_bf16x2_f32(px, py)
+        w1 = C.cvt_rn_bf16x2_f32(pz, pw)
+        y0 = P.bf16_lo(w0)
+        y1 = P.bf16_hi(w0)
+        y2 = P.bf16_lo(w1)
+        y3 = P.bf16_hi(w1)
+        if ik < 0:
+            y0 = Float32(0.0)
+            y1 = Float32(0.0)
+            y2 = Float32(0.0)
+            y3 = Float32(0.0)
+        P.st_shared_v4_u32(
+            Uint32((fy.iterator + (k * ELEMS_PER_CTA + 4 * ch)).toint()),
+            P.f32_bits(y0),
+            P.f32_bits(y1),
+            P.f32_bits(y2),
+            P.f32_bits(y3),
+        )
+
+    @cute.jit
+    def store_sh_acc(self, fsh, sacc, sv, ch):
+        """8-quarter variant of ``store_sh``: continue sequential sum from ``sacc``
+        (quarters 0..3) through ``sv`` (quarters 4..7)."""
+        s0 = C.add_rn(
+            C.add_rn(C.add_rn(C.add_rn(sacc[0], sv[0, 0]), sv[1, 0]), sv[2, 0]),
+            sv[3, 0],
+        )
+        s1 = C.add_rn(
+            C.add_rn(C.add_rn(C.add_rn(sacc[1], sv[0, 1]), sv[1, 1]), sv[2, 1]),
+            sv[3, 1],
+        )
+        s2 = C.add_rn(
+            C.add_rn(C.add_rn(C.add_rn(sacc[2], sv[0, 2]), sv[1, 2]), sv[2, 2]),
+            sv[3, 2],
+        )
+        s3 = C.add_rn(
+            C.add_rn(C.add_rn(C.add_rn(sacc[3], sv[0, 3]), sv[1, 3]), sv[2, 3]),
+            sv[3, 3],
+        )
         P.st_shared_v4_u32(
             Uint32((fsh.iterator + 4 * ch).toint()),
             P.f32_bits(s0),
