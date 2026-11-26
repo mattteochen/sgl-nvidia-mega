@@ -209,6 +209,8 @@ TR_W_ACC1F, TR_W_PFREE, TR_W_PRECV, TR_W_ACC2F = 16, 17, 18, 19
 TR_NUNITS, TR_NEX, TR_READOUT, TR_HCHAIN, TR_IDS, TR_PRE0 = 20, 21, 22, 23, 24, 25
 # absolute stamps of the last launch (st)
 TR_PDL_ABS, TR_FIRST_ABS, TR_SEND_ABS = 26, 27, 28
+# default exchange path: per group, send (incl. the buffer wait) / sum + h compute
+TR_HSEND, TR_HCOMP = 29, 30
 TR_ABS = (TR_ENTRY, TR_EXIT, TR_PDL_ABS, TR_FIRST_ABS, TR_SEND_ABS)
 TR_LAUNCHES = 31
 
@@ -232,6 +234,9 @@ class Nvfp4MoeSmallM16:
       lookahead + 1);
     * ``pre`` = n (1..3): unit 0's first n FC1 chunks issue as soon as unit 0 is known,
       before the union list and unit table are built (default 1);
+    * ``xgate`` (with ``fasttab``): unit 0's first chunks issue only once the epilogue
+      warps have issued their second x loads (the weight burst otherwise queues ahead
+      of them in L2 and delays the x quantization);
     * ``rfirst``: per step k the epilogue reads out FC2(k - lookahead) before the h chain
       of unit k (frees the single FC2 accumulator sooner);
     * ``xhoist``: the x quantization issues both halves' loads before quantizing;
@@ -254,6 +259,7 @@ class Nvfp4MoeSmallM16:
         fasttab: bool = False,
         rfirst: bool = False,
         xhoist: bool = False,
+        xgate: bool = False,
         trace: bool = False,
     ):
         self.shared = shared
@@ -263,6 +269,9 @@ class Nvfp4MoeSmallM16:
         self.fasttab = bool(fasttab)
         self.rfirst = bool(rfirst)
         self.xhoist = bool(xhoist)
+        self.xgate = bool(xgate)
+        if self.xgate and (self.xhoist or not self.fasttab):
+            raise ValueError("engine16: xgate needs fasttab and the default x loads")
         self.trace = bool(trace)
         if not 0 <= self.l2pf <= 4:
             raise ValueError(f"engine16: l2pf {l2pf}")
@@ -284,6 +293,7 @@ class Nvfp4MoeSmallM16:
             "fasttab": self.fasttab,
             "rfirst": self.rfirst,
             "xhoist": self.xhoist,
+            "xgate": self.xgate,
             "trace": self.trace,
         }
 
@@ -707,6 +717,8 @@ class Nvfp4MoeSmallM16:
         e0 = cute.arch.shuffle_sync(eu, 0)
         pre0 = Int32(0)
         if (lane == 0) & (nunits > 0) & (code0 >= 0):
+            if cutlass.const_expr(self.xgate):
+                C.mbarrier_wait_parity(misc + B_XBAR, 0)
             for c in cutlass.range_constexpr(self.pre):
                 C.mbarrier_arrive_expect_tx(misc + B_FULL + 8 * c, BIG)
                 self.fc1_chunk(
@@ -1553,6 +1565,11 @@ class Nvfp4MoeSmallM16:
                         for w in cutlass.range_constexpr(4):
                             raw[8 * ii + w] = lo[w]
                             raw[8 * ii + 4 + w] = hi[w]
+                if cutlass.const_expr(self.xgate):
+                    if hf == 1:
+                        cute.arch.sync_warp()
+                        if lane == 0:
+                            C.mbarrier_arrive(misc + B_XBAR)
                 for ii in cutlass.range_constexpr(6):
                     b = et + 128 * (hf * 6 + ii)
                     n = b // 96
@@ -2088,6 +2105,8 @@ class Nvfp4MoeSmallM16:
                             p = e % self.RECV_BUFS
                             use = e // self.RECV_BUFS
                             gi = gi + 1
+                            if cutlass.const_expr(self.trace):
+                                ts = P.globaltimer()
                             if use >= 1:
                                 self.twait(
                                     misc + self.B_PFREE + 8 * p,
@@ -2115,6 +2134,9 @@ class Nvfp4MoeSmallM16:
                                         v2,
                                         v3,
                                     )
+                            if cutlass.const_expr(self.trace):
+                                if et == 0:
+                                    self.tr_since(err, block, TR_HSEND, ts)
                             self.twait(
                                 misc + self.B_PRECV + 8 * p,
                                 use & 1,
@@ -2124,6 +2146,8 @@ class Nvfp4MoeSmallM16:
                                 et,
                                 ".acquire.cluster",
                             )
+                            if cutlass.const_expr(self.trace):
+                                tc = P.globaltimer()
                             acc = [
                                 Float32(0.0),
                                 Float32(0.0),
@@ -2165,6 +2189,9 @@ class Nvfp4MoeSmallM16:
                                     qd,
                                     lane,
                                 )
+                            if cutlass.const_expr(self.trace):
+                                if et == 0:
+                                    self.tr_since(err, block, TR_HCOMP, tc)
                 ex = ex + ng
                 C.fence_proxy_async_shared_cta()
                 cute.arch.sync_warp()
@@ -2289,7 +2316,7 @@ class Nvfp4MoeSmallM16:
                 C.mbarrier_init(misc + B_FULL + 8 * s, 1)
                 C.mbarrier_init(misc + B_EMPTY + 8 * s, 1)
             C.mbarrier_init(misc + B_XREADY, 4)
-            C.mbarrier_init(misc + B_XBAR, 1)
+            C.mbarrier_init(misc + B_XBAR, 4 if self.xgate else 1)
             # one arrive per lane of the table-building warp: each lane publishes its
             # own unit-record stores (PTX memory model; no reliance on the warp barrier)
             C.mbarrier_init(misc + B_TREADY, 32)

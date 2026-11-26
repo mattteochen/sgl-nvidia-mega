@@ -45,6 +45,7 @@ ENGINE_SMEM = {"g1": 227440, "g2": 229968, "g4": 223664}
 #                             is built (1..3, default 1)
 #   ..._MOE16_FASTTAB=1       lane-parallel unit table (batched id loads, no union list)
 #   ..._MOE16_XHOIST=1        x quantization issues all its loads before quantizing
+#   ..._MOE16_XGATE=1         (with FASTTAB) unit 0's first chunks wait for the x loads' issue
 #   ..._MOE16_RFIRST=1        epilogue reads out FC2(k - lookahead) before unit k's h chain
 #   ..._MOE16_SHARED_WEIGHT=w schedule weight of the shared quarter in units (default 4)
 #   ..._MOE16_SHARED_FILL=1   the shared clusters also take up to cap - weight routed units
@@ -70,6 +71,7 @@ def g4_knobs() -> dict:
         "pre": _env_int("PRE", 1),
         "fasttab": _env_int("FASTTAB", 0) != 0,
         "xhoist": _env_int("XHOIST", 0) != 0,
+        "xgate": _env_int("XGATE", 0) != 0,
         "rfirst": _env_int("RFIRST", 0) != 0,
     }
 
