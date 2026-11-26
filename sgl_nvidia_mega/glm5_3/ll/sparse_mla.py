@@ -509,6 +509,7 @@ class SparseMlaFdFamily:
         # SM103 TP4 (16 heads, rows <= 8) PDL CuTe DSL uv_proj (replaces cuBLAS torch.bmm)
         self.uv16_fn = None
         self.uv16_weights: Dict[int, int] = {}
+        self.uv16_stages: Dict[int, tuple] = {}
         self._uv16_keep: list = []
 
     def _compile_uv16(self) -> None:
@@ -520,14 +521,30 @@ class SparseMlaFdFamily:
             return
         import cutlass.cute as cute
 
+        from sgl_nvidia_mega.glm5_3.attention.fused import (
+            EVICT_LAST,
+            NO_SLOT,
+            _prefetch_slot,
+        )
         from sgl_nvidia_mega.glm5_3.runtime.compile import compile_cached
         from sgl_nvidia_mega.glm5_3.sm103.attention.api import example_args
         from sgl_nvidia_mega.glm5_3.sm103.attention.mla_uv_proj import MlaUvProj
         from sgl_nvidia_mega.glm5_3.sm103.packing import pack_uv_proj_from_w_vc
 
+        vpc = int(os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_UV_VPC", "64") or "64")
+        if vpc not in (16, 32, 64):
+            raise ValueError(f"SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_UV_VPC={vpc}")
+        stage_prefix_kb = int(
+            os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_OPROJ_STAGE_PREFIX_KB", "96")
+            or "96"
+        )
+        slab_bytes = 48 * 4096 * 2  # one GEMV CTA's o_proj weight slab at TP4
+        prefix_bytes = min(max(0, stage_prefix_kb * 1024), slab_bytes)
+
         weights: Dict[int, int] = {}
+        stages: Dict[int, tuple] = {}
         keep: list = []
-        for layer in self.layers:
+        for idx, layer in enumerate(self.layers):
             attn = layer.self_attn
             w_vc = getattr(attn, "w_vc", None)
             if (
@@ -536,23 +553,51 @@ class SparseMlaFdFamily:
                 or tuple(w_vc.shape) != (16, HEAD_DIM_V, V_HEAD_DIM)
             ):
                 return
-            packed = pack_uv_proj_from_w_vc(w_vc, values_per_cta=32)
+            packed = pack_uv_proj_from_w_vc(w_vc, values_per_cta=vpc)
             if self.derived is not None:
                 packed = self.derived.add("ll.uv_proj_16", packed)
             keep.append(packed)
             weights[attn.layer_id] = packed.data_ptr()
-        kernel = MlaUvProj(max_rows=8, heads=16, values_per_cta=32)
+            s0, s1 = NO_SLOT, NO_SLOT
+            if not self.draft and prefix_bytes > 0:
+                wo = getattr(getattr(attn, "o_proj", None), "weight", None)
+                if (
+                    isinstance(wo, torch.Tensor)
+                    and wo.dtype == torch.bfloat16
+                    and tuple(wo.shape) == (6144, 4096)
+                ):
+                    s0 = _prefetch_slot(
+                        wo, wo.numel() * wo.element_size(), slab_bytes, prefix_bytes
+                    )
+                if idx + 1 < len(self.layers):
+                    nxt_w = getattr(
+                        getattr(
+                            self.layers[idx + 1].self_attn,
+                            "fused_qkv_a_proj_with_mqa",
+                            None,
+                        ),
+                        "weight",
+                        None,
+                    )
+                    if isinstance(nxt_w, torch.Tensor):
+                        s1 = _prefetch_slot(nxt_w, 4 * 1024 * 1024)
+            stages[attn.layer_id] = (s0, s1)
+        kernel = MlaUvProj(max_rows=8, heads=16, values_per_cta=vpc)
         args = example_args()["uv"]
         self.uv16_fn = compile_cached(
             kernel,
-            {"max_rows": 8, "heads": 16, "values_per_cta": 32},
+            {"max_rows": 8, "heads": 16, "values_per_cta": vpc},
             lambda k=kernel, a=args: cute.compile(k, *a),
         )
         self.uv16_weights = weights
+        self.uv16_stages = stages
         self._uv16_keep = keep
         logger.info(
-            "%s: SM103 TP4 MlaUvProj16 (128 CTAs, PDL) compiled for %d layers (rows <= 8)",
+            "%s: SM103 TP4 MlaUvProj16 (%d CTAs, vpc=%d, stage_prefix=%d KiB, PDL) compiled for %d layers (rows <= 8)",
             NAME,
+            16 * (V_HEAD_DIM // vpc),
+            vpc,
+            prefix_bytes // 1024,
             len(weights),
         )
 
@@ -786,6 +831,7 @@ class SparseMlaFdSteps:
         ):
             from cutlass import Int32, Int64
 
+            from sgl_nvidia_mega.glm5_3.attention.fused import NO_SLOT, _slot_args
             from sgl_nvidia_mega.glm5_3.runtime.compile import cu_stream
 
             out = torch.empty(
@@ -793,7 +839,7 @@ class SparseMlaFdSteps:
                 dtype=torch.bfloat16,
                 device=attn_output.device,
             )
-            z64, z32 = Int64(0), Int32(0)
+            s0, s1 = self.family.uv16_stages.get(attn.layer_id, (NO_SLOT, NO_SLOT))
             uv_fn(
                 Int64(w_ptr),
                 Int64(attn_output.data_ptr()),
@@ -802,8 +848,8 @@ class SparseMlaFdSteps:
                 Int64(out.data_ptr()),
                 Int64(out.stride(0)),
                 Int32(rows),
-                z64, z64, z64, z64, z32,
-                z64, z64, z64, z64, z32,
+                *_slot_args(s0),
+                *_slot_args(s1),
                 cu_stream(attn_output.device),
             )
             return out

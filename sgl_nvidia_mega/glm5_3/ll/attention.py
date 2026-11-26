@@ -43,6 +43,7 @@ import torch
 from sgl_nvidia_mega.glm5_3 import ll
 from sgl_nvidia_mega.glm5_3.attention.step import (
     AttentionStep,
+    IndexQ,
     PrologueOut,
     StepContext,
 )
@@ -135,7 +136,7 @@ WIDE_MAX_ROWS = 48
 MAX_ROWS = 48
 # The steps the unit claims (atomically: the deferred kv_a norm passes from prologue
 # to rope_cache, and TP4 MlaPrologue16 also absorbs q_nope).
-STEPS = ("qkv_a", "prologue", "index_k", "q_absorb", "rope_cache")
+STEPS = ("qkv_a", "prologue", "index_k", "index_q", "q_absorb", "rope_cache")
 # the option unit that folds the kv_a norm (units.OPTIONS)
 FOLD_UNIT = "ll.attention.kv_norm_fold"
 
@@ -365,12 +366,82 @@ class LLAttention(AttentionStep):
         self.rows = rows
         self.forms = family.forms[rows]
         self.fold = family.fold.fold
+        self._use_sm103_front = (
+            1 <= rows <= 8 and family.sm103_front is not None
+        )
+
+    def _stock_index_steps(self) -> bool:
+        return not self._use_sm103_front
+
+    @staticmethod
+    def _runs_indexer(attn, step: StepContext) -> bool:
+        ri = getattr(step, "run_indexer", None)
+        if ri is not None:
+            return bool(ri)
+        return not attn.skip_topk
 
     def _check_rows(self, t: torch.Tensor, what: str) -> None:
         if t.shape[0] != self.rows:
             raise _fail(f"{what} has {t.shape[0]} rows at the {self.rows}-row width")
 
+    def _run_sm103_qkv_a(self, fn, w_ptr: int, x: torch.Tensor, dn=None, index_kw: bool = False):
+        from cutlass import Float32, Int32, Int64
+
+        from sgl_nvidia_mega.glm5_3.runtime.compile import cu_stream
+
+        rows = x.shape[0]
+        qkv = torch.empty((rows, QKV_A_SHAPE[0]), dtype=torch.bfloat16, device=x.device)
+        kw = (
+            torch.empty((rows, 160), dtype=torch.bfloat16, device=x.device)
+            if index_kw
+            else None
+        )
+        tail = ()
+        if dn is not None:
+            tail = (Int64(dn[0].data_ptr()), Float32(dn[1]))
+        fn(
+            Int64(w_ptr),
+            Int64(x.data_ptr()),
+            Int64(x.stride(0)),
+            Int32(rows),
+            Int64(qkv.data_ptr()),
+            Int64(qkv.stride(0)),
+            Int64(kw.data_ptr() if kw is not None else 0),
+            Int64(kw.stride(0) if kw is not None else 0),
+            *tail,
+            cu_stream(x.device),
+        )
+        return qkv, kw
+
     def qkv_a(self, attn, x, step: StepContext) -> torch.Tensor:
+        dn, step.dnorm = step.dnorm, None
+        if self._use_sm103_front:
+            la = self.family.sm103_layers.get(attn.layer_id)
+            if la is not None and x.dtype == torch.bfloat16 and x.is_contiguous():
+                if not self._runs_indexer(attn, step):
+                    if dn is not None:
+                        qa_dn = self.family.sm103_front.get("qkv_a_shared_dn.8")
+                        if dn[0] != attn.layer_id or qa_dn is None or not la["w_qkva_s"]:
+                            raise _fail(
+                                f"layer {attn.layer_id} got deferred norm of layer {dn[0]}"
+                            )
+                        return self._run_sm103_qkv_a(
+                            qa_dn, la["w_qkva_s"], x, dn=(dn[1], la["in_eps"])
+                        )[0]
+                    qa_s = self.family.sm103_front.get("qkv_a_shared.8")
+                    if qa_s is not None and la["w_qkva_s"]:
+                        return self._run_sm103_qkv_a(qa_s, la["w_qkva_s"], x)[0]
+                else:
+                    if dn is not None:
+                        raise _fail(f"indexer layer {attn.layer_id} got deferred norm")
+                    qa = self.family.sm103_front.get("qkv_a.8")
+                    if qa is not None and la["w_qkva"]:
+                        qkv, step.index_kw = self._run_sm103_qkv_a(
+                            qa, la["w_qkva"], x, index_kw=True
+                        )
+                        return qkv
+        elif dn is not None:
+            raise _fail(f"layer {attn.layer_id} got deferred norm without SM103 front")
         form = self.forms.qkv_a
         if form is None:
             return super().qkv_a(attn, x, step)
@@ -393,6 +464,7 @@ class LLAttention(AttentionStep):
     ) -> PrologueOut:
         from sglang.srt.model_executor.runner import get_is_capture_mode
 
+        step.index_k_done = False
         p16 = self.family.prologue16_fn
         p16_la = (
             self.family.prologue16_layers.get(attn.layer_id)
@@ -428,7 +500,8 @@ class LLAttention(AttentionStep):
                 and pos.stride(0) == 1
             ):
                 dev = qkv_latent.device
-                mla = step.view.kv_pool.get_key_buffer(attn.layer_id)
+                pool = step.view.kv_pool
+                mla = pool.get_key_buffer(attn.layer_id)
                 if mla.dim() == 2:
                     mla = mla.unsqueeze(1)
                 if (
@@ -440,7 +513,37 @@ class LLAttention(AttentionStep):
                     mqa = torch.empty(
                         (rows, HEADS, MQA_DIM), dtype=torch.float8_e4m3fn, device=dev
                     )
-                    need_qc = getattr(attn, "indexer", None) is not None
+                    la = self.family.sm103_layers.get(attn.layer_id)
+                    run_idx = self._runs_indexer(attn, step)
+                    kw = step.index_kw
+                    full = False
+                    idx_ptr = idx_stride = ik_w = ik_b = irope = irope_stride = 0
+                    ik_eps = 0.0
+                    if (
+                        run_idx
+                        and la is not None
+                        and la["ik_w"] is not None
+                        and isinstance(kw, torch.Tensor)
+                        and kw.dtype == torch.bfloat16
+                        and tuple(kw.shape) == (rows, 160)
+                        and kw.is_contiguous()
+                    ):
+                        buf = pool.get_index_k_with_scale_buffer(layer_id=attn.layer_id)
+                        if (
+                            buf.dim() == 2
+                            and buf.shape[1] == 64 * (128 + 4)
+                            and buf.element_size() == 1
+                            and buf.is_contiguous()
+                        ):
+                            full = True
+                            idx_ptr = buf.data_ptr()
+                            idx_stride = buf.stride(0) * buf.element_size()
+                            ik_w = la["ik_w"].data_ptr()
+                            ik_b = la["ik_b"].data_ptr()
+                            ik_eps = la["ik_eps"]
+                            irope = la["index_rope"].data_ptr()
+                            irope_stride = la["index_rope"].stride(0)
+                    need_qc = full or (getattr(attn, "indexer", None) is not None and run_idx)
                     qc = (
                         torch.empty((rows, Q_LORA), dtype=torch.bfloat16, device=dev)
                         if need_qc
@@ -454,26 +557,29 @@ class LLAttention(AttentionStep):
                         Int64(base), Int64(stride),
                         Int64(base + Q_LORA * 2), Int64(stride),
                         Int64(base + (Q_LORA + KV_LORA) * 2), Int64(stride),
-                        z64, z64,  # idx_k unused (has_indexer=0; index_k runs via ll.gemm)
+                        Int64(kw.data_ptr()) if full else z64,
+                        Int64(kw.stride(0)) if full else z64,
                         Int64(pos.data_ptr()), Int64(loc.data_ptr()),
-                        z64,  # idx_slot_mapping unused
+                        Int64(loc.data_ptr()) if full else z64,
                         Int32(rows),
-                        z32,  # has_indexer=0
+                        Int32(1 if full else 0),
                         Int64(w_qb), Int64(w_uk),
                         Int64(q_nw.data_ptr()), Int64(kv_nw.data_ptr()),
                         Float32(q_eps), Float32(kv_eps),
                         Int64(rope.data_ptr()), Int64(rope.stride(0)),
                         Int64(ones), Int64(ones),
-                        z64, z64, Float32(0.0), z64, z64,  # index-K norm & rope unused
+                        Int64(ik_w), Int64(ik_b), Float32(ik_eps),
+                        Int64(irope), Int64(irope_stride),
                         Int64(mqa.data_ptr()), Int64(mqa.stride(0)),
                         Int64(mla.data_ptr()), Int64(mla.stride(0)), Int64(mla.stride(1)), Int64(1),
-                        z64, z64, Int64(1),  # idx_cache unused
-                        z64, z64, z32,  # topk unused
+                        Int64(idx_ptr), Int64(idx_stride), Int64(64),
+                        z64, z64, z32,
                         Int64(qc.data_ptr()) if qc is not None else z64,
                         Int64(qc.stride(0)) if qc is not None else z64,
                         cu_stream(dev),
                     )
                     step.q_fp8 = mqa
+                    step.index_k_done = full
                     return PrologueOut(qc, None, None, None, None)
 
         # AttentionStep.prologue with q_b on _q_b and, when folded, the kv_a norm
@@ -504,6 +610,51 @@ class LLAttention(AttentionStep):
         if step.q_fp8 is not None:
             return None
         return super().q_absorb(attn, q_nope, step)
+
+    def index_k(self, attn, x, positions, step: StepContext) -> None:
+        if getattr(step, "index_k_done", False):
+            step.index_k_done = False
+            return
+        return super().index_k(attn, x, positions, step)
+
+    def index_q(self, attn, x, q_lora: torch.Tensor, step: StepContext) -> IndexQ:
+        if self._use_sm103_front and self.family.sm103_iq is not None:
+            la = self.family.sm103_layers.get(attn.layer_id)
+            if (
+                la is not None
+                and la["w_iq"]
+                and q_lora.dtype == torch.bfloat16
+                and q_lora.is_contiguous()
+            ):
+                from cutlass import Float32, Int32, Int64
+
+                from sgl_nvidia_mega.glm5_3.runtime.compile import cu_stream
+
+                rows = q_lora.shape[0]
+                _, weights_raw = self._index_kw(attn.indexer, x, step)
+                pos = step.positions
+                dev = q_lora.device
+                q = torch.empty((rows, 32, 128), dtype=torch.float8_e4m3fn, device=dev)
+                w = torch.empty((rows, 32), dtype=torch.float32, device=dev)
+                self.family.sm103_iq(
+                    Int64(la["w_iq"]),
+                    Int64(q_lora.data_ptr()),
+                    Int64(q_lora.stride(0)),
+                    Int64(pos.data_ptr()),
+                    Int64(la["index_rope"].data_ptr()),
+                    Int64(la["index_rope"].stride(0)),
+                    Int64(weights_raw.data_ptr()),
+                    Int64(weights_raw.stride(0)),
+                    Float32(la["w_scale"]),
+                    Int32(rows),
+                    Int64(q.data_ptr()),
+                    Int64(q.stride(0)),
+                    Int64(w.data_ptr()),
+                    Int64(w.stride(0)),
+                    cu_stream(dev),
+                )
+                return IndexQ(q, w.unsqueeze(-1))
+        return super().index_q(attn, x, q_lora, step)
 
     def _index_kw(self, indexer, x, step: StepContext):
         """(key, raw head gates), projecting ``x`` through ``ll.linear`` unless a
@@ -666,13 +817,24 @@ class AttentionFamily:
         self.kw_gemm = ""
         self._served: Dict[int, LLAttention] = {}
         self.prologue16_fn = None
+        self.prologue16_end_fn = None
         self.prologue16_layers: Dict[int, tuple] = {}
         self.prologue16_ones: Optional[torch.Tensor] = None
+        self.sm103_front: Optional[Dict[str, object]] = None
+        self.sm103_layers: Dict[int, dict] = {}
+        self.sm103_iq = None
         self._p16_keep: list = []
 
     def _compile_prologue16(self, widths: Sequence[int]) -> None:
+        attn_front_on = (
+            os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_SM103_ATTN_FRONT", "1")
+            == "1"
+        )
+        p16_on = attn_front_on or (
+            os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_PROLOGUE", "0") == "1"
+        )
         if (
-            os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_PROLOGUE", "0") != "1"
+            not p16_on
             or self.profile is None
             or tuple(self.profile.sm) != SM
             or not any(1 <= m <= 8 for m in widths)
@@ -680,20 +842,40 @@ class AttentionFamily:
             return
         import dataclasses
         import cutlass.cute as cute
+        from sglang.srt.layers.layernorm import LayerNorm
 
-        from sgl_nvidia_mega.glm5_3.attention.fused import _prologue_numerics
+        from sgl_nvidia_mega.glm5_3.attention.fused import (
+            INDEX_Q_ROPE_FORM,
+            _prologue_numerics,
+        )
+        from sgl_nvidia_mega.glm5_3.runtime import SLOTS
         from sgl_nvidia_mega.glm5_3.runtime.compile import compile_cached
         from sgl_nvidia_mega.glm5_3.sm103.attention.api import example_args
+        from sgl_nvidia_mega.glm5_3.sm103.attention.indexer_q_proj import IndexerQProj
         from sgl_nvidia_mega.glm5_3.sm103.attention.mla_prologue import MlaPrologue
+        from sgl_nvidia_mega.glm5_3.sm103.attention.qkv_a_proj_small_m import (
+            QkvAProjSmallM,
+            QkvAProjSmallMDn,
+        )
         from sgl_nvidia_mega.glm5_3.sm103.packing import (
+            pack_indexer_q,
             pack_q_b,
+            pack_qkv_a,
             pack_w_uk_t,
             pack_w_uk_t_from_w_kc,
         )
 
+        is_target = len(self.layers) > 1
+        grid = torch.cuda.get_device_properties(self.device).multi_processor_count
         la_map: Dict[int, tuple] = {}
+        sm103_map: Dict[int, dict] = {}
         keep: list = []
-        for attn in self.attns:
+        has_shared_qa = False
+        has_idx_qa = False
+        has_iq = False
+        index_rope_f32 = True
+
+        for layer, attn in zip(self.layers, self.attns):
             w_qb = pack_q_b(attn.q_b_proj.weight, heads=HEADS)
             kv_b_w = getattr(getattr(attn, "kv_b_proj", None), "weight", None)
             if (
@@ -720,39 +902,166 @@ class AttentionFamily:
                 float(attn.kv_a_layernorm.variance_epsilon),
                 attn.rotary_emb.cos_sin_cache,
             )
+
+            entry = {
+                "w_qkva": 0,
+                "w_qkva_s": 0,
+                "w_iq": 0,
+                "ik_w": None,
+                "ik_b": None,
+                "ik_eps": 0.0,
+                "index_rope": None,
+                "w_scale": 0.0,
+                "in_eps": float(layer.input_layernorm.variance_epsilon),
+            }
+            if attn_front_on:
+                qkv_a_w = attn.fused_qkv_a_proj_with_mqa.weight
+                ix = getattr(attn, "indexer", None)
+                if (
+                    ix is not None
+                    and isinstance(getattr(ix, "k_norm", None), LayerNorm)
+                    and ix.k_norm.weight.dtype == torch.float32
+                    and ix.k_norm.bias is not None
+                    and ix.n_heads == 32
+                    and ix.head_dim == 128
+                ):
+                    wkw = ix.wk_weights_proj.weight
+                    if (
+                        isinstance(wkw, torch.Tensor)
+                        and wkw.dtype == torch.bfloat16
+                        and tuple(wkw.shape) == (160, HIDDEN)
+                        and wkw.is_contiguous()
+                    ):
+                        pk = pack_qkv_a(torch.cat([qkv_a_w, wkw], dim=0), grid)
+                        if self.derived is not None:
+                            pk = self.derived.add("ll.attention.qkv_a_index", pk)
+                        keep.append(pk)
+                        entry["w_qkva"] = pk.data_ptr()
+                        has_idx_qa = True
+                        entry["ik_w"] = ix.k_norm.weight
+                        entry["ik_b"] = ix.k_norm.bias
+                        entry["ik_eps"] = float(ix.k_norm.variance_epsilon)
+                        entry["index_rope"] = ix.rotary_emb.cos_sin_cache
+                        index_rope_f32 = entry["index_rope"].dtype == torch.float32
+                        entry["w_scale"] = float(ix.softmax_scale * ix.n_heads**-0.5)
+                    wq_b = ix.wq_b.weight
+                    if (
+                        is_target
+                        and isinstance(wq_b, torch.Tensor)
+                        and wq_b.dtype == torch.bfloat16
+                        and tuple(wq_b.shape) == (32 * 128, Q_LORA)
+                        and wq_b.is_contiguous()
+                    ):
+                        piq = pack_indexer_q(wq_b)
+                        if self.derived is not None:
+                            piq = self.derived.add("ll.attention.index_q", piq)
+                        keep.append(piq)
+                        entry["w_iq"] = piq.data_ptr()
+                        has_iq = True
+                if (ix is None and getattr(attn, "skip_topk", False)) or (not is_target):
+                    pks = pack_qkv_a(qkv_a_w, grid)
+                    if self.derived is not None:
+                        pks = self.derived.add("ll.attention.qkv_a_shared", pks)
+                    keep.append(pks)
+                    entry["w_qkva_s"] = pks.data_ptr()
+                    has_shared_qa = True
+            sm103_map[attn.layer_id] = entry
+
         num = _prologue_numerics()
+        args = example_args()
+        p_key = {
+            "max_rows": 8,
+            "heads": HEADS,
+            **dataclasses.asdict(num),
+            "rope_cache_fp32": True,
+            "index_rope_cache_fp32": index_rope_f32,
+            "overlap8": True,
+            "push": True,
+            "f32x2": True,
+            "early_arm8": True,
+        }
         kernel = MlaPrologue(
             8,
             num,
             rope_cache_fp32=True,
-            index_rope_cache_fp32=True,
+            index_rope_cache_fp32=index_rope_f32,
             overlap8=True,
             push=True,
             f32x2=True,
             early_arm8=True,
             heads=HEADS,
         )
-        key = {
-            "max_rows": 8,
-            "heads": HEADS,
-            **dataclasses.asdict(num),
-            "rope_cache_fp32": True,
-            "index_rope_cache_fp32": True,
-            "overlap8": True,
-            "push": True,
-            "f32x2": True,
-            "early_arm8": True,
-        }
-        args = example_args()["prologue"]
         self.prologue16_fn = compile_cached(
-            kernel, key, lambda k=kernel, a=args: cute.compile(k, *a)
+            kernel, p_key, lambda k=kernel, a=args["prologue"]: cute.compile(k, *a)
         )
+
+        front: Dict[str, object] = {}
+        if attn_front_on:
+            if has_idx_qa:
+                qa_k = QkvAProjSmallM(QKV_A_SHAPE[0] + 160, QKV_A_SHAPE[0], grid=grid)
+                front["qkv_a.8"] = compile_cached(
+                    qa_k,
+                    {"total": QKV_A_SHAPE[0] + 160, "main": QKV_A_SHAPE[0], "grid": grid},
+                    lambda k=qa_k, a=args["qkv_a"]: cute.compile(k, *a),
+                )
+            if has_shared_qa:
+                qas_k = QkvAProjSmallM(QKV_A_SHAPE[0], QKV_A_SHAPE[0], grid=grid)
+                front["qkv_a_shared.8"] = compile_cached(
+                    qas_k,
+                    {"total": QKV_A_SHAPE[0], "main": QKV_A_SHAPE[0], "grid": grid},
+                    lambda k=qas_k, a=args["qkv_a"]: cute.compile(k, *a),
+                )
+                dnorm_on = (
+                    is_target
+                    and os.environ.get(
+                        "SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_SM103_HOP_MOE", "1"
+                    )
+                    == "1"
+                    and os.environ.get(
+                        "SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_SM103_DNORM", "1"
+                    )
+                    == "1"
+                    and "dnorm" in SLOTS
+                    and "qkv_a_small_m_shared" in SLOTS
+                )
+                if dnorm_on:
+                    qadn_k = QkvAProjSmallMDn(QKV_A_SHAPE[0], QKV_A_SHAPE[0], grid=grid)
+                    front["qkv_a_shared_dn.8"] = compile_cached(
+                        qadn_k,
+                        {
+                            "total": QKV_A_SHAPE[0],
+                            "main": QKV_A_SHAPE[0],
+                            "grid": grid,
+                            "dnorm": True,
+                        },
+                        lambda k=qadn_k, a=args["qkv_a_dn"]: cute.compile(k, *a),
+                    )
+            if has_iq:
+                iq_k = IndexerQProj(
+                    8, rope_form=INDEX_Q_ROPE_FORM, rope_cache_fp32=index_rope_f32
+                )
+                self.sm103_iq = compile_cached(
+                    iq_k,
+                    {
+                        "max_rows": 8,
+                        "rope_form": INDEX_Q_ROPE_FORM,
+                        "rope_cache_fp32": index_rope_f32,
+                    },
+                    lambda k=iq_k, a=args["index_q"]: cute.compile(k, *a),
+                )
+            self.sm103_front = front
+
         self.prologue16_layers = la_map
+        self.sm103_layers = sm103_map
         self.prologue16_ones = torch.ones(1, dtype=torch.float32, device=self.device)
         self._p16_keep = keep
         logger.info(
-            "ll.attention: SM103 TP4 MlaPrologue16 (17x8=136 CTAs, overlap8+push+f32x2+early_arm8) compiled for %d layers (rows <= 8)",
+            "ll.attention: SM103 TP4 front compiled for %d layers (rows <= 8, qkv_a=%s, dnorm=%s, index_q=%s, prologue_end=%s)",
             len(la_map),
+            sorted(front.keys()),
+            "qkv_a_shared_dn.8" in front,
+            self.sm103_iq is not None,
+            self.prologue16_end_fn is not None,
         )
 
     def compile(self, widths: Sequence[int]) -> None:

@@ -132,6 +132,12 @@ NEXT_QKV_A_PREFETCH_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_NEXT_QKV_A_PREFETCH"
 
 
 _OPROJ_STAGE_MIN_ROWS = int(os.environ.get(OPROJ_STAGE_MIN_ROWS_ENV, "1") or "1")
+UV_VPC_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_UV_VPC"
+_UV_VPC = int(os.environ.get(UV_VPC_ENV, "16") or "16")
+if _UV_VPC not in (16, 32, 64):
+    raise ValueError(f"{UV_VPC_ENV}={_UV_VPC}: expected 16, 32 or 64")
+DRAFT_QKV_A_DECODE_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_DRAFT_QKV_A_DECODE"
+_DRAFT_QKV_A_DECODE = os.environ.get(DRAFT_QKV_A_DECODE_ENV, "1") == "1"
 # SGLANG_NVIDIA_MEGAKERNEL_GLM_SPARSE_LL_MIN_ROWS=n (0 = off): the target's verify rows n..16 run the sparse MLA core
 # on the flash decode of ll.sparse_mla_fd instead of the 16-CTA SparseMlaDecode: its one-tile kernel (16-CTA
 # clusters, one CTA per SM, early gather) up to its one-wave rows (capped by ..._SPARSE_LL_ONE_TILE_MAX, default
@@ -328,6 +334,8 @@ class LayerArgs:
     # projection (0: not served) and the input RMSNorm epsilon (deferred input norm)
     w_qkva_s: int = 0
     in_eps: float = 0.0
+    # 16-row UV projection weight when cap=8 uses values_per_cta=64 (cap=16 uses 32)
+    w_uv16: int = 0
 
 
 class FusedAttention(AttentionStep):
@@ -709,8 +717,9 @@ class FusedAttention(AttentionStep):
         if rows < _OPROJ_STAGE_MIN_ROWS and stage0[2] == O_PROJ_STAGE_SLAB_BYTES:
             # below OPROJ_STAGE_MIN_ROWS the o_proj slot stages the default prefix
             stage0 = (*stage0[:3], O_PROJ_STAGE_PREFIX_BYTES, stage0[4])
+        w_uv = la.w_uv16 if (self.max_rows == 16 and la.w_uv16) else la.w_uv
         self.uv(
-            *_i64(la.w_uv),  # weights
+            *_i64(w_uv),  # weights
             *_i64(attn_output.data_ptr(), *attn_output.stride()[:2]),  # attn, strides
             *_i64(*_addr(out)),  # out, out_row_stride
             Int32(rows),
@@ -781,7 +790,13 @@ class AttentionGlue:
                 ):
                     packed = pack_qkv_a(fused_a(attn), self.grid)
                     shared_qa[i] = derived.add("attention.qkv_a_shared", packed)
+        elif not self.target and _DRAFT_QKV_A_DECODE:
+            for i, layer in enumerate(layers):
+                packed = pack_qkv_a(fused_a(layer.self_attn), self.grid)
+                shared_qa[i] = derived.add("attention.qkv_a_shared", packed)
         self.shared_qkv_a_layers = len(shared_qa)
+        self.uv_vpc = _UV_VPC if self.target else 16
+        self._derived = derived
         for i, layer in enumerate(layers):
             attn = layer.self_attn
             kv_b = _bf16_weight(attn.kv_b_proj, (KV_B_ROWS, KV_LORA), "kv_b_proj")
@@ -796,7 +811,9 @@ class AttentionGlue:
             rope = attn.rotary_emb.cos_sin_cache
             rope_f32.add(_rope_cache_fp32(rope, "RoPE cache"))
             args = LayerArgs(
-                w_uv=derived.add("attention.uv_proj", pack_uv_proj(kv_b)).data_ptr(),
+                w_uv=derived.add(
+                    "attention.uv_proj", pack_uv_proj(kv_b, values_per_cta=self.uv_vpc)
+                ).data_ptr(),
                 stage0=_prefetch_slot(
                     nxt,
                     _env_bytes(
@@ -872,9 +889,19 @@ class AttentionGlue:
         from sgl_nvidia_mega.glm5_3.runtime import SLOTS
         from sgl_nvidia_mega.glm5_3.sm103.attention import api
 
+        caps = sorted({kernel_rows(m) for m in rows} - {None})
+        if self.uv_vpc == 64 and 16 in caps:
+            from sgl_nvidia_mega.glm5_3.sm103.packing import pack_uv_proj
+
+            for layer in self.decoder_layers:
+                attn = layer.self_attn
+                kv_b = _bf16_weight(attn.kv_b_proj, (KV_B_ROWS, KV_LORA), "kv_b_proj")
+                self.layers[attn.layer_id].w_uv16 = self._derived.add(
+                    "attention.uv_proj16", pack_uv_proj(kv_b, values_per_cta=32)
+                ).data_ptr()
         shared = QKV_A_ROWS if self.shared_qkv_a_layers else None
         specs = api.compile_specs(
-            sorted({kernel_rows(m) for m in rows} - {None}),
+            caps,
             numerics=_prologue_numerics(),
             index_q_rope_form=INDEX_Q_ROPE_FORM,
             rope_cache_fp32=self.rope_f32,
@@ -884,7 +911,7 @@ class AttentionGlue:
             grid=self.grid,
             prologue_end=self.target,
             qkv_a_shared=shared,
-            qkv_a_shared_dn=bool(shared) and "dnorm" in SLOTS,
+            qkv_a_shared_dn=bool(shared) and self.target and "dnorm" in SLOTS,
             prologue16_overlap=_PROLOGUE16_OVERLAP,
             prologue16_kv_split=_PROLOGUE16_KV_SPLIT,
             prologue8_overlap=_PROLOGUE8_OVERLAP,
@@ -894,6 +921,7 @@ class AttentionGlue:
             prologue16_row_norm=_PROLOGUE16_ROW_NORM,
             prologue16_early_arm=_PROLOGUE16_EARLY_ARM,
             prologue8_early_arm=_PROLOGUE8_EARLY_ARM,
+            uv_values_per_cta=self.uv_vpc,
         )
         if self.idx_split:
             split_rows = [m for m in sorted(rows) if self.idx_split_min_rows <= m <= 16]

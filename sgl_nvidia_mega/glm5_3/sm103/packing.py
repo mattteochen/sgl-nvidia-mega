@@ -33,8 +33,8 @@ def pack_uv_proj(
             f"kv_b_proj weight must be [{heads * KV_B_ROWS_PER_HEAD}, {LATENT}], "
             f"got {tuple(kv_b_weight.shape)}"
         )
-    if values_per_cta not in (16, 32):
-        raise ValueError(f"values_per_cta must be 16 or 32, got {values_per_cta}")
+    if values_per_cta not in (16, 32, 64):
+        raise ValueError(f"values_per_cta must be 16, 32 or 64, got {values_per_cta}")
     w = kv_b_weight.view(heads, KV_B_ROWS_PER_HEAD, LATENT)[:, NOPE:, :]
     w = w.reshape(heads, VALUE_DIM // values_per_cta, values_per_cta, LATENT // 32, 32)
     return w.permute(0, 1, 3, 2, 4).contiguous().view(-1)
@@ -51,8 +51,8 @@ def pack_uv_proj_from_w_vc(
         raise ValueError(
             f"w_vc must be bf16 [heads, {LATENT}, {VALUE_DIM}], got {w_vc.dtype} {tuple(w_vc.shape)}"
         )
-    if values_per_cta not in (16, 32):
-        raise ValueError(f"values_per_cta must be 16 or 32, got {values_per_cta}")
+    if values_per_cta not in (16, 32, 64):
+        raise ValueError(f"values_per_cta must be 16, 32 or 64, got {values_per_cta}")
     heads = int(w_vc.shape[0])
     # w_vc is [heads, 512 (latent), 256 (value)] -> transpose to [heads, 256, 512]
     w = w_vc.transpose(1, 2).contiguous()

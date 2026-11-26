@@ -67,6 +67,7 @@ def compile_specs(
     prologue16_row_norm: bool = False,
     prologue16_early_arm: bool = False,
     prologue8_early_arm: bool = False,
+    uv_values_per_cta: int = 16,
 ) -> dict[str, tuple]:
     """The attention units for row capacities ``caps`` and sparse-MLA warp counts
     ``warps``. ``numerics`` is the engine's ``PrologueNumerics`` value table and
@@ -109,7 +110,15 @@ def compile_specs(
     specs: dict[str, tuple] = {}
     caps = sorted(set(caps))
     for cap in caps:
-        specs[f"uv.{cap}"] = (MlaUvProj(cap), {"max_rows": cap}, args["uv"])
+        vpc = uv_values_per_cta if cap == 8 else min(uv_values_per_cta, 32)
+        uv_key = {"max_rows": cap}
+        if vpc != 16:
+            uv_key["values_per_cta"] = vpc
+        specs[f"uv.{cap}"] = (
+            MlaUvProj(cap, values_per_cta=vpc),
+            uv_key,
+            args["uv"],
+        )
         key = {
             "max_rows": cap,
             **dataclasses.asdict(numerics),

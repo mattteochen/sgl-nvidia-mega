@@ -75,11 +75,11 @@ class MlaUvProj:
     def __init__(self, max_rows: int, heads: int = HEADS, values_per_cta: int = VALUES_PER_CTA):
         if max_rows not in MAX_ROWS:
             raise ValueError(f"max_rows must be one of {MAX_ROWS}, got {max_rows}")
-        if values_per_cta not in (16, 32) or VALUE_DIM % values_per_cta:
+        if values_per_cta not in (16, 32, 64) or VALUE_DIM % values_per_cta:
             raise ValueError(f"unsupported values_per_cta={values_per_cta}")
-        if max_rows * values_per_cta > THREADS:
+        if max_rows == 16 and values_per_cta > 32:
             raise ValueError(
-                f"max_rows={max_rows} * values_per_cta={values_per_cta} exceeds THREADS={THREADS}"
+                f"max_rows={max_rows} with values_per_cta={values_per_cta} exceeds SMEM budget"
             )
         self.max_rows = max_rows
         self.heads = heads
@@ -280,11 +280,12 @@ class MlaUvProj:
                     ptx.st_shared_v2_f32(at, acc[n, 2], acc[n, 3])
         self.sync_partials()
 
-        # One output element per thread (rows * values_per_cta <= 256 threads): thread tid owns row
-        # tid / values_per_cta, value tid % values_per_cta of this CTA's slice.
-        if tid < rows * values_per_cta:
-            r = tid // values_per_cta
-            d = tid % values_per_cta
+        # Each thread writes ceil(rows * values_per_cta / THREADS) output elements.
+        total_out = rows * values_per_cta
+        elem = tid
+        while elem < total_out:
+            r = elem // values_per_cta
+            d = elem % values_per_cta
             s = Float32(0.0)
             for w in cutlass.range_constexpr(WARPS):
                 at = partial_s + ((w * max_rows + r) * values_per_cta + d) * 4
@@ -292,6 +293,7 @@ class MlaUvProj:
             col = head * VALUE_DIM + part * values_per_cta + d
             dst = out + (Int64(r) * out_row_stride + Int64(col)) * 2
             ptx.st_global_b16(dst, ptx.cvt_rn_bf16_f32(s))
+            elem = elem + THREADS
         self.release_outputs()
 
     # Synchronization points, one method each.
