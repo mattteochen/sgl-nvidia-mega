@@ -905,7 +905,7 @@ class AttentionGlue:
                 "P_front %s, P_back = %s on a side stream forked after %s, at rows %s "
                 "(%s=%d, %s=%d)",
                 sorted(fronts),
-                sorted(f"prologue_end.{kernel_rows(m)}" for m in split_rows),
+                sorted({f"prologue_end.{kernel_rows(m)}" for m in split_rows}),
                 "the indexer query" if self.idx_split == 2 else "q_a / kv_a",
                 split_rows,
                 IDX_SPLIT_ENV,
