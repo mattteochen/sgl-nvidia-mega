@@ -57,6 +57,7 @@ def compile_specs(
     prologue_end: bool = False,
     qkv_a_shared: int | None = None,
     qkv_a_shared_dn: bool = False,
+    prologue16_overlap: bool = False,
 ) -> dict[str, tuple]:
     """The attention units for row capacities ``caps`` and sparse-MLA warp counts
     ``warps``. ``numerics`` is the engine's ``PrologueNumerics`` value table and
@@ -65,7 +66,9 @@ def compile_specs(
     ``qkv_a = (n_rows, n_main)`` adds the skinny q_a / kv_a (+ indexer key) projection
     at 8 rows on ``grid`` CTAs (default: the current device's multiprocessor count).
     ``prologue_end`` adds ``prologue_end.<cap>``: the prologue that triggers its
-    dependents after its last output store. ``qkv_a_shared = n_rows`` adds
+    dependents after its last output store.
+    ``prologue16_overlap`` builds the 16-row prologues in the overlapped issue order
+    (``MlaPrologue(overlap16=True)``: same outputs). ``qkv_a_shared = n_rows`` adds
     ``qkv_a_shared.8``: the skinny projection of the q_a / kv_a rows alone (the layers
     without their own indexer), at 8 rows on ``grid`` CTAs; ``qkv_a_shared_dn`` adds
     its epilogue-scaled form ``qkv_a_shared_dn.8`` (deferred input norm)."""
@@ -88,6 +91,9 @@ def compile_specs(
         }
         if index_scale_ue8m0x4:
             key["index_scale_ue8m0x4"] = True
+        overlap16 = prologue16_overlap and cap == 16
+        if overlap16:
+            key["overlap16"] = True
         specs[f"prologue.{cap}"] = (
             MlaPrologue(
                 cap,
@@ -95,6 +101,7 @@ def compile_specs(
                 rope_cache_fp32,
                 index_rope_cache_fp32,
                 index_scale_ue8m0x4,
+                overlap16=overlap16,
             ),
             key,
             args["prologue"],
@@ -108,6 +115,7 @@ def compile_specs(
                     index_rope_cache_fp32,
                     index_scale_ue8m0x4,
                     trigger_at_end=True,
+                    overlap16=overlap16,
                 ),
                 {**key, "trigger_at_end": True},
                 args["prologue"],

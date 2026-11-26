@@ -148,6 +148,11 @@ _SPARSE_MT_MIN_ROWS = int(os.environ.get(SPARSE_MT_MIN_ROWS_ENV, "0") or "0")
 if _SPARSE_LL_MIN_ROWS <= 0 and _SPARSE_MT_MIN_ROWS > 0:
     _SPARSE_LL_MIN_ROWS = max(_SPARSE_MT_MIN_ROWS, 9)
 _SPARSE_LL_ONE_TILE_MAX = int(os.environ.get(SPARSE_LL_ONE_TILE_MAX_ENV, "0") or "0")
+# SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE16_OVERLAP=1: the 16-row MLA prologue (9-16 verify rows) issues every load of
+# a phase before that phase's stores (MlaPrologue overlap16), so its row slots' latencies overlap. Same outputs.
+# Read at build.
+PROLOGUE16_OVERLAP_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE16_OVERLAP"
+_PROLOGUE16_OVERLAP = os.environ.get(PROLOGUE16_OVERLAP_ENV, "0").strip() not in ("", "0")
 
 
 def _env_bytes(name: str, default: int, full: int) -> int:
@@ -734,7 +739,14 @@ class AttentionGlue:
             prologue_end=self.target,
             qkv_a_shared=shared,
             qkv_a_shared_dn=bool(shared) and "dnorm" in SLOTS,
+            prologue16_overlap=_PROLOGUE16_OVERLAP,
         )
+        if _PROLOGUE16_OVERLAP and "prologue.16" in specs:
+            logger.info(
+                "NVIDIA megakernel: GLM-5.3 / GLM-5.2: 16-row MLA prologue in the "
+                "overlapped issue order (%s=1)",
+                PROLOGUE16_OVERLAP_ENV,
+            )
         self.sparse_ll = self._sparse_ll_plan(rows)
         for name, (kernel, key, args) in specs.items():
             fn = compile_cached(
