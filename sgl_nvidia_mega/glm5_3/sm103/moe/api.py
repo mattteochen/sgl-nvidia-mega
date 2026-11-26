@@ -43,6 +43,7 @@ ENGINE_SMEM = {"g1": 227440, "g2": 229968, "g4": 223664}
 #   ..._MOE16_LOOKAHEAD=n     FC2(k) after FC1(k + n) (default 2)
 #   ..._MOE16_PRE=n           unit 0's first n FC1 chunks issue before the unit table
 #                             is built (1..3, default 1)
+#   ..._MOE16_FASTTAB=1       lane-parallel unit table (batched id loads, no union list)
 #   ..._MOE16_SHARED_WEIGHT=w schedule weight of the shared quarter in units (default 4)
 #   ..._MOE16_CLUSTERS=n      g4 grid in clusters, at most the co-resident count (0 off)
 MOE16_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_MOE16_"
@@ -64,6 +65,7 @@ def g4_knobs() -> dict:
         "recv_bufs": _env_int("RECV_BUFS", RECV_BUFS),
         "lookahead": _env_int("LOOKAHEAD", LOOKAHEAD),
         "pre": _env_int("PRE", 1),
+        "fasttab": _env_int("FASTTAB", 0) != 0,
     }
 
 

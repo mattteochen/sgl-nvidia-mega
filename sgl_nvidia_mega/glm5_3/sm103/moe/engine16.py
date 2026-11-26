@@ -232,6 +232,9 @@ class Nvfp4MoeSmallM16:
       lookahead + 1);
     * ``pre`` = n (1..3): unit 0's first n FC1 chunks issue as soon as unit 0 is known,
       before the union list and unit table are built (default 1);
+    * ``fasttab``: the producer loads the four requests' ids back to back and decodes
+      every unit's expert and group mask lane-parallel from the class bitmaps (no
+      union list), so the unit table is ready sooner (same records);
     * ``trace`` (measurement only): per-CTA wait and phase times into the error
       buffer's tail (``TRACE_OFF``).
     """
@@ -245,12 +248,14 @@ class Nvfp4MoeSmallM16:
         recv_bufs: int = RECV_BUFS,
         lookahead: int = LOOKAHEAD,
         pre: int = 1,
+        fasttab: bool = False,
         trace: bool = False,
     ):
         self.shared = shared
         self.xpipe = bool(xpipe)
         self.l2pf = int(l2pf)
         self.pre = int(pre)
+        self.fasttab = bool(fasttab)
         self.trace = bool(trace)
         if not 0 <= self.l2pf <= 4:
             raise ValueError(f"engine16: l2pf {l2pf}")
@@ -269,6 +274,7 @@ class Nvfp4MoeSmallM16:
             "recv_bufs": self.RECV_BUFS,
             "lookahead": self.LOOKAHEAD,
             "pre": self.pre,
+            "fasttab": self.fasttab,
             "trace": self.trace,
         }
 
@@ -616,6 +622,123 @@ class Nvfp4MoeSmallM16:
             C.st_global_u64(self.tr_addr(err, block, TR_SEND_ABS), P.globaltimer())
         self.ring_tail(misc, it, nring)
 
+    @cute.jit
+    def table_fast(
+        self,
+        tmap_ptr,
+        sf13,
+        misc,
+        base,
+        crank,
+        cl,
+        gall,
+        err,
+        wq,
+        wcls,
+        cincl,
+        cbase1,
+        cbase2,
+        d0,
+        lane,
+        policy,
+        block,
+        t0k,
+    ):
+        """``fasttab``: lane u decodes unit u of the schedule row (rank in the
+        class-ordered union -> expert via the class bitmaps, group mask from the request
+        bitmaps), unit 0's first ``pre`` FC1 chunks issue, then the unit records. Same
+        records as the union-list path. Returns (pre0, nunits, exchanges)."""
+        self.wait_schedule(misc)
+        row = misc + self.M_STAB + 2 * SCHED_ROW * min(d0, MAX_LIST)
+        nraw = P.ld_shared_s16(row)
+        nunits = min(nraw, MAX_UNITS)
+        if (lane == 0) & (nraw > MAX_UNITS):
+            P.atom_or_global(err, ERR_UNIT_CAP)
+        code = Int32(-1)
+        if lane < nunits:
+            code = P.ld_shared_s16(row + 2 + 2 * lane)
+        # class and rank within the class (lanes 0..7 hold the per-word class
+        # prefixes; ranks < 1024)
+        idx = code >> 2
+        cls = Int32(0)
+        r = idx
+        if idx >= cbase2:
+            cls = Int32(2)
+            r = idx - cbase2
+        elif idx >= cbase1:
+            cls = Int32(1)
+            r = idx - cbase1
+        if r < 0:
+            r = Int32(0)
+        packed = cincl[0] | (cincl[1] << 10) | (cincl[2] << 20)
+        wsel = Int32(0)
+        excl = Int32(0)
+        for w in cutlass.range_constexpr(NUM_EXPERTS // 32):
+            incl = (cute.arch.shuffle_sync(packed, w) >> (10 * cls)) & 1023
+            if incl <= r:
+                wsel = Int32(w + 1)
+                excl = incl
+        if wsel > NUM_EXPERTS // 32 - 1:
+            wsel = Int32(NUM_EXPERTS // 32 - 1)
+        cw = Uint32(cute.arch.shuffle_sync(Int32(wcls[0]), wsel))
+        cw1 = Uint32(cute.arch.shuffle_sync(Int32(wcls[1]), wsel))
+        cw2 = Uint32(cute.arch.shuffle_sync(Int32(wcls[2]), wsel))
+        if cls == 1:
+            cw = cw1
+        if cls == 2:
+            cw = cw2
+        bit = P.fns(cw, 0, r - excl + 1) & 31
+        eu = 32 * wsel + bit
+        gmu = Int32(0)
+        for q in cutlass.range_constexpr(GROUPS):
+            wqq = Uint32(cute.arch.shuffle_sync(Int32(wq[q]), wsel))
+            gmu = gmu | Int32(((wqq >> Uint32(bit)) & Uint32(1)) << Uint32(q))
+        # unit 0's first chunks (a routed unit 0 is on a routed cluster: empty ring)
+        code0 = cute.arch.shuffle_sync(code, 0)
+        e0 = cute.arch.shuffle_sync(eu, 0)
+        pre0 = Int32(0)
+        if (lane == 0) & (nunits > 0) & (code0 >= 0):
+            for c in cutlass.range_constexpr(self.pre):
+                C.mbarrier_arrive_expect_tx(misc + B_FULL + 8 * c, BIG)
+                self.fc1_chunk(
+                    tmap_ptr,
+                    sf13,
+                    base + OFF_RING + c * BIG,
+                    e0,
+                    code0 & 3,
+                    crank,
+                    c,
+                    misc + B_FULL + 8 * c,
+                    policy,
+                )
+            pre0 = Int32(self.pre)
+        pre0 = cute.arch.shuffle_sync(pre0, 0)
+        if cutlass.const_expr(self.trace):
+            if lane == 0:
+                self.tr_since(err, block, TR_PRE0, t0k)
+        if lane < nunits:
+            unit = misc + self.M_UNITS + lane * UNIT_BYTES
+            if code < 0:
+                C.st_shared_u32(unit + U_E, Int32(-1))
+                C.st_shared_u32(unit + U_J, cl)
+                C.st_shared_u32(unit + U_SH, Int32(1))
+                gmu = gall
+            else:
+                C.st_shared_u32(unit + U_E, eu)
+                C.st_shared_u32(unit + U_J, code & 3)
+                C.st_shared_u32(unit + U_SH, Int32(0))
+            C.st_shared_u32(unit + U_GM, gmu)
+        else:
+            gmu = Int32(0)
+        nx = P.popc(gmu)
+        for o in (16, 8, 4, 2, 1):
+            nx = nx + cute.arch.shuffle_sync_bfly(nx, o)
+        if lane == 0:
+            C.st_shared_u32(misc + self.M_NEX, nx)
+            C.st_shared_u32(misc + self.M_NUNITS, nunits)
+        cute.arch.sync_warp()
+        return pre0, nunits, nx
+
     # ------------------------------------------------ warp 0: union, schedule, producer
     @cute.jit
     def producer(
@@ -678,24 +801,51 @@ class Nvfp4MoeSmallM16:
         # lane l holds (token l >> 3, slot l & 7) of each request; per-request bitmaps
         # by shared atomics
         badid = Int32(0)
-        for q in cutlass.range_constexpr(GROUPS):
-            mq = self.rows_of(mqs, q)
-            inside = lane < TOP_K * mq
-            eq = Int32(-1)
-            if inside:
-                eq = P.ld_cg_s32(
-                    ids + Int64(TOP_K * self.first_row_of(rbs, q) + lane) * 4
-                )
-            ok = Int32(0)
-            if inside & (Uint32(eq) < Uint32(NUM_EXPERTS)):
-                ok = Int32(1)
-            if inside & (ok == 0):
-                badid = Int32(1)
-            if ok != 0:
-                P.atom_or_shared(
-                    misc + self.M_BM + 4 * (8 * q + (eq >> 5)),
-                    Uint32(1) << Uint32(eq & 31),
-                )
+        if cutlass.const_expr(self.fasttab):
+            # the four loads back to back, then the bitmap atomics
+            eqs = []
+            ins = []
+            for q in cutlass.range_constexpr(GROUPS):
+                inside = lane < TOP_K * self.rows_of(mqs, q)
+                eq = Int32(-1)
+                if inside:
+                    eq = P.ld_cg_s32(
+                        ids + Int64(TOP_K * self.first_row_of(rbs, q) + lane) * 4
+                    )
+                eqs.append(eq)
+                ins.append(inside)
+            for q in cutlass.range_constexpr(GROUPS):
+                eq = eqs[q]
+                inside = ins[q]
+                ok = Int32(0)
+                if inside & (Uint32(eq) < Uint32(NUM_EXPERTS)):
+                    ok = Int32(1)
+                if inside & (ok == 0):
+                    badid = Int32(1)
+                if ok != 0:
+                    P.atom_or_shared(
+                        misc + self.M_BM + 4 * (8 * q + (eq >> 5)),
+                        Uint32(1) << Uint32(eq & 31),
+                    )
+        else:
+            for q in cutlass.range_constexpr(GROUPS):
+                mq = self.rows_of(mqs, q)
+                inside = lane < TOP_K * mq
+                eq = Int32(-1)
+                if inside:
+                    eq = P.ld_cg_s32(
+                        ids + Int64(TOP_K * self.first_row_of(rbs, q) + lane) * 4
+                    )
+                ok = Int32(0)
+                if inside & (Uint32(eq) < Uint32(NUM_EXPERTS)):
+                    ok = Int32(1)
+                if inside & (ok == 0):
+                    badid = Int32(1)
+                if ok != 0:
+                    P.atom_or_shared(
+                        misc + self.M_BM + 4 * (8 * q + (eq >> 5)),
+                        Uint32(1) << Uint32(eq & 31),
+                    )
         if badid != 0:
             P.atom_or_global(err, ERR_BAD_ID)
         cute.arch.sync_warp()
@@ -729,146 +879,169 @@ class Nvfp4MoeSmallM16:
         cbase1 = ctot[0]
         cbase2 = ctot[0] + ctot[1]
         d0 = cbase2 + ctot[2]
-        # unit 0 resolved from the schedule row and the class bitmaps; its first copies
-        # issue now
-        pre0 = Int32(0)
-        self.wait_schedule(misc)
-        row0 = misc + self.M_STAB + 2 * SCHED_ROW * min(d0, MAX_LIST)
-        code0 = Int32(-1)
-        if P.ld_shared_s16(row0) > 0:
-            code0 = P.ld_shared_s16(row0 + 2)
-        if code0 >= 0:
-            idx = code0 >> 2
-            r0 = idx
-            ci = cincl[0]
-            cc = ccnt[0]
-            cw = wcls[0]
-            if idx >= cbase2:
-                r0 = idx - cbase2
-                ci = cincl[2]
-                cc = ccnt[2]
-                cw = wcls[2]
-            elif idx >= cbase1:
-                r0 = idx - cbase1
-                ci = cincl[1]
-                cc = ccnt[1]
-                cw = wcls[1]
-            mine = (r0 >= ci - cc) & (r0 < ci)
-            who = Uint32(cute.arch.vote_ballot_sync(mine))
-            e0 = Int32(0)
-            if mine:
-                bits = cw
-                for _ in cutlass.range(r0 - (ci - cc), unroll=1):
-                    bits = bits & (bits - Uint32(1))
-                e0 = 32 * lane + P.ctz(bits)
-            src_lane = Int32(0)
-            if who != Uint32(0):
-                src_lane = P.ctz(who)
-            e0 = cute.arch.shuffle_sync(e0, src_lane)
-            if (lane == 0) & (who != Uint32(0)):
-                if cutlass.const_expr(self.pre == 1):
-                    C.mbarrier_arrive_expect_tx(misc + B_FULL, BIG)
-                    self.fc1_chunk(
-                        tmap_ptr,
-                        sf13,
-                        base + OFF_RING,
-                        e0,
-                        code0 & 3,
-                        crank,
-                        0,
-                        misc + B_FULL,
-                        policy,
-                    )
-                else:
-                    # ring slots 0 .. pre - 1 (pre <= 3 < RING; unit 0 of a routed
-                    # cluster, so the ring is empty)
-                    for c in cutlass.range_constexpr(self.pre):
-                        C.mbarrier_arrive_expect_tx(misc + B_FULL + 8 * c, BIG)
+        if cutlass.const_expr(self.fasttab):
+            pre0, nunits, nx = self.table_fast(
+                tmap_ptr,
+                sf13,
+                misc,
+                base,
+                crank,
+                cl,
+                gall,
+                err,
+                wq,
+                wcls,
+                cincl,
+                cbase1,
+                cbase2,
+                d0,
+                lane,
+                policy,
+                block,
+                t0k,
+            )
+        else:
+            # unit 0 resolved from the schedule row and the class bitmaps; its first copies
+            # issue now
+            pre0 = Int32(0)
+            self.wait_schedule(misc)
+            row0 = misc + self.M_STAB + 2 * SCHED_ROW * min(d0, MAX_LIST)
+            code0 = Int32(-1)
+            if P.ld_shared_s16(row0) > 0:
+                code0 = P.ld_shared_s16(row0 + 2)
+            if code0 >= 0:
+                idx = code0 >> 2
+                r0 = idx
+                ci = cincl[0]
+                cc = ccnt[0]
+                cw = wcls[0]
+                if idx >= cbase2:
+                    r0 = idx - cbase2
+                    ci = cincl[2]
+                    cc = ccnt[2]
+                    cw = wcls[2]
+                elif idx >= cbase1:
+                    r0 = idx - cbase1
+                    ci = cincl[1]
+                    cc = ccnt[1]
+                    cw = wcls[1]
+                mine = (r0 >= ci - cc) & (r0 < ci)
+                who = Uint32(cute.arch.vote_ballot_sync(mine))
+                e0 = Int32(0)
+                if mine:
+                    bits = cw
+                    for _ in cutlass.range(r0 - (ci - cc), unroll=1):
+                        bits = bits & (bits - Uint32(1))
+                    e0 = 32 * lane + P.ctz(bits)
+                src_lane = Int32(0)
+                if who != Uint32(0):
+                    src_lane = P.ctz(who)
+                e0 = cute.arch.shuffle_sync(e0, src_lane)
+                if (lane == 0) & (who != Uint32(0)):
+                    if cutlass.const_expr(self.pre == 1):
+                        C.mbarrier_arrive_expect_tx(misc + B_FULL, BIG)
                         self.fc1_chunk(
                             tmap_ptr,
                             sf13,
-                            base + OFF_RING + c * BIG,
+                            base + OFF_RING,
                             e0,
                             code0 & 3,
                             crank,
-                            c,
-                            misc + B_FULL + 8 * c,
+                            0,
+                            misc + B_FULL,
                             policy,
                         )
-                pre0 = Int32(self.pre)
-            pre0 = cute.arch.shuffle_sync(pre0, 0)
-        if cutlass.const_expr(self.trace):
-            if lane == 0:
-                self.tr_since(err, block, TR_PRE0, t0k)
-        # the union list in class order, with group masks
-        for c in cutlass.range_constexpr(3):
-            bits = wcls[c]
-            k = cincl[c] - ccnt[c]
-            if cutlass.const_expr(c == 1):
-                k = k + cbase1
-            if cutlass.const_expr(c == 2):
-                k = k + cbase2
-            while bits != Uint32(0):
-                b = P.ctz(bits)
-                if k < MAX_LIST:
-                    C.st_shared_u32(misc + self.M_ELIST + 4 * k, 32 * lane + b)
-                    gm = Uint32(0)
-                    for q in cutlass.range_constexpr(GROUPS):
-                        gm = gm | (((wq[q] >> Uint32(b)) & Uint32(1)) << Uint32(q))
-                    P.st_shared_b8(misc + self.M_EGM + k, gm)
-                k = k + 1
-                bits = bits & (bits - Uint32(1))
-        cute.arch.sync_warp()
-        d = min(d0, MAX_LIST)
-        self.wait_schedule(misc)
-        row = misc + self.M_STAB + 2 * SCHED_ROW * d
-        nraw = P.ld_shared_s16(row)
-        nunits = min(nraw, MAX_UNITS)
-        if (lane == 0) & (nraw > MAX_UNITS):
-            P.atom_or_global(err, ERR_UNIT_CAP)
-        gmu = Int32(0)
-        if lane < nunits:
-            code = P.ld_shared_s16(row + 2 + 2 * lane)
-            unit = misc + self.M_UNITS + lane * UNIT_BYTES
-            if code < 0:
-                C.st_shared_u32(unit + U_E, Int32(-1))
-                C.st_shared_u32(unit + U_J, cl)
-                C.st_shared_u32(unit + U_SH, Int32(1))
-                gmu = gall
-            else:
-                C.st_shared_u32(
-                    unit + U_E, C.ld_shared_u32(misc + self.M_ELIST + 4 * (code >> 2))
-                )
-                C.st_shared_u32(unit + U_J, code & 3)
-                C.st_shared_u32(unit + U_SH, Int32(0))
-                gmu = P.ld_shared_u8(misc + self.M_EGM + (code >> 2))
-            C.st_shared_u32(unit + U_GM, gmu)
-        # exchanges of this cluster (one per (unit, group)), the same in its four CTAs
-        nx = P.popc(gmu)
-        for o in (16, 8, 4, 2, 1):
-            nx = nx + cute.arch.shuffle_sync_bfly(nx, o)
-        if lane == 0:
-            C.st_shared_u32(misc + self.M_NEX, nx)
-        cute.arch.sync_warp()
-        if lane == 0:
-            if (pre0 == 0) & (nunits > 0):  # noqa: SIM102
-                if self.ufield(misc, 0, U_SH) == Uint32(0):
-                    C.mbarrier_arrive_expect_tx(misc + B_FULL, BIG)
-                    e0 = Int32(self.ufield(misc, 0, U_E))
-                    j0 = Int32(self.ufield(misc, 0, U_J))
-                    self.fc1_chunk(
-                        tmap_ptr,
-                        sf13,
-                        base + OFF_RING,
-                        e0,
-                        j0,
-                        crank,
-                        0,
-                        misc + B_FULL,
-                        policy,
+                    else:
+                        # ring slots 0 .. pre - 1 (pre <= 3 < RING; unit 0 of a routed
+                        # cluster, so the ring is empty)
+                        for c in cutlass.range_constexpr(self.pre):
+                            C.mbarrier_arrive_expect_tx(misc + B_FULL + 8 * c, BIG)
+                            self.fc1_chunk(
+                                tmap_ptr,
+                                sf13,
+                                base + OFF_RING + c * BIG,
+                                e0,
+                                code0 & 3,
+                                crank,
+                                c,
+                                misc + B_FULL + 8 * c,
+                                policy,
+                            )
+                    pre0 = Int32(self.pre)
+                pre0 = cute.arch.shuffle_sync(pre0, 0)
+            if cutlass.const_expr(self.trace):
+                if lane == 0:
+                    self.tr_since(err, block, TR_PRE0, t0k)
+            # the union list in class order, with group masks
+            for c in cutlass.range_constexpr(3):
+                bits = wcls[c]
+                k = cincl[c] - ccnt[c]
+                if cutlass.const_expr(c == 1):
+                    k = k + cbase1
+                if cutlass.const_expr(c == 2):
+                    k = k + cbase2
+                while bits != Uint32(0):
+                    b = P.ctz(bits)
+                    if k < MAX_LIST:
+                        C.st_shared_u32(misc + self.M_ELIST + 4 * k, 32 * lane + b)
+                        gm = Uint32(0)
+                        for q in cutlass.range_constexpr(GROUPS):
+                            gm = gm | (((wq[q] >> Uint32(b)) & Uint32(1)) << Uint32(q))
+                        P.st_shared_b8(misc + self.M_EGM + k, gm)
+                    k = k + 1
+                    bits = bits & (bits - Uint32(1))
+            cute.arch.sync_warp()
+            d = min(d0, MAX_LIST)
+            self.wait_schedule(misc)
+            row = misc + self.M_STAB + 2 * SCHED_ROW * d
+            nraw = P.ld_shared_s16(row)
+            nunits = min(nraw, MAX_UNITS)
+            if (lane == 0) & (nraw > MAX_UNITS):
+                P.atom_or_global(err, ERR_UNIT_CAP)
+            gmu = Int32(0)
+            if lane < nunits:
+                code = P.ld_shared_s16(row + 2 + 2 * lane)
+                unit = misc + self.M_UNITS + lane * UNIT_BYTES
+                if code < 0:
+                    C.st_shared_u32(unit + U_E, Int32(-1))
+                    C.st_shared_u32(unit + U_J, cl)
+                    C.st_shared_u32(unit + U_SH, Int32(1))
+                    gmu = gall
+                else:
+                    C.st_shared_u32(
+                        unit + U_E,
+                        C.ld_shared_u32(misc + self.M_ELIST + 4 * (code >> 2)),
                     )
-                    pre0 = Int32(1)
-            C.st_shared_u32(misc + self.M_NUNITS, nunits)
+                    C.st_shared_u32(unit + U_J, code & 3)
+                    C.st_shared_u32(unit + U_SH, Int32(0))
+                    gmu = P.ld_shared_u8(misc + self.M_EGM + (code >> 2))
+                C.st_shared_u32(unit + U_GM, gmu)
+            # exchanges of this cluster (one per (unit, group)), the same in its four CTAs
+            nx = P.popc(gmu)
+            for o in (16, 8, 4, 2, 1):
+                nx = nx + cute.arch.shuffle_sync_bfly(nx, o)
+            if lane == 0:
+                C.st_shared_u32(misc + self.M_NEX, nx)
+            cute.arch.sync_warp()
+            if lane == 0:
+                if (pre0 == 0) & (nunits > 0):  # noqa: SIM102
+                    if self.ufield(misc, 0, U_SH) == Uint32(0):
+                        C.mbarrier_arrive_expect_tx(misc + B_FULL, BIG)
+                        e0 = Int32(self.ufield(misc, 0, U_E))
+                        j0 = Int32(self.ufield(misc, 0, U_J))
+                        self.fc1_chunk(
+                            tmap_ptr,
+                            sf13,
+                            base + OFF_RING,
+                            e0,
+                            j0,
+                            crank,
+                            0,
+                            misc + B_FULL,
+                            policy,
+                        )
+                        pre0 = Int32(1)
+                C.st_shared_u32(misc + self.M_NUNITS, nunits)
         # Every lane arrives (count 32): each lane's own unit-record stores are
         # released by its own arrive (see the init of B_TREADY).
         C.mbarrier_arrive(misc + B_TREADY)

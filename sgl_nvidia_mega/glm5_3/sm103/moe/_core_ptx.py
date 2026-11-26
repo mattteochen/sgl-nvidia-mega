@@ -274,3 +274,14 @@ def globaltimer():
 def red_add_u64(address, value):
     """Relaxed GPU-scope ``red.add.u64`` into a global word (trace builds only)."""
     return "red.global.add.u64 [$0], $1;", "l,l", (Int64(address), Uint64(value))
+
+
+@ptx_arith(Int32)
+def fns(mask, base, offset):
+    """Bit position of the ``offset``-th (1-based) set bit of ``mask`` from bit ``base``
+    upward (0xffffffff if none)."""
+    return (
+        "fns.b32 $0, $1, $2, $3;",
+        "=r,r,r,r",
+        (Uint32(mask), Uint32(base), Int32(offset)),
+    )
