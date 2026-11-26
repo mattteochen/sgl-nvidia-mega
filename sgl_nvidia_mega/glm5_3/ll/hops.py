@@ -191,8 +191,9 @@ WORLD_DEFAULTS = {
 # one-shot geometry, 0 = the plain rule, 2 / 4 / 8 = that cluster.
 FINALIZE_CLUSTER = 1
 # P10: rows where the standalone quantize stays (the shared expert
-# loses its SM race against an earlier FC1): TP4 1-3 and 21 rows, TP8 11-16, 36.
-NVFP4_SKIP_ROWS = {4: ((1, 3), (21, 21)), 8: ((11, 16), (36, 36))}
+# loses its SM race against an earlier FC1): TP4 1-3 rows, TP8 11-16, 36.
+# (TP4 21 rows removed in v6: fused P10 saves ~300 us/step at K=6 bs=3.)
+NVFP4_SKIP_ROWS = {4: ((1, 3),), 8: ((11, 16), (36, 36))}
 
 
 def world_defaults(world: int) -> WorldDefaults:

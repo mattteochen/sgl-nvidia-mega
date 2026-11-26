@@ -304,18 +304,22 @@ class MlaPrologue:
         early_arm8: bool = False,
         heads: int = HEADS,
     ):
-        if max_rows not in (8, 16):
-            raise ValueError(f"max_rows must be 8 or 16, got {max_rows}")
+        if max_rows not in (8, 16, 32):
+            raise ValueError(f"max_rows must be 8, 16 or 32, got {max_rows}")
         if heads not in (8, 16):
             raise ValueError(f"heads must be 8 or 16, got {heads}")
         self.heads = heads
         self.grid = (heads + 1) * CLUSTER
         if overlap8 and max_rows != 8:
             raise ValueError("overlap8 applies to max_rows 8 only")
-        if overlap16 and max_rows != 16:
-            raise ValueError("overlap16 applies to max_rows 16 only")
-        if kv_split and max_rows != 16:
-            raise ValueError("kv_split applies to max_rows 16 only")
+        if overlap16 and max_rows not in (16, 32):
+            raise ValueError("overlap16 applies to max_rows 16 or 32 only")
+        if kv_split and max_rows not in (16, 32):
+            raise ValueError("kv_split applies to max_rows 16 or 32 only")
+        if max_rows == 32 and not (overlap16 and push and row_norm and early_arm):
+            raise ValueError(
+                "max_rows 32 requires overlap16, push, row_norm and early_arm"
+            )
         self.max_rows = max_rows
         self.overlap16 = overlap16
         self.overlap8 = overlap8
@@ -350,7 +354,7 @@ class MlaPrologue:
         self.row_norm = row_norm
         # early_arm: the QN barrier armed (CTA scope) before the weight bulk copies
         self.early_arm = early_arm
-        self.off = layout(max_rows, overlap16, push)
+        self.off = layout(min(max_rows, 16), overlap16, push)
         if overlap8:
             self.off = layout_overlap8(self.off)
 
@@ -517,7 +521,29 @@ class MlaPrologue:
         if cutlass.const_expr(self.probe):
             self._probe_base = topk
         if cluster_id < self.heads:
-            if cutlass.const_expr(self.overlap16):
+            if cutlass.const_expr(self.max_rows == 32):
+                self.head_cta32o(
+                    base,
+                    cluster_id,
+                    r,
+                    tid,
+                    q_c,
+                    q_c_stride,
+                    positions,
+                    rows,
+                    w_qb,
+                    w_uk,
+                    q_norm_w,
+                    q_eps,
+                    rope_cache,
+                    rope_stride,
+                    q_scale,
+                    mqa_q,
+                    mqa_stride,
+                    qc_out,
+                    qc_out_stride,
+                )
+            elif cutlass.const_expr(self.overlap16):
                 self.head_cta16o(
                     base,
                     cluster_id,
@@ -1972,6 +1998,396 @@ class MlaPrologue:
         self.mark(14, tid)
 
     @cute.jit
+    def head_cta32o(
+        self,
+        base: Int32,
+        h: Int32,
+        r: Int32,
+        tid: Int32,
+        q_c: Int64,
+        q_c_stride: Int64,
+        positions: Int64,
+        rows: Int32,
+        w_qb: Int64,
+        w_uk: Int64,
+        q_norm_w: Int64,
+        q_eps: Float32,
+        rope_cache: Int64,
+        rope_stride: Int64,
+        q_scale: Int64,
+        mqa_q: Int64,
+        mqa_stride: Int64,
+        qc_out: Int64,
+        qc_out_stride: Int64,
+    ):
+        """``head_cta16o`` (overlap16 + push + row_norm + early_arm) extended to up to
+        32 rows by running 1-2 chunks of 16 rows while keeping the 128 KiB W_qb and
+        24 KiB W_UK resident in shared memory."""
+        off = self.off
+        lane = tid % 32
+        warp = tid // 32
+        bar = base + off["mbar"]
+        qbar = bar + 8
+
+        c0_rows = rows
+        if c0_rows > 16:
+            c0_rows = Int32(16)
+
+        if tid == 0:
+            ptx.mbarrier_init(bar, 1)
+            ptx.mbarrier_init(qbar, 1)
+            ptx.fence_mbarrier_init_release_cluster()
+            ptx.fence_proxy_async_shared_cta()
+            ptx.mbarrier_arrive_expect_tx(qbar, (NOPE // 32) * 64 * c0_rows)
+            ptx.mbarrier_arrive_expect_tx(bar, WQB_BYTES + WUK_BYTES)
+            src_qb = w_qb + Int64(h * 16 + 2 * r) * ((Q_LORA // 32) * 1024)
+            src_uk = w_uk + Int64(h * 32 + 4 * r) * ((NOPE // 32) * 1024)
+            for part in cutlass.range_constexpr(2):
+                ptx.bulk_copy_g2s(
+                    base + off["wqb"] + part * (WQB_BYTES // 2),
+                    src_qb + part * (WQB_BYTES // 2),
+                    WQB_BYTES // 2,
+                    bar,
+                )
+            ptx.bulk_copy_g2s(base + off["wuk"], src_uk, WUK_BYTES, bar)
+
+        nw = []
+        for b in cutlass.range_constexpr(8):
+            q_w = ptx.ld_global_nc_v4(q_norm_w + Int64(lane + 32 * b) * 16)
+            words = []
+            for e in cutlass.range_constexpr(4):
+                lo, hi = ptx.bf16x2_to_f32x2(q_w[e])
+                if cutlass.const_expr(self.num.norm_weight_plus_zero):
+                    lo = ptx.add_rn(lo, Float32(0.0))
+                    hi = ptx.add_rn(hi, Float32(0.0))
+                words.append(ptx.cvt_rn_bf16x2_f32(lo, hi))
+            nw.append(words)
+        inv_qs = ptx.rcp_rn(ptx.ld_global_nc_f32(q_scale))
+        ptx.sync_threads()
+        ptx.cluster_arrive_relaxed()
+
+        self.wait_q_inputs()
+
+        self.head_chunk16o(
+            base,
+            h,
+            r,
+            tid,
+            warp,
+            lane,
+            bar,
+            qbar,
+            nw,
+            inv_qs,
+            q_c,
+            q_c_stride,
+            positions,
+            c0_rows,
+            Int32(0),
+            q_eps,
+            rope_cache,
+            rope_stride,
+            mqa_q,
+            mqa_stride,
+            qc_out,
+            qc_out_stride,
+            0,
+            True,
+        )
+
+        if rows > 16:
+            ptx.sync_threads()
+            c1_rows = rows - Int32(16)
+            if tid == 0:
+                ptx.mbarrier_arrive_expect_tx(qbar, (NOPE // 32) * 64 * c1_rows)
+            ptx.sync_threads()
+            ptx.cluster_arrive_release()
+            self.head_chunk16o(
+                base,
+                h,
+                r,
+                tid,
+                warp,
+                lane,
+                bar,
+                qbar,
+                nw,
+                inv_qs,
+                q_c,
+                q_c_stride,
+                positions,
+                c1_rows,
+                Int32(16),
+                q_eps,
+                rope_cache,
+                rope_stride,
+                mqa_q,
+                mqa_stride,
+                qc_out,
+                qc_out_stride,
+                1,
+                False,
+            )
+
+        ptx.cluster_arrive_relaxed()
+        self.release_outputs()
+        self.exit_wait()
+
+    @cute.jit
+    def head_chunk16o(
+        self,
+        base: Int32,
+        h: Int32,
+        r: Int32,
+        tid: Int32,
+        warp: Int32,
+        lane: Int32,
+        bar: Int32,
+        qbar: Int32,
+        nw,
+        inv_qs: Float32,
+        q_c: Int64,
+        q_c_stride: Int64,
+        positions: Int64,
+        c_rows: Int32,
+        row_off: Int32,
+        q_eps: Float32,
+        rope_cache: Int64,
+        rope_stride: Int64,
+        mqa_q: Int64,
+        mqa_stride: Int64,
+        qc_out: Int64,
+        qc_out_stride: Int64,
+        phase: cutlass.Constexpr[int],
+        wait_w: cutlass.Constexpr[bool],
+    ):
+        off = self.off
+        s_xs = base + off["xs"]
+        s_red = base + off["red"]
+        s_qn = base + off["qn"]
+
+        is_rope = r >= NOPE // 32
+        pair = ((r - NOPE // 32) * 32 + lane) // 2
+        pv = []
+        for it in cutlass.range_constexpr(2):
+            pv.append(
+                self.ldg_s64_if(
+                    positions + Int64(row_off + (tid + THREADS * it) // 32) * 8,
+                    is_rope & (tid + THREADS * it < 32 * c_rows),
+                )
+            )
+        qv = []
+        for hf in cutlass.range_constexpr(2):
+            for b in cutlass.range_constexpr(8):
+                qv.append(
+                    ptx.ld_global_v4_if(
+                        q_c
+                        + (
+                            Int64(row_off + warp + 8 * hf) * q_c_stride
+                            + Int64((lane + 32 * b) * 8)
+                        )
+                        * 2,
+                        warp + 8 * hf < c_rows,
+                    )
+                )
+        rope_c = [Float32(0.0), Float32(0.0)]
+        rope_s = [Float32(0.0), Float32(0.0)]
+        for it in cutlass.range_constexpr(2):
+            rope_c[it], rope_s[it] = self.rope_at(
+                is_rope & (tid + THREADS * it < 32 * c_rows),
+                pv[it],
+                pair,
+                rope_cache,
+                rope_stride,
+            )
+        self.row_norm16(s_xs, qv, nw, tid, warp, lane, c_rows, q_eps)
+        ptx.sync_threads()
+
+        if cutlass.const_expr(wait_w):
+            self.wait_weights(bar)
+
+        g = lane // 4
+        t = lane % 4
+        zero = Float32(0.0)
+        z4 = (zero, zero, zero, zero)
+        c = [z4, z4, z4, z4]
+        for i in cutlass.range_constexpr(8):
+            s_ = warp * 8 + i
+            b0 = _lds_v4_if(s_xs + g * XS_STRIDE + (s_ * 32 + 8 * t) * 2, g < c_rows)
+            b1 = _lds_v4_if(
+                s_xs + (g + 8) * XS_STRIDE + (s_ * 32 + 8 * t) * 2, g + 8 < c_rows
+            )
+            for j in cutlass.range_constexpr(2):
+                blk = base + off["wqb"] + (j * (Q_LORA // 32) + s_) * 1024
+                lo = ptx.ld_shared_v4(blk + lane * 16)
+                hi = ptx.ld_shared_v4(blk + 512 + lane * 16)
+                for tt in cutlass.range_constexpr(2):
+                    bq = b0 if tt == 0 else b1
+                    c1 = ptx.mma_m16n8k16_bf16(
+                        (lo[0], hi[0], lo[1], hi[1]), (bq[0], bq[1]), c[j * 2 + tt]
+                    )
+                    c[j * 2 + tt] = ptx.mma_m16n8k16_bf16(
+                        (lo[2], hi[2], lo[3], hi[3]), (bq[2], bq[3]), c1
+                    )
+        if qc_out != Int64(0):
+            n_q = (h * 8 + r) // 4
+            c_q = ((h * 8 + r) % 4) * 64 + tid
+            if (h < 8) & (tid < 64) & (n_q < c_rows):
+                ptx.st_global_v4(
+                    qc_out
+                    + (Int64(row_off + n_q) * qc_out_stride + Int64(c_q * 8)) * 2,
+                    ptx.ld_shared_v4(s_xs + n_q * XS_STRIDE + c_q * 16),
+                )
+        self.rows_dead()
+        for j in cutlass.range_constexpr(2):
+            for tt in cutlass.range_constexpr(2):
+                cc = c[j * 2 + tt]
+                for e in cutlass.range_constexpr(4):
+                    ptx.st_shared_f32(
+                        s_red
+                        + (
+                            ((warp * 2 + tt) * 8 + 2 * t + e % 2) * RED_QB_ROW
+                            + j * 16
+                            + g
+                            + 8 * (e // 2)
+                        )
+                        * 4,
+                        cc[e],
+                    )
+        self.sync_partials()
+
+        parts = []
+        for it in cutlass.range_constexpr(2):
+            idx = tid + THREADS * it
+            rho = idx % 32
+            n = idx // 32
+            p = []
+            for w in cutlass.range_constexpr(8):
+                p.append(
+                    _lds_f32_if(
+                        s_red
+                        + (((w * 2 + n // 8) * 8 + n % 8) * RED_QB_ROW + rho) * 4,
+                        idx < 32 * c_rows,
+                    )
+                )
+            parts.append(p)
+
+        ptx.cluster_wait_acquire()
+        qbs = []
+        for it in cutlass.range_constexpr(2):
+            idx = tid + THREADS * it
+            n = idx // 32
+            v = Float32(0.0)
+            for w in cutlass.range_constexpr(8):
+                v = ptx.add_rn(v, parts[it][w])
+            qb = ptx.cvt_rn_bf16_f32(v)
+            self.push_qnope(
+                base, qbar, r, n, lane, qb, (r < NOPE // 32) & (idx < 32 * c_rows)
+            )
+            qbs.append(qb)
+
+        rope_b = []
+        for it in cutlass.range_constexpr(2):
+            rope_b.append(
+                self.q_rope_byte(
+                    r >= NOPE // 32,
+                    (r - NOPE // 32) * 32 + (tid + THREADS * it) % 32,
+                    qbs[it],
+                    rope_c[it],
+                    rope_s[it],
+                    inv_qs,
+                )
+            )
+        ptx.mbarrier_wait_parity(qbar, phase, ".acquire.cluster")
+
+        tile = warp % 4
+        half = warp // 4
+        cw = [z4, z4]
+        for i in cutlass.range_constexpr(3):
+            s_ = half * 3 + i
+            b0 = _lds_v4_if(s_qn + g * QN_STRIDE + (s_ * 32 + 8 * t) * 2, g < c_rows)
+            b1 = _lds_v4_if(
+                s_qn + (g + 8) * QN_STRIDE + (s_ * 32 + 8 * t) * 2, g + 8 < c_rows
+            )
+            blk = base + off["wuk"] + (tile * (NOPE // 32) + s_) * 1024
+            lo = ptx.ld_shared_v4(blk + lane * 16)
+            hi = ptx.ld_shared_v4(blk + 512 + lane * 16)
+            for tt in cutlass.range_constexpr(2):
+                bq = b0 if tt == 0 else b1
+                c1 = ptx.mma_m16n8k16_bf16(
+                    (lo[0], hi[0], lo[1], hi[1]), (bq[0], bq[1]), cw[tt]
+                )
+                cw[tt] = ptx.mma_m16n8k16_bf16(
+                    (lo[2], hi[2], lo[3], hi[3]), (bq[2], bq[3]), c1
+                )
+        for tt in cutlass.range_constexpr(2):
+            for e in cutlass.range_constexpr(4):
+                ptx.st_shared_f32(
+                    s_red
+                    + (
+                        ((half * 2 + tt) * 8 + 2 * t + e % 2) * RED_UK_ROW
+                        + tile * 16
+                        + g
+                        + 8 * (e // 2)
+                    )
+                    * 4,
+                    cw[tt][e],
+                )
+        self.sync_partials()
+        nk = (64 * 16 + THREADS - 1) // THREADS
+        pa = []
+        pb = []
+        for k in cutlass.range_constexpr(nk):
+            idx = tid + k * THREADS
+            col = idx % 64
+            n = idx // 64
+            pa.append(
+                _lds_f32_if(
+                    s_red + ((((0 * 2 + n // 8) * 8 + n % 8) * RED_UK_ROW) + col) * 4,
+                    idx < 64 * c_rows,
+                )
+            )
+            pb.append(
+                _lds_f32_if(
+                    s_red + ((((1 * 2 + n // 8) * 8 + n % 8) * RED_UK_ROW) + col) * 4,
+                    idx < 64 * c_rows,
+                )
+            )
+        for k in cutlass.range_constexpr(nk):
+            idx = tid + k * THREADS
+            if idx < 64 * c_rows:
+                col = idx % 64
+                row = idx // 64
+                qf = ptx.bf16_to_f32(ptx.cvt_rn_bf16_f32(ptx.add_rn(pa[k], pb[k])))
+                dst = (
+                    mqa_q
+                    + Int64(row_off + row) * mqa_stride
+                    + Int64(h * MQA_DIM + r * 64 + col)
+                )
+                ptx.st_global_u8(
+                    dst,
+                    cutlass.Uint16(
+                        Uint32(
+                            ptx.cvt_rn_satfinite_e4m3x2_f32(
+                                ptx.mul_rn(qf, inv_qs), Float32(0.0)
+                            )
+                        )
+                        & Uint32(0xFF)
+                    ),
+                )
+        if r >= NOPE // 32:
+            for it in cutlass.range_constexpr(2):
+                idx = tid + THREADS * it
+                if idx < 32 * c_rows:
+                    d = (r - NOPE // 32) * 32 + idx % 32
+                    ptx.st_global_u8(
+                        mqa_q
+                        + Int64(row_off + idx // 32) * mqa_stride
+                        + Int64(h * MQA_DIM + KV_LORA + d),
+                        rope_b[it],
+                    )
+
+    @cute.jit
     def row_norm16(
         self,
         s_xs: Int32,
@@ -2291,13 +2707,20 @@ class MlaPrologue:
     ):
         lane = tid % 32
         warp = tid // 32
-        # kv_split: CTA 2 (MLA) / 3 (index-K) take rows 8..15; else one CTA each, all rows
-        nsplit = 2 if self.kv_split else 0
+        # kv_split: at 16 rows, CTA 0/2 (MLA) and 1/3 (index-K) split rows 0..7 / 8..15;
+        # at 32 rows, even CTAs 0,2,4,6 (MLA) and odd CTAs 1,3,5,7 (index-K) run all 4
+        # 8-row groups in parallel across the 8-CTA cluster.
+        nsplit = 6 if (self.kv_split and self.max_rows == 32) else (2 if self.kv_split else 0)
         mla_grp = Int32(-1)
         idx_grp = Int32(-1)
         is_mla = r == 0
         is_idx = r == 1
-        if cutlass.const_expr(self.kv_split):
+        if cutlass.const_expr(self.kv_split and self.max_rows == 32):
+            is_mla = (r % 2) == 0
+            is_idx = (r % 2) == 1
+            mla_grp = r // 2
+            idx_grp = r // 2
+        elif cutlass.const_expr(self.kv_split):
             is_mla = (r == 0) | (r == 2)
             is_idx = (r == 1) | (r == 3)
             mla_grp = Int32(0)
@@ -2355,23 +2778,24 @@ class MlaPrologue:
                         idx_grp,
                     )
                 else:
-                    self.wait_inputs()
-                    per_row = topk_width // 4
-                    end = rows * per_row
-                    neg = Uint32(0xFFFFFFFF)
-                    first = 2 + nsplit
-                    for idx in cutlass.range(
-                        (r - first) * THREADS + tid,
-                        end,
-                        (CLUSTER - first) * THREADS,
-                        unroll=1,
-                    ):
-                        n = idx // per_row
-                        cc = idx % per_row
-                        ptx.st_global_v4(
-                            topk + (Int64(n) * topk_stride + Int64(cc * 4)) * 4,
-                            (neg, neg, neg, neg),
-                        )
+                    if cutlass.const_expr(2 + nsplit < CLUSTER):
+                        self.wait_inputs()
+                        per_row = topk_width // 4
+                        end = rows * per_row
+                        neg = Uint32(0xFFFFFFFF)
+                        first = 2 + nsplit
+                        for idx in cutlass.range(
+                            (r - first) * THREADS + tid,
+                            end,
+                            (CLUSTER - first) * THREADS,
+                            unroll=1,
+                        ):
+                            n = idx // per_row
+                            cc = idx % per_row
+                            ptx.st_global_v4(
+                                topk + (Int64(n) * topk_stride + Int64(cc * 4)) * 4,
+                                (neg, neg, neg, neg),
+                            )
 
     @cute.jit
     def mla_rows(

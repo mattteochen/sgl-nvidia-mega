@@ -51,6 +51,7 @@ LL_SLOTS = (
     "ll.attention",
     "ll.attention.kv_norm_fold",
     "ll.sparse_mla_fd",
+    "ll.uv_proj",
     "ll.hops",
     "ll.moe.nvfp4",
     "ll.moe",

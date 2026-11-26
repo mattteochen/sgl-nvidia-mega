@@ -444,12 +444,24 @@ class LLAttention(AttentionStep):
             raise _fail(f"layer {attn.layer_id} got deferred norm without SM103 front")
         form = self.forms.qkv_a
         if form is None:
-            return super().qkv_a(attn, x, step)
-        self._check_rows(x, "the attention input")
-        w = attn.fused_qkv_a_proj_with_mqa.weight
-        if form[0] == "ll":
-            return fused_a_ll(x, w, ilp=form[1], deep=form[2])
-        return fused_a_wide(x, w, form[1])
+            qkv = super().qkv_a(attn, x, step)
+        else:
+            self._check_rows(x, "the attention input")
+            w = attn.fused_qkv_a_proj_with_mqa.weight
+            if form[0] == "ll":
+                qkv = fused_a_ll(x, w, ilp=form[1], deep=form[2])
+            else:
+                qkv = fused_a_wide(x, w, form[1])
+        if (
+            self.family.prologue32_fn is not None
+            and 9 <= x.shape[0] <= 32
+            and self._runs_indexer(attn, step)
+            and step.index_kw is None
+        ):
+            step.index_kw = ll.linear(
+                "wk_weights_proj", attn.indexer.wk_weights_proj, x
+            )
+        return qkv
 
     def _q_b(self, attn, q: torch.Tensor) -> torch.Tensor:
         """``q_b_proj_forward`` (``[rows, heads, qk_head_dim]``)."""
@@ -465,17 +477,25 @@ class LLAttention(AttentionStep):
         from sglang.srt.model_executor.runner import get_is_capture_mode
 
         step.index_k_done = False
-        p16 = self.family.prologue16_fn
+        rows = qkv_latent.shape[0]
+        p16 = (
+            self.family.prologue16_fn
+            if 1 <= rows <= 8
+            else (
+                self.family.prologue32_fn
+                if 9 <= rows <= self.family.prologue_mid_max
+                else None
+            )
+        )
         p16_la = (
             self.family.prologue16_layers.get(attn.layer_id)
             if p16 is not None
             else None
         )
-        rows = qkv_latent.shape[0]
         if (
             p16 is not None
             and p16_la is not None
-            and 1 <= rows <= 8
+            and 1 <= rows <= max(8, self.family.prologue_mid_max)
             and qkv_latent.dtype == torch.bfloat16
             and qkv_latent.is_contiguous()
         ):
@@ -618,7 +638,17 @@ class LLAttention(AttentionStep):
         return super().index_k(attn, x, positions, step)
 
     def index_q(self, attn, x, q_lora: torch.Tensor, step: StepContext) -> IndexQ:
-        if self._use_sm103_front and self.family.sm103_iq is not None:
+        rows = q_lora.shape[0]
+        iq_fn = (
+            self.family.sm103_iq
+            if (self._use_sm103_front and 1 <= rows <= 8)
+            else (
+                self.family.sm103_iq32
+                if 9 <= rows <= self.family.iq_mid_max
+                else None
+            )
+        )
+        if iq_fn is not None:
             la = self.family.sm103_layers.get(attn.layer_id)
             if (
                 la is not None
@@ -630,13 +660,12 @@ class LLAttention(AttentionStep):
 
                 from sgl_nvidia_mega.glm5_3.runtime.compile import cu_stream
 
-                rows = q_lora.shape[0]
                 _, weights_raw = self._index_kw(attn.indexer, x, step)
                 pos = step.positions
                 dev = q_lora.device
                 q = torch.empty((rows, 32, 128), dtype=torch.float8_e4m3fn, device=dev)
                 w = torch.empty((rows, 32), dtype=torch.float32, device=dev)
-                self.family.sm103_iq(
+                iq_fn(
                     Int64(la["w_iq"]),
                     Int64(q_lora.data_ptr()),
                     Int64(q_lora.stride(0)),
@@ -817,12 +846,16 @@ class AttentionFamily:
         self.kw_gemm = ""
         self._served: Dict[int, LLAttention] = {}
         self.prologue16_fn = None
+        self.prologue32_fn = None
+        self.prologue_mid_max = 8
         self.prologue16_end_fn = None
         self.prologue16_layers: Dict[int, tuple] = {}
         self.prologue16_ones: Optional[torch.Tensor] = None
         self.sm103_front: Optional[Dict[str, object]] = None
         self.sm103_layers: Dict[int, dict] = {}
         self.sm103_iq = None
+        self.sm103_iq32 = None
+        self.iq_mid_max = 8
         self._p16_keep: list = []
 
     def _compile_prologue16(self, widths: Sequence[int]) -> None:
@@ -833,11 +866,40 @@ class AttentionFamily:
         p16_on = attn_front_on or (
             os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_PROLOGUE", "0") == "1"
         )
+        mid_max = max(
+            8,
+            min(
+                32,
+                int(
+                    os.environ.get(
+                        "SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_MIDBAND_MAX_ROWS", "16"
+                    )
+                    or "16"
+                ),
+            ),
+        )
+        mid_target = 16 if mid_max <= 16 else 32
+        midband_prologue_on = (
+            mid_max > 8
+            and os.environ.get(
+                "SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_MIDBAND_PROLOGUE", "1"
+            )
+            == "1"
+        )
+        midband_iq_on = (
+            mid_max > 8
+            and os.environ.get(
+                "SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_MIDBAND_INDEX_Q", "1"
+            )
+            == "1"
+        )
+        has_le8 = any(1 <= m <= 8 for m in widths)
+        has_mid = any(9 <= m <= mid_max for m in widths)
         if (
             not p16_on
             or self.profile is None
             or tuple(self.profile.sm) != SM
-            or not any(1 <= m <= 8 for m in widths)
+            or not (has_le8 or (has_mid and (midband_prologue_on or midband_iq_on)))
         ):
             return
         import dataclasses
@@ -969,42 +1031,76 @@ class AttentionFamily:
 
         num = _prologue_numerics()
         args = example_args()
-        p_key = {
-            "max_rows": 8,
-            "heads": HEADS,
-            **dataclasses.asdict(num),
-            "rope_cache_fp32": True,
-            "index_rope_cache_fp32": index_rope_f32,
-            "overlap8": True,
-            "push": True,
-            "f32x2": True,
-            "early_arm8": True,
-        }
-        kernel = MlaPrologue(
-            8,
-            num,
-            rope_cache_fp32=True,
-            index_rope_cache_fp32=index_rope_f32,
-            overlap8=True,
-            push=True,
-            f32x2=True,
-            early_arm8=True,
-            heads=HEADS,
-        )
-        self.prologue16_fn = compile_cached(
-            kernel, p_key, lambda k=kernel, a=args["prologue"]: cute.compile(k, *a)
-        )
+        if has_le8:
+            p_key = {
+                "max_rows": 8,
+                "heads": HEADS,
+                **dataclasses.asdict(num),
+                "rope_cache_fp32": True,
+                "index_rope_cache_fp32": index_rope_f32,
+                "overlap8": True,
+                "push": True,
+                "f32x2": True,
+                "early_arm8": True,
+            }
+            kernel = MlaPrologue(
+                8,
+                num,
+                rope_cache_fp32=True,
+                index_rope_cache_fp32=index_rope_f32,
+                overlap8=True,
+                push=True,
+                f32x2=True,
+                early_arm8=True,
+                heads=HEADS,
+            )
+            self.prologue16_fn = compile_cached(
+                kernel, p_key, lambda k=kernel, a=args["prologue"]: cute.compile(k, *a)
+            )
+        if has_mid and midband_prologue_on:
+            p32_key = {
+                "max_rows": mid_target,
+                "heads": HEADS,
+                **dataclasses.asdict(num),
+                "rope_cache_fp32": True,
+                "index_rope_cache_fp32": index_rope_f32,
+                "overlap16": True,
+                "kv_split": True,
+                "push": True,
+                "f32x2": True,
+                "row_norm": True,
+                "early_arm": True,
+            }
+            kernel32 = MlaPrologue(
+                mid_target,
+                num,
+                rope_cache_fp32=True,
+                index_rope_cache_fp32=index_rope_f32,
+                overlap16=True,
+                kv_split=True,
+                push=True,
+                f32x2=True,
+                row_norm=True,
+                early_arm=True,
+                heads=HEADS,
+            )
+            self.prologue32_fn = compile_cached(
+                kernel32,
+                p32_key,
+                lambda k=kernel32, a=args["prologue"]: cute.compile(k, *a),
+            )
+            self.prologue_mid_max = mid_max
 
         front: Dict[str, object] = {}
         if attn_front_on:
-            if has_idx_qa:
+            if has_le8 and has_idx_qa:
                 qa_k = QkvAProjSmallM(QKV_A_SHAPE[0] + 160, QKV_A_SHAPE[0], grid=grid)
                 front["qkv_a.8"] = compile_cached(
                     qa_k,
                     {"total": QKV_A_SHAPE[0] + 160, "main": QKV_A_SHAPE[0], "grid": grid},
                     lambda k=qa_k, a=args["qkv_a"]: cute.compile(k, *a),
                 )
-            if has_shared_qa:
+            if has_le8 and has_shared_qa:
                 qas_k = QkvAProjSmallM(QKV_A_SHAPE[0], QKV_A_SHAPE[0], grid=grid)
                 front["qkv_a_shared.8"] = compile_cached(
                     qas_k,
@@ -1037,18 +1133,35 @@ class AttentionFamily:
                         lambda k=qadn_k, a=args["qkv_a_dn"]: cute.compile(k, *a),
                     )
             if has_iq:
-                iq_k = IndexerQProj(
-                    8, rope_form=INDEX_Q_ROPE_FORM, rope_cache_fp32=index_rope_f32
-                )
-                self.sm103_iq = compile_cached(
-                    iq_k,
-                    {
-                        "max_rows": 8,
-                        "rope_form": INDEX_Q_ROPE_FORM,
-                        "rope_cache_fp32": index_rope_f32,
-                    },
-                    lambda k=iq_k, a=args["index_q"]: cute.compile(k, *a),
-                )
+                if has_le8:
+                    iq_k = IndexerQProj(
+                        8, rope_form=INDEX_Q_ROPE_FORM, rope_cache_fp32=index_rope_f32
+                    )
+                    self.sm103_iq = compile_cached(
+                        iq_k,
+                        {
+                            "max_rows": 8,
+                            "rope_form": INDEX_Q_ROPE_FORM,
+                            "rope_cache_fp32": index_rope_f32,
+                        },
+                        lambda k=iq_k, a=args["index_q"]: cute.compile(k, *a),
+                    )
+                if has_mid and midband_iq_on:
+                    iq32_k = IndexerQProj(
+                        mid_target,
+                        rope_form=INDEX_Q_ROPE_FORM,
+                        rope_cache_fp32=index_rope_f32,
+                    )
+                    self.sm103_iq32 = compile_cached(
+                        iq32_k,
+                        {
+                            "max_rows": mid_target,
+                            "rope_form": INDEX_Q_ROPE_FORM,
+                            "rope_cache_fp32": index_rope_f32,
+                        },
+                        lambda k=iq32_k, a=args["index_q"]: cute.compile(k, *a),
+                    )
+                    self.iq_mid_max = mid_max
             self.sm103_front = front
 
         self.prologue16_layers = la_map
@@ -1056,12 +1169,14 @@ class AttentionFamily:
         self.prologue16_ones = torch.ones(1, dtype=torch.float32, device=self.device)
         self._p16_keep = keep
         logger.info(
-            "ll.attention: SM103 TP4 front compiled for %d layers (rows <= 8, qkv_a=%s, dnorm=%s, index_q=%s, prologue_end=%s)",
+            "ll.attention: SM103 TP4 front compiled for %d layers (p8=%s, p32=%s, qkv_a=%s, dnorm=%s, iq8=%s, iq32=%s)",
             len(la_map),
+            self.prologue16_fn is not None,
+            self.prologue32_fn is not None,
             sorted(front.keys()),
             "qkv_a_shared_dn.8" in front,
             self.sm103_iq is not None,
-            self.prologue16_end_fn is not None,
+            self.sm103_iq32 is not None,
         )
 
     def compile(self, widths: Sequence[int]) -> None:
