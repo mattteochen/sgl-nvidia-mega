@@ -42,6 +42,7 @@ elsewhere); eager steps run SGLang's draft forward (the parity switch excepted, 
 from __future__ import annotations
 
 import logging
+import os
 from functools import partial
 from typing import TYPE_CHECKING, Optional
 
