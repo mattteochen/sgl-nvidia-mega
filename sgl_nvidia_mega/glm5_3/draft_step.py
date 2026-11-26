@@ -22,7 +22,7 @@ kernels inside the draft-decode and draft-extend CUDA graphs.
   same columns of the weight, cuBLAS) and the hop family's residual-free all-reduce + RMSNorm sums the partials and
   applies the draft layer's input norm in one launch (``draft_attention.PreparedInput``: the attention prepare is
   skipped). Each partial rounds to BF16 before the sum and the norm is the hop's, so only the draft's proposals can
-  change (acceptance); at most 8 rows per launch (wider steps keep the column shard).
+  change (acceptance); served at 2-8 rows (1-row and wider steps keep the column shard).
 * slot ``draft_rowselect``: in the draft extend the layer keeps only the ``select_index`` rows (one per request:
   the rows its LM head reads) after the post-attention norm, so the MLP, its all-reduce and the final norm run on
   one row per request (the attention still writes every row's KV and indexer key).
@@ -242,6 +242,9 @@ DRAFT_FRONT_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_DRAFT_FRONT"
 # the TP8 K window of a rank (2H / 8 input columns: ranks 0-3 the embedding half, 4-7 the hidden half)
 ROWPAR_WORLD = 8
 ROWPAR_WINDOW = 2 * HIDDEN // ROWPAR_WORLD
+# rows from which the row-parallel front serves: at 1 row it measured no faster than the column shard
+# (T90a frontbench, GB300 TP8: +0.4 us at 1 row, -2.5 / -4.8 / -7.5 us at 2 / 4 / 8 rows)
+ROWPAR_MIN_ROWS = 2
 
 
 def draft_front_mode() -> Optional[str]:
@@ -400,12 +403,13 @@ class FusedDraft:
     def eh_prepared(self, eh_input: torch.Tensor):
         """``DRAFT_FRONT_ENV``: the row-parallel eh_proj summed through the draft layer's
         input norm in the hop (``draft_attention.PreparedInput``), or None (the column
-        shard): an engaged step at 1-8 rows once the target's hops serve the sum."""
+        shard): an engaged step at ``ROWPAR_MIN_ROWS``-8 rows once the target's hops
+        serve the sum."""
         rows = eh_input.shape[0]
         if (
             not self._rp_ready
             or not self.engaged()
-            or not 1 <= rows <= HOP_ROWS
+            or not ROWPAR_MIN_ROWS <= rows <= HOP_ROWS
             or not eh_input.is_contiguous()
         ):
             return None
@@ -496,8 +500,8 @@ class FusedDraft:
             logger.info(
                 "NVIDIA megakernel: GLM-5.3 / GLM-5.2 draft: %s=rowpar: %s",
                 DRAFT_FRONT_ENV,
-                "eh_proj row-parallel (K window %d) + the hops' all-reduce + input RMSNorm at 1-%d rows"
-                % (ROWPAR_WINDOW, HOP_ROWS)
+                "eh_proj row-parallel (K window %d) + the hops' all-reduce + input RMSNorm at %d-%d rows"
+                % (ROWPAR_WINDOW, ROWPAR_MIN_ROWS, HOP_ROWS)
                 if self._rp_ready
                 else f"declined ({why}); the column shard and its gather serve",
             )
