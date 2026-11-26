@@ -185,6 +185,22 @@ class HopFamily:
                     "its activations with cp.async from %d rows",
                     n_as,
                 )
+            n_rf = self.api.oproj_remap_min_rows()
+            if n_rf and any(n_rf <= m <= SMALL_ROWS for m in rows):
+                # opt-in (env): the router producer dispatches its router CTAs first
+                with_as = bool(n_as) and any(
+                    max(n_as, n_rf) <= m <= SMALL_ROWS for m in rows
+                )
+                rf = self.api.oproj_remap_specs(async_stage=with_as)
+                specs += rf
+                names |= {sp.name for sp in rf}
+                # engagement line (the T90a in-job gate reads it)
+                logger.info(
+                    "NVIDIA megakernel: GLM-5.3 / GLM-5.2: o_proj router producer "
+                    "dispatches its router CTAs first from %d rows (units %s)",
+                    n_rf,
+                    ",".join(sp.name for sp in rf),
+                )
             names |= {"moe_fold_split", "moe_fold_plain"}
             if self.dnorm_layers:
                 names |= {"moe_fold_split_dn", "moe_fold_plain_dn"}

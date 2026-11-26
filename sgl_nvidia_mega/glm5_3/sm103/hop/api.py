@@ -16,6 +16,9 @@
 * ``oproj_async_min_rows()`` / ``oproj_async_specs()``: the opt-in o_proj producer
   forms that stage the activations with ``cp.async`` up to 8 rows, awaited inside the
   epoch read (same outputs), and the row count from which ``HopKernels`` serves them.
+* ``oproj_remap_min_rows()`` / ``oproj_remap_specs()``: the opt-in router-producer forms
+  that dispatch their router CTAs before the GEMV CTAs up to 8 rows (same outputs), and
+  the row count from which ``HopKernels`` serves them.
 
 ``SGLANG_NVIDIA_MEGAKERNEL_GLM_HOP16_ROUTER_ROWS=1`` (read by ``unit_specs``, i.e. at
 build): the 9..16-row routing o_proj producer (mailbox instance B) stores its router
@@ -118,6 +121,21 @@ def hop16_router_rows(value=None) -> bool:
     if raw not in ("", "0", "1"):
         raise ValueError(f"{HOP16_ROUTER_ROWS_ENV}={raw!r}: expected 0 or 1")
     return raw == "1"
+
+
+# From this row count on (up to 8 rows; unset or 0: off), the router o_proj producer
+# (MoE layers) dispatches its 16 router CTAs right after the synchronization CTA,
+# before the 128 GEMV CTAs: units o_proj_produce_router[_as]_rf (the same CTA work in
+# another block order, the same outputs).
+OPROJ_REMAP_MIN_ROWS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_OPROJ8_REMAP"
+
+
+def oproj_remap_min_rows() -> int:
+    """The row count from which the router-first producer forms serve (0: off)."""
+    value = int(os.environ.get(OPROJ_REMAP_MIN_ROWS_ENV, "0") or "0")
+    if not 0 <= value <= 8:
+        raise ValueError(f"{OPROJ_REMAP_MIN_ROWS_ENV}={value}: expected 0..8")
+    return value
 
 
 @dataclass(frozen=True)
@@ -312,6 +330,31 @@ def oproj_async_specs():
     ]
 
 
+def oproj_remap_specs(async_stage: bool = False):
+    """The opt-in router-producer forms (up to 8 rows) that dispatch the router CTAs
+    first: ``o_proj_produce_router_rf`` and, with ``async_stage``, also
+    ``o_proj_produce_router_as_rf`` (the async-staging form of
+    ``oproj_async_specs``)."""
+    specs = [
+        UnitSpec(
+            "o_proj_produce_router_rf",
+            OProjArProduce(router=True, router_first=True),
+            _args_produce(),
+        )
+    ]
+    if async_stage:
+        specs.append(
+            UnitSpec(
+                "o_proj_produce_router_as_rf",
+                OProjArProduce(
+                    router=True, async_stage=True, epoch_overlap=True, router_first=True
+                ),
+                _args_produce(),
+            )
+        )
+    return specs
+
+
 def _version(text, prefix):
     """(major, minor) of the first ``<prefix>X.Y`` in ``text``, else None."""
     i = text.find(prefix)
@@ -394,6 +437,8 @@ class HopKernels:
     form: frozenset = frozenset()
     # the async-staging producer forms serve from this row count on (0: off)
     async_min_rows: int = 0
+    # the router-first router-producer forms serve from this row count on (0: off)
+    remap_min_rows: int = 0
     _peers: dict = field(default_factory=dict)
 
     @classmethod
@@ -440,6 +485,7 @@ class HopKernels:
         if "split8dn" in self.form and "moe_fold_split_dn_nc" in compiled:
             self.split8dn_rows = _split8_rows(device_index)
         self.async_min_rows = oproj_async_min_rows()
+        self.remap_min_rows = oproj_remap_min_rows()
         return self
 
     def fold_limits(self):
@@ -460,10 +506,19 @@ class HopKernels:
 
     def _producer(self, name, rows):
         """The producer unit ``name`` serves ``rows``: its async-staging form from
-        ``async_min_rows`` up to 8 rows, when compiled."""
+        ``async_min_rows`` up to 8 rows, when compiled; of the router producer, the
+        router-first form of that unit from ``remap_min_rows`` up to 8 rows, when
+        compiled."""
+        unit = name
         if 1 <= self.async_min_rows <= rows <= 8 and f"{name}_as" in self.compiled:
-            return self.compiled[f"{name}_as"]
-        return self.compiled[name]
+            unit = f"{name}_as"
+        if (
+            name == "o_proj_produce_router"
+            and 1 <= self.remap_min_rows <= rows <= 8
+            and f"{unit}_rf" in self.compiled
+        ):
+            unit = f"{unit}_rf"
+        return self.compiled[unit]
 
     def reset(self):
         """Collective. Re-initialize the mailboxes and zero the router-partial words
