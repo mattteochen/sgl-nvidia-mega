@@ -46,6 +46,10 @@ ENGINE_SMEM = {"g1": 227440, "g2": 229968, "g4": 223664}
 #   ..._MOE16_XGATE=1         (with FASTTAB) unit 0's first chunks wait for the x loads' issue
 #   ..._MOE16_SHARED_WEIGHT=w schedule weight of the shared quarter in units (default 4)
 #   ..._MOE16_SHARED_FILL=1   the shared clusters also take up to cap - weight routed units
+#   ..._MOE16_XTMA=n          (with FASTTAB, no XGATE) routed clusters stage x with bulk copies
+#                             in ring slot 3 right after the id loads; n = 1: unrolled
+#                             quantization, n = 2..4: rolled, n - 1 warp tiles per iteration
+#   ..._MOE16_SNAKE=1         snake order of the routed experts over the routed clusters
 MOE16_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_MOE16_"
 
 
@@ -66,15 +70,17 @@ def g4_knobs() -> dict:
         "pre": _env_int("PRE", 1),
         "fasttab": _env_int("FASTTAB", 0) != 0,
         "xgate": _env_int("XGATE", 0) != 0,
+        "xtma": _env_int("XTMA", 0),
     }
 
 
 def g4_schedule_knobs() -> dict:
-    """The g4 schedule's choices from the environment: shared-quarter weight and shared
-    fill (``schedule.g4_table`` keywords)."""
+    """The g4 schedule's choices from the environment: shared-quarter weight, shared
+    fill and snake order (``schedule.g4_table`` keywords)."""
     return {
         "shared_weight": _env_int("SHARED_WEIGHT", S.G4_SHARED_WEIGHT),
         "fill_shared": _env_int("SHARED_FILL", 0) != 0,
+        "snake": _env_int("SNAKE", 0) != 0,
     }
 
 

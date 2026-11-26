@@ -263,6 +263,19 @@ def globaltimer():
     return "mov.u64 $0, %globaltimer;", "=l", ()
 
 
+@ptx_op(Uint64)
+def globaltimer_after(dep):
+    """``%globaltimer`` read after ``dep`` is computed (unused operand; trace builds
+    only)."""
+    return "mov.u64 $0, %globaltimer;", "=l,r", (Uint32(dep),)
+
+
+@ptx_op(Uint64)
+def clock64():
+    """``%clock64`` (SM cycles; trace builds only)."""
+    return "mov.u64 $0, %clock64;", "=l", ()
+
+
 @ptx_op()
 def red_add_u64(address, value):
     """Relaxed GPU-scope ``red.add.u64`` into a global word (trace builds only)."""

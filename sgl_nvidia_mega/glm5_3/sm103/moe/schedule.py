@@ -118,12 +118,16 @@ def g4_table(
     shared: bool,
     shared_weight: int = G4_SHARED_WEIGHT,
     fill_shared: bool = False,
+    snake: bool = False,
 ) -> torch.Tensor:
     """int16 [nclusters][G4_BLOCK_BYTES / 2]: the G1 assignment rule over D <= 128
     entries with the shared quarter weighted as ``shared_weight`` units (default 4)
     and a 17-unit cluster cap. ``fill_shared``: the shared clusters also take up to
     cap - shared_weight routed units each (the list's last units), the routed clusters
-    the rest, so fewer routed clusters carry the cap."""
+    the rest, so fewer routed clusters carry the cap. ``snake``: the routed units go to
+    the routed clusters expert by expert (an expert's four quarters to four adjacent
+    clusters), the direction reversed every round, so the class order's heavy experts
+    (most requests, most exchanges) do not all land on the same clusters."""
     nc = nclusters
     with_shared = shared and nc >= 2 * SH_CLUSTERS
     tab = torch.zeros(nc, G4_D, G4_ROW, dtype=torch.int16)
@@ -144,8 +148,15 @@ def g4_table(
                 lim = max(lim, 0)
             for cl in range(SH_CLUSTERS):
                 lists[cl].append(-1)
+            groups = routed_clusters // 4
             for u in range(lim):
-                lists[SH_CLUSTERS + u % routed_clusters].append(u)
+                if snake and routed_clusters % 4 == 0:
+                    g = (u // 4) % groups
+                    if ((u // 4) // groups) % 2 == 1:
+                        g = groups - 1 - g
+                    lists[SH_CLUSTERS + 4 * g + u % 4].append(u)
+                else:
+                    lists[SH_CLUSTERS + u % routed_clusters].append(u)
             for u in range(lim, units):
                 lists[(u - lim) % SH_CLUSTERS].append(u)
         for cl in range(nc):
