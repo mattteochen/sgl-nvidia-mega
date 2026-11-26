@@ -12,11 +12,12 @@ on n8), and the four quarters are summed in a fixed order.
 
 Launch order: the CTAs are dispatched in block order (the synchronization CTA, then
 the GEMV CTAs, then the router CTAs). ``router_pos`` (opt-in, router producer up to 8
-rows) dispatches the 16 router CTAs after the first ``router_pos`` GEMV CTAs instead of
-after all 128 (0: right after the synchronization CTA). Under a predecessor that leaves
-too few SMs free for every producer CTA, the last-dispatched CTAs start late and load
-their weights after the wait; the position decides which work they carry. Every CTA
-computes the same rows or experts in the same order wherever it is dispatched.
+rows) puts the 16 router CTAs at blocks ``router_pos`` .. ``router_pos + 15`` after the
+synchronization CTA instead of after all 128 GEMV CTAs (the served work order rotated;
+0 puts them first). Under a predecessor that leaves too few SMs free for every producer
+CTA, the last-dispatched CTAs start late and load their weights after the wait; the
+position decides which work they carry. Every CTA computes the same rows or experts in
+the same order wherever it is dispatched.
 
 Router (``router=True``, MoE layers): the router logits are computed through the o_proj
 hop. With ``W' = W_router * diag(gamma)`` and ``Q_r = W' W_o^(r)`` (fp32, split into
@@ -296,13 +297,16 @@ class OProjArProduce(Transport):
         cta = bx - self.sync_ctas
         pol = sys_ops.create_policy_evict_first()
         if cutlass.const_expr(self.router_pos != GEMV_CTAS):
-            # GEMV CTAs 0..router_pos-1, router CTAs 0..15, GEMV CTAs router_pos..127
-            rp0: cutlass.Constexpr = self.router_pos
-            if cta >= rp0 and cta < rp0 + ROUTER_CTAS:
+            # the served work order (GEMV CTAs 0..127, router CTAs 0..15) rotated so
+            # that the router CTAs sit at blocks router_pos..router_pos + 15
+            nwork: cutlass.Constexpr = GEMV_CTAS + ROUTER_CTAS
+            rot: cutlass.Constexpr = (GEMV_CTAS - self.router_pos) % nwork
+            wk = (cta + rot) % nwork
+            if wk >= GEMV_CTAS:
                 self.router_cta(
                     mb,
                     base,
-                    cta - rp0,
+                    wk - GEMV_CTAS,
                     x,
                     qh,
                     ql,
@@ -312,10 +316,7 @@ class OProjArProduce(Transport):
                     pol,
                 )
                 sys_ops.exit_thread()
-            g = cta
-            if cta >= rp0 + ROUTER_CTAS:
-                g = cta - ROUTER_CTAS
-            self.gemv_cta(mb, base, g, x, w, rows, pol)
+            self.gemv_cta(mb, base, wk, x, w, rows, pol)
         else:
             if cutlass.const_expr(self.router):  # noqa: SIM102
                 if cta >= GEMV_CTAS:
