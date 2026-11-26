@@ -16,9 +16,9 @@
 * ``oproj_async_min_rows()`` / ``oproj_async_specs()``: the opt-in o_proj producer
   forms that stage the activations with ``cp.async`` up to 8 rows, awaited inside the
   epoch read (same outputs), and the row count from which ``HopKernels`` serves them.
-* ``oproj_remap_min_rows()`` / ``oproj_remap_specs()``: the opt-in router-producer forms
-  that dispatch their router CTAs before the GEMV CTAs up to 8 rows (same outputs), and
-  the row count from which ``HopKernels`` serves them.
+* ``oproj_remap()`` / ``oproj_remap_specs()``: the opt-in router-producer forms that
+  dispatch their 16 router CTAs at another position among the GEMV CTAs up to 8 rows
+  (same outputs), and the rows at which ``HopKernels`` serves each position.
 
 ``SGLANG_NVIDIA_MEGAKERNEL_GLM_HOP16_ROUTER_ROWS=1`` (read by ``unit_specs``, i.e. at
 build): the 9..16-row routing o_proj producer (mailbox instance B) stores its router
@@ -123,19 +123,40 @@ def hop16_router_rows(value=None) -> bool:
     return raw == "1"
 
 
-# From this row count on (up to 8 rows; unset or 0: off), the router o_proj producer
-# (MoE layers) dispatches its 16 router CTAs right after the synchronization CTA,
-# before the 128 GEMV CTAs: units o_proj_produce_router[_as]_rf (the same CTA work in
-# another block order, the same outputs).
-OPROJ_REMAP_MIN_ROWS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_OPROJ8_REMAP"
+# The router o_proj producer's launch order (MoE layers, up to 8 rows; unset or empty:
+# the served order, router CTAs after the 128 GEMV CTAs): a comma list of
+# ``rows[@pos]``, ``rows`` = ``lo-hi`` or ``n`` (= n-8), ``pos`` (default 0) = the GEMV
+# CTAs dispatched before the 16 router CTAs (units o_proj_produce_router[_as]_rp<pos>;
+# the same CTA work in another block order, the same outputs).
+OPROJ_REMAP_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_OPROJ8_REMAP"
+REMAP_MAX_POS = 127
 
 
-def oproj_remap_min_rows() -> int:
-    """The row count from which the router-first producer forms serve (0: off)."""
-    value = int(os.environ.get(OPROJ_REMAP_MIN_ROWS_ENV, "0") or "0")
-    if not 0 <= value <= 8:
-        raise ValueError(f"{OPROJ_REMAP_MIN_ROWS_ENV}={value}: expected 0..8")
-    return value
+def oproj_remap(raw=None) -> dict:
+    """``{rows: router position}`` for rows 1..8 from ``OPROJ_REMAP_ENV`` (or ``raw``);
+    empty when unset."""
+    if raw is None:
+        raw = os.environ.get(OPROJ_REMAP_ENV, "")
+    out = {}
+    for item in (x.strip() for x in raw.split(",")):
+        if not item:
+            continue
+        rng, _, pos = item.partition("@")
+        try:
+            lo, _, hi = rng.partition("-")
+            lo, hi = int(lo), int(hi) if hi else 8
+            pos = int(pos) if pos else 0
+        except ValueError:
+            raise ValueError(f"{OPROJ_REMAP_ENV}={raw!r}: bad item {item!r}") from None
+        if not (1 <= lo <= hi <= 8 and 0 <= pos <= REMAP_MAX_POS):
+            raise ValueError(
+                f"{OPROJ_REMAP_ENV}={raw!r}: {item!r} (rows 1..8, position 0..127)"
+            )
+        for m in range(lo, hi + 1):
+            if m in out:
+                raise ValueError(f"{OPROJ_REMAP_ENV}={raw!r}: rows {m} twice")
+            out[m] = pos
+    return out
 
 
 @dataclass(frozen=True)
@@ -330,28 +351,30 @@ def oproj_async_specs():
     ]
 
 
-def oproj_remap_specs(async_stage: bool = False):
+def oproj_remap_specs(positions, async_stage=()):
     """The opt-in router-producer forms (up to 8 rows) that dispatch the router CTAs
-    first: ``o_proj_produce_router_rf`` and, with ``async_stage``, also
-    ``o_proj_produce_router_as_rf`` (the async-staging form of
+    after the first ``pos`` GEMV CTAs, for each ``pos`` of ``positions``:
+    ``o_proj_produce_router_rp<pos>`` and, for each ``pos`` of ``async_stage``,
+    ``o_proj_produce_router_as_rp<pos>`` (the async-staging form of
     ``oproj_async_specs``)."""
     specs = [
         UnitSpec(
-            "o_proj_produce_router_rf",
-            OProjArProduce(router=True, router_first=True),
+            f"o_proj_produce_router_rp{p}",
+            OProjArProduce(router=True, router_pos=p),
             _args_produce(),
         )
+        for p in sorted(set(positions))
     ]
-    if async_stage:
-        specs.append(
-            UnitSpec(
-                "o_proj_produce_router_as_rf",
-                OProjArProduce(
-                    router=True, async_stage=True, epoch_overlap=True, router_first=True
-                ),
-                _args_produce(),
-            )
+    specs += [
+        UnitSpec(
+            f"o_proj_produce_router_as_rp{p}",
+            OProjArProduce(
+                router=True, async_stage=True, epoch_overlap=True, router_pos=p
+            ),
+            _args_produce(),
         )
+        for p in sorted(set(async_stage))
+    ]
     return specs
 
 
@@ -437,8 +460,8 @@ class HopKernels:
     form: frozenset = frozenset()
     # the async-staging producer forms serve from this row count on (0: off)
     async_min_rows: int = 0
-    # the router-first router-producer forms serve from this row count on (0: off)
-    remap_min_rows: int = 0
+    # the router producer's launch order: {rows: router position} (empty: served order)
+    remap: dict = field(default_factory=dict)
     _peers: dict = field(default_factory=dict)
 
     @classmethod
@@ -485,7 +508,7 @@ class HopKernels:
         if "split8dn" in self.form and "moe_fold_split_dn_nc" in compiled:
             self.split8dn_rows = _split8_rows(device_index)
         self.async_min_rows = oproj_async_min_rows()
-        self.remap_min_rows = oproj_remap_min_rows()
+        self.remap = oproj_remap()
         return self
 
     def fold_limits(self):
@@ -506,18 +529,15 @@ class HopKernels:
 
     def _producer(self, name, rows):
         """The producer unit ``name`` serves ``rows``: its async-staging form from
-        ``async_min_rows`` up to 8 rows, when compiled; of the router producer, the
-        router-first form of that unit from ``remap_min_rows`` up to 8 rows, when
-        compiled."""
+        ``async_min_rows`` up to 8 rows, when compiled; of the router producer, that
+        unit's form with the router CTAs at ``remap[rows]``, when compiled."""
         unit = name
         if 1 <= self.async_min_rows <= rows <= 8 and f"{name}_as" in self.compiled:
             unit = f"{name}_as"
-        if (
-            name == "o_proj_produce_router"
-            and 1 <= self.remap_min_rows <= rows <= 8
-            and f"{unit}_rf" in self.compiled
-        ):
-            unit = f"{unit}_rf"
+        if name == "o_proj_produce_router" and rows in self.remap:
+            rp = f"{unit}_rp{self.remap[rows]}"
+            if rp in self.compiled:
+                unit = rp
         return self.compiled[unit]
 
     def reset(self):

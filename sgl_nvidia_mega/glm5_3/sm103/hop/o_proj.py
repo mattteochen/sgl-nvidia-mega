@@ -11,12 +11,12 @@ then the activations are staged, ``mma.sync.m16n8k16`` accumulates per K quarter
 on n8), and the four quarters are summed in a fixed order.
 
 Launch order: the CTAs are dispatched in block order (the synchronization CTA, then
-the GEMV CTAs, then the router CTAs). ``router_first`` (opt-in, up to 8 rows) puts the
-router CTAs right after the synchronization CTA: under a predecessor that leaves too few
-SMs free for every producer CTA, the last-dispatched CTAs start late and load their
-weights after the wait, and the router CTAs (the heavier post-wait work: hi / lo terms,
-twelve-warp sum, eight remote stores) should not be among them. Every CTA computes the
-same rows or experts in the same order wherever it is dispatched.
+the GEMV CTAs, then the router CTAs). ``router_pos`` (opt-in, router producer up to 8
+rows) dispatches the 16 router CTAs after the first ``router_pos`` GEMV CTAs instead of
+after all 128 (0: right after the synchronization CTA). Under a predecessor that leaves
+too few SMs free for every producer CTA, the last-dispatched CTAs start late and load
+their weights after the wait; the position decides which work they carry. Every CTA
+computes the same rows or experts in the same order wherever it is dispatched.
 
 Router (``router=True``, MoE layers): the router logits are computed through the o_proj
 hop. With ``W' = W_router * diag(gamma)`` and ``Q_r = W' W_o^(r)`` (fp32, split into
@@ -106,18 +106,20 @@ class OProjArProduce(Transport):
         max_rows: int = 8,
         async_stage: bool = False,
         epoch_overlap: bool = False,
-        router_first: bool = False,
+        router_pos: int = GEMV_CTAS,
     ):
         if max_rows not in (8, 16) or (max_rows == 16 and not router):
             raise ValueError(
                 "provided for up to 8 rows, or up to 16 rows with the router"
             )
-        if router_first:
-            if not router or max_rows != 8:
-                raise ValueError("router_first: the router producer up to 8 rows")
-            # opt-in form: the router CTAs are dispatched before the GEMV CTAs (the
-            # served forms keep their attributes)
-            self.router_first = True
+        if router_pos != GEMV_CTAS:
+            if not router or max_rows != 8 or not 0 <= router_pos < GEMV_CTAS:
+                raise ValueError(
+                    "router_pos: 0..127, the router producer up to 8 rows"
+                )
+            # opt-in form: the router CTAs are dispatched after the first router_pos
+            # GEMV CTAs (the served forms keep their attributes)
+            self.router_pos = router_pos
         self.router, self.max_rows = router, max_rows
         # rows 9..16: a second n8 token tile per mma (same A fragments, same k order),
         # and the
@@ -133,7 +135,7 @@ class OProjArProduce(Transport):
             self.epoch_overlap = True
 
     epoch_overlap = False
-    router_first = False
+    router_pos = GEMV_CTAS
 
     def smem_bytes(self):
         gemv = (
@@ -293,13 +295,14 @@ class OProjArProduce(Transport):
                 sys_ops.exit_thread()
         cta = bx - self.sync_ctas
         pol = sys_ops.create_policy_evict_first()
-        if cutlass.const_expr(self.router_first):
-            # router CTAs 0..15 first, then GEMV CTAs 0..127
-            if cta < ROUTER_CTAS:
+        if cutlass.const_expr(self.router_pos != GEMV_CTAS):
+            # GEMV CTAs 0..router_pos-1, router CTAs 0..15, GEMV CTAs router_pos..127
+            rp0: cutlass.Constexpr = self.router_pos
+            if cta >= rp0 and cta < rp0 + ROUTER_CTAS:
                 self.router_cta(
                     mb,
                     base,
-                    cta,
+                    cta - rp0,
                     x,
                     qh,
                     ql,
@@ -309,7 +312,10 @@ class OProjArProduce(Transport):
                     pol,
                 )
                 sys_ops.exit_thread()
-            self.gemv_cta(mb, base, cta - ROUTER_CTAS, x, w, rows, pol)
+            g = cta
+            if cta >= rp0 + ROUTER_CTAS:
+                g = cta - ROUTER_CTAS
+            self.gemv_cta(mb, base, g, x, w, rows, pol)
         else:
             if cutlass.const_expr(self.router):  # noqa: SIM102
                 if cta >= GEMV_CTAS:

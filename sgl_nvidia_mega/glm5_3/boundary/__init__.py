@@ -29,6 +29,7 @@ and initialized before the first capture.
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Optional
 
 import torch
@@ -185,20 +186,22 @@ class HopFamily:
                     "its activations with cp.async from %d rows",
                     n_as,
                 )
-            n_rf = self.api.oproj_remap_min_rows()
-            if n_rf and any(n_rf <= m <= SMALL_ROWS for m in rows):
-                # opt-in (env): the router producer dispatches its router CTAs first
-                with_as = bool(n_as) and any(
-                    max(n_as, n_rf) <= m <= SMALL_ROWS for m in rows
+            remap = {m: p for m, p in self.api.oproj_remap().items() if m in rows}
+            if remap:
+                # opt-in (env): the router producer's launch order at these rows
+                rf = self.api.oproj_remap_specs(
+                    remap.values(),
+                    [p for m, p in remap.items() if n_as and m >= n_as],
                 )
-                rf = self.api.oproj_remap_specs(async_stage=with_as)
                 specs += rf
                 names |= {sp.name for sp in rf}
                 # engagement line (the T90a in-job gate reads it)
                 logger.info(
                     "NVIDIA megakernel: GLM-5.3 / GLM-5.2: o_proj router producer "
-                    "dispatches its router CTAs first from %d rows (units %s)",
-                    n_rf,
+                    "launch order %s: router CTAs after GEMV CTA position by rows %s "
+                    "(units %s)",
+                    os.environ.get(self.api.OPROJ_REMAP_ENV, ""),
+                    dict(sorted(remap.items())),
                     ",".join(sp.name for sp in rf),
                 )
             names |= {"moe_fold_split", "moe_fold_plain"}
