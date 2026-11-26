@@ -25,7 +25,9 @@ writes the MLA rows, CTA 1 the index-K rows, CTAs 2..7 the top-k fill.
 Option fields (compile time): ``max_rows`` (8 or 16), ``overlap16`` (16 rows only: the
 head CTA issues every load of a phase before the stores of that phase, so the rows'
 latencies overlap instead of adding up; per row the same operations in the same order,
-so the same outputs), ``kv_split`` (16 rows only: the
+so the same outputs), ``overlap8`` (8 rows only: the
+head CTA issues each phase's loads before that phase's stores and keeps its global
+q_pe stores out of the hand-off; same outputs), ``kv_split`` (16 rows only: the
 kv cluster's rows 8..15 run on CTAs 2 (MLA rows) and 3 (index-K rows) beside rows 0..7 on
 CTAs 0 and 1, instead of a second pass of the same warps; the top-k fill moves to CTAs
 4..7; per row the same operations, so the same outputs), ``numerics``
@@ -98,6 +100,28 @@ def _lds_v4_if(addr, valid):
         "@p ld.shared.v4.u32 {$0, $1, $2, $3}, [$4]; }"
     )
     return code, "=r,=r,=r,=r,r,r", (addr, Int32(Boolean(valid)))
+
+
+@ptx.ptx_op(Float32)
+def _lds_f32_pred(addr, valid):
+    """``ld.shared.f32`` where ``valid`` holds, else 0 (predicated, no branch)."""
+    code = (
+        "{ .reg .pred p; setp.ne.b32 p, $2, 0; mov.f32 $0, 0f00000000; "
+        "@p ld.shared.f32 $0, [$1]; }"
+    )
+    return code, "=f,r,r", (addr, Int32(Boolean(valid)))
+
+
+@ptx.ptx_op((Uint32, Uint32, Uint32, Uint32))
+def _lds_v4_pred(addr, valid):
+    """``ld.shared.v4.u32`` where ``valid`` holds, else zeros (predicated)."""
+    code = (
+        "{ .reg .pred p; setp.ne.b32 p, $5, 0; "
+        "mov.b32 $0, 0; mov.b32 $1, 0; mov.b32 $2, 0; mov.b32 $3, 0; "
+        "@p ld.shared.v4.u32 {$0, $1, $2, $3}, [$4]; }"
+    )
+    return code, "=r,=r,=r,=r,r,r", (addr, Int32(Boolean(valid)))
+
 
 HEADS = 8
 Q_LORA = 2048
@@ -172,6 +196,25 @@ XS_STRIDE = Q_LORA * 2 + 64
 QN_STRIDE = NOPE * 2 + 64
 
 
+# overlap8 partials, one FP32 row per (warp or absorb half, token): q_b 32 output rows + 4
+# pad, absorb 64 columns + 4 pad, so a reader warp's 32 lanes read consecutive words and
+# a writer warp's lanes (8 t + g) hit distinct banks (the C-fragment layout of head_cta
+# costs 8 wavefronts per reduction load)
+P8_RED_QB_ROW = 32 + 4
+P8_RED_UK_ROW = 64 + 4
+P8_RED_BYTES = 8 * 8 * P8_RED_QB_ROW * 4  # 9,216 (the absorb partials: 4,352)
+
+
+def layout_overlap8(off):
+    """``layout(8)`` with the larger overlap8 partials region (``red``); the regions
+    after it move up."""
+    off = dict(off)
+    grow = P8_RED_BYTES - (off["ssq"] - off["red"])
+    for k in ("ssq", "mbar", "total"):
+        off[k] += grow
+    return off
+
+
 # overlap16 partials, one FP32 row per (warp or half, token tile, token): q_b 32 output
 # rows + 4 pad, absorb 64 columns + 4 pad, so a reader warp's 32 lanes read consecutive
 # words and a writer warp's lanes (8 t + g) hit distinct banks
@@ -222,17 +265,21 @@ class MlaPrologue:
         index_scale_ue8m0x4: bool = False,
         trigger_at_end: bool = False,
         overlap16: bool = False,
+        overlap8: bool = False,
         kv_split: bool = False,
         probe: bool = False,
     ):
         if max_rows not in (8, 16):
             raise ValueError(f"max_rows must be 8 or 16, got {max_rows}")
+        if overlap8 and max_rows != 8:
+            raise ValueError("overlap8 applies to max_rows 8 only")
         if overlap16 and max_rows != 16:
             raise ValueError("overlap16 applies to max_rows 16 only")
         if kv_split and max_rows != 16:
             raise ValueError("kv_split applies to max_rows 16 only")
         self.max_rows = max_rows
         self.overlap16 = overlap16
+        self.overlap8 = overlap8
         self.kv_split = kv_split
         # benchmark builds: phase timestamps to the top-k pointer (shared layers only)
         self.probe = probe
@@ -246,6 +293,8 @@ class MlaPrologue:
         self.index_scale_ue8m0x4 = index_scale_ue8m0x4
         self.trigger_at_end = trigger_at_end
         self.off = layout(max_rows, overlap16)
+        if overlap8:
+            self.off = layout_overlap8(self.off)
 
     @cute.jit
     def __call__(
@@ -434,6 +483,28 @@ class MlaPrologue:
                 )
             elif cutlass.const_expr(self.max_rows == 16):
                 self.head_cta16(
+                    base,
+                    cluster_id,
+                    r,
+                    tid,
+                    q_c,
+                    q_c_stride,
+                    positions,
+                    rows,
+                    w_qb,
+                    w_uk,
+                    q_norm_w,
+                    q_eps,
+                    rope_cache,
+                    rope_stride,
+                    q_scale,
+                    mqa_q,
+                    mqa_stride,
+                    qc_out,
+                    qc_out_stride,
+                )
+            elif cutlass.const_expr(self.overlap8):
+                self.head_cta8o(
                     base,
                     cluster_id,
                     r,
@@ -756,6 +827,319 @@ class MlaPrologue:
                 )
         self.release_outputs()
         self.exit_wait()
+
+    @cute.jit
+    def head_cta8o(
+        self,
+        base: Int32,
+        h: Int32,
+        r: Int32,
+        tid: Int32,
+        q_c: Int64,
+        q_c_stride: Int64,
+        positions: Int64,
+        rows: Int32,
+        w_qb: Int64,
+        w_uk: Int64,
+        q_norm_w: Int64,
+        q_eps: Float32,
+        rope_cache: Int64,
+        rope_stride: Int64,
+        q_scale: Int64,
+        mqa_q: Int64,
+        mqa_stride: Int64,
+        qc_out: Int64,
+        qc_out_stride: Int64,
+    ):
+        """``head_cta`` (same operations per row, same order, same rounding) in an issue
+        order where a phase's loads precede its stores (memory operations keep their
+        program order, and a load after a store to the same space waits for it): the
+        RoPE position before the q rows, its cos / sin after them; every row's sum of
+        squares before any normalized row is stored; the q_b reduction's 8 partials
+        before its sum; both absorb slots' partials before their stores; token-tile
+        operands loaded predicated (no lane-divergent branch); the q_b and absorb
+        partials as one padded FP32 row per (warp or half, token) (``P8_RED_*``), free
+        of the fragment layout's 8-way bank conflicts; the RoPE ranks' FP8 q_pe bytes
+        kept in registers and stored with the absorbed columns at the end, so no global
+        store is outstanding at the hand-off's cluster barrier release."""
+        off = self.off
+        max_rows = self.max_rows
+        lane = tid % 32
+        warp = tid // 32
+        bar = base + off["mbar"]
+        s_xs = base + off["xs"]
+        s_red = base + off["red"]
+        s_ssq = base + off["ssq"]
+        s_pub = base + off["pub"]
+        s_qn = base + off["qn"]
+        strided = self.num.norm_order == "strided_8x256"
+        # constant weights: q_b slice (two 64 KiB halves) + W_UK^T slice (24 KiB),
+        # before the PDL wait
+        if tid == 0:
+            ptx.mbarrier_init(bar, 1)
+            ptx.fence_mbarrier_init_release_cluster()
+            ptx.fence_proxy_async_shared_cta()
+            ptx.mbarrier_arrive_expect_tx(bar, WQB_BYTES + WUK_BYTES)
+            src_qb = w_qb + Int64(h * 16 + 2 * r) * ((Q_LORA // 32) * 1024)
+            src_uk = w_uk + Int64(h * 32 + 4 * r) * ((NOPE // 32) * 1024)
+            for part in cutlass.range_constexpr(2):
+                ptx.bulk_copy_g2s(
+                    base + off["wqb"] + part * (WQB_BYTES // 2),
+                    src_qb + part * (WQB_BYTES // 2),
+                    WQB_BYTES // 2,
+                    bar,
+                )
+            ptx.bulk_copy_g2s(base + off["wuk"], src_uk, WUK_BYTES, bar)
+        qw = ptx.ld_global_nc_v4(q_norm_w + Int64(tid) * 16)
+        inv_qs = ptx.rcp_rn(ptx.ld_global_nc_f32(q_scale))
+        ptx.sync_threads()
+
+        self.wait_q_inputs()
+
+        # RoPE CTAs: the position first, then the q rows, then the cos / sin loads that
+        # need the position
+        is_rope = r >= NOPE // 32
+        rope_ok = is_rope & (tid < 32 * rows)
+        pos = self.p8_ldg_s64_if(positions + Int64(tid // 32) * 8, rope_ok)
+        qv = []
+        for n in cutlass.range_constexpr(max_rows):
+            qv.append(
+                self.load16(
+                    q_c + (Int64(n) * q_c_stride + Int64(tid * 8)) * 2, n < rows
+                )
+            )
+        pr = ((r - NOPE // 32) * 32 + lane) // 2
+        rope_c, rope_s = self.p8_rope_at(rope_ok, pos, pr, rope_cache, rope_stride)
+        if cutlass.const_expr(strided):
+            self.q_norm_sums_strided(s_xs, s_ssq, qv, warp, lane, tid, rows)
+        else:
+            self.q_norm_sums_contiguous(s_ssq, qv, warp, lane, rows)
+        ptx.sync_threads()
+        wv = []
+        for e in cutlass.range_constexpr(4):
+            lo, hi = ptx.bf16x2_to_f32x2(qw[e])
+            if cutlass.const_expr(self.num.norm_weight_plus_zero):
+                lo = ptx.add_rn(lo, Float32(0.0))
+                hi = ptx.add_rn(hi, Float32(0.0))
+            wv.append(lo)
+            wv.append(hi)
+        # every row's sum of squares, then the normalized rows (raw rows in registers)
+        ss = []
+        for n in cutlass.range_constexpr(max_rows):
+            if cutlass.const_expr(strided):
+                ss.append(_lds_f32_pred(s_ssq + n * 4, n < rows))
+            else:
+                part = []
+                for w in cutlass.range_constexpr(8):
+                    part.append(
+                        _lds_f32_pred(s_ssq + (w * max_rows + n) * 4, n < rows)
+                    )
+                ss.append(part)
+        for n in cutlass.range_constexpr(max_rows):
+            if n < rows:
+                sn = Float32(0.0)
+                if cutlass.const_expr(strided):
+                    sn = ss[n]
+                else:
+                    for w in cutlass.range_constexpr(8):
+                        sn = ptx.add_rn(sn, ss[n][w])
+                rr = ptx.rsqrt_approx(ptx.fma_rn(sn, Float32(1.0 / Q_LORA), q_eps))
+                words = []
+                for e in cutlass.range_constexpr(4):
+                    x0, x1 = ptx.bf16x2_to_f32x2(qv[n][e])
+                    words.append(
+                        ptx.cvt_rn_bf16x2_f32(
+                            ptx.mul_rn(ptx.mul_rn(x0, rr), wv[2 * e]),
+                            ptx.mul_rn(ptx.mul_rn(x1, rr), wv[2 * e + 1]),
+                        )
+                    )
+                packed = (words[0], words[1], words[2], words[3])
+                ptx.st_shared_v4(s_xs + n * XS_STRIDE + tid * 16, packed)
+                if (qc_out != Int64(0)) & (h == 0) & (r == 0):
+                    ptx.st_global_v4(
+                        qc_out + (Int64(n) * qc_out_stride + Int64(tid * 8)) * 2, packed
+                    )
+        ptx.sync_threads()
+
+        self.wait_weights(bar)
+
+        g = lane // 4
+        t = lane % 4
+        # q_b MMA (tokens on N = 8): warp w covers k-steps [8 w, 8 w + 8) for both
+        # 16-row tiles
+        zero = Float32(0.0)
+        c = [(zero, zero, zero, zero), (zero, zero, zero, zero)]
+        for i in cutlass.range_constexpr(8):
+            s_ = warp * 8 + i
+            bq = _lds_v4_pred(s_xs + g * XS_STRIDE + (s_ * 32 + 8 * t) * 2, g < rows)
+            for j in cutlass.range_constexpr(2):
+                blk = base + off["wqb"] + (j * (Q_LORA // 32) + s_) * 1024
+                lo = ptx.ld_shared_v4(blk + lane * 16)
+                hi = ptx.ld_shared_v4(blk + 512 + lane * 16)
+                c1 = ptx.mma_m16n8k16_bf16(
+                    (lo[0], hi[0], lo[1], hi[1]), (bq[0], bq[1]), c[j]
+                )
+                c[j] = ptx.mma_m16n8k16_bf16(
+                    (lo[2], hi[2], lo[3], hi[3]), (bq[2], bq[3]), c1
+                )
+        # each accumulator to its (warp, token, q_b row) word: the C fragment holds
+        # rows g / g + 8 of tile j, tokens 2 t / 2 t + 1
+        for j in cutlass.range_constexpr(2):
+            for e in cutlass.range_constexpr(4):
+                ptx.st_shared_f32(
+                    s_red
+                    + (
+                        (warp * 8 + 2 * t + e % 2) * P8_RED_QB_ROW
+                        + j * 16
+                        + g
+                        + 8 * (e // 2)
+                    )
+                    * 4,
+                    c[j][e],
+                )
+        self.sync_partials()
+        # the 8 partials of this thread's (token, q_b row), then their sum in warp order
+        rho = tid % 32
+        n = tid // 32
+        red_ok = tid < 32 * rows
+        parts = []
+        for w in cutlass.range_constexpr(8):
+            parts.append(
+                _lds_f32_pred(s_red + ((w * 8 + n) * P8_RED_QB_ROW + rho) * 4, red_ok)
+            )
+        v = Float32(0.0)
+        for w in cutlass.range_constexpr(8):
+            v = ptx.add_rn(v, parts[w])
+        qb = ptx.cvt_rn_bf16_f32(v)
+        if r < NOPE // 32:
+            if red_ok:
+                ptx.st_shared_b16(s_pub + (n * 32 + rho) * 2, qb)
+        # the RoPE ranks keep their FP8 q_pe byte (stored at the end)
+        rope_b = self.p8_q_rope_byte(
+            is_rope, (r - NOPE // 32) * 32 + rho, qb, rope_c, rope_s, inv_qs
+        )
+        # q_nope hand-off: ranks 0..5 published 32 rows each
+        self.handoff(base, tid, rows)
+        self.done_reading()
+        ptx.sync_threads()
+        # W_UK absorb: rows l in [64 r, 64 r + 64) (4 tiles), K = 192 (6 k-steps); warp
+        # -> (tile w % 4, half w // 4)
+        tile = warp % 4
+        half = warp // 4
+        cw = (zero, zero, zero, zero)
+        for i in cutlass.range_constexpr(3):
+            s_ = half * 3 + i
+            bq = _lds_v4_pred(s_qn + g * QN_STRIDE + (s_ * 32 + 8 * t) * 2, g < rows)
+            blk = base + off["wuk"] + (tile * (NOPE // 32) + s_) * 1024
+            lo = ptx.ld_shared_v4(blk + lane * 16)
+            hi = ptx.ld_shared_v4(blk + 512 + lane * 16)
+            c1 = ptx.mma_m16n8k16_bf16((lo[0], hi[0], lo[1], hi[1]), (bq[0], bq[1]), cw)
+            cw = ptx.mma_m16n8k16_bf16((lo[2], hi[2], lo[3], hi[3]), (bq[2], bq[3]), c1)
+        # each accumulator to its (half, token, absorbed column) word
+        for e in cutlass.range_constexpr(4):
+            ptx.st_shared_f32(
+                s_red
+                + (
+                    (half * 8 + 2 * t + e % 2) * P8_RED_UK_ROW
+                    + tile * 16
+                    + g
+                    + 8 * (e // 2)
+                )
+                * 4,
+                cw[e],
+            )
+        self.sync_partials()
+        nk = (64 * max_rows + THREADS - 1) // THREADS
+        pa = []
+        pb = []
+        for k in cutlass.range_constexpr(nk):
+            idx = tid + k * THREADS
+            col = idx % 64
+            row = idx // 64
+            # half 0 (k-steps 0..2) + half 1 (k-steps 3..5), as head_cta
+            pa.append(
+                _lds_f32_pred(
+                    s_red + ((0 * 8 + row) * P8_RED_UK_ROW + col) * 4, idx < 64 * rows
+                )
+            )
+            pb.append(
+                _lds_f32_pred(
+                    s_red + ((1 * 8 + row) * P8_RED_UK_ROW + col) * 4, idx < 64 * rows
+                )
+            )
+        for k in cutlass.range_constexpr(nk):
+            idx = tid + k * THREADS
+            if idx < 64 * rows:
+                col = idx % 64
+                row = idx // 64
+                qf = ptx.bf16_to_f32(ptx.cvt_rn_bf16_f32(ptx.add_rn(pa[k], pb[k])))
+                dst = mqa_q + Int64(row) * mqa_stride + Int64(h * MQA_DIM + r * 64 + col)
+                ptx.st_global_u8(
+                    dst,
+                    cutlass.Uint16(
+                        Uint32(
+                            ptx.cvt_rn_satfinite_e4m3x2_f32(
+                                ptx.mul_rn(qf, inv_qs), Float32(0.0)
+                            )
+                        )
+                        & Uint32(0xFF)
+                    ),
+                )
+        # the RoPE ranks' q_pe bytes (computed before the hand-off)
+        if is_rope:
+            if red_ok:
+                d = (r - NOPE // 32) * 32 + rho
+                ptx.st_global_u8(
+                    mqa_q + Int64(n) * mqa_stride + Int64(h * MQA_DIM + KV_LORA + d),
+                    rope_b,
+                )
+        self.release_outputs()
+        self.exit_wait()
+
+    @cute.jit
+    def p8_q_rope_byte(
+        self,
+        valid,
+        d: Int32,
+        qb,
+        c: Float32,
+        s: Float32,
+        inv_qs: Float32,
+    ):
+        """The FP8 q_pe byte of dim d (``head_cta``'s RoPE arithmetic on the BF16 q_b
+        output ``qb``; the pair partner is the neighbouring lane), 0 unless ``valid``
+        (CTA-uniform: the shuffle sees the whole warp)."""
+        byte = cutlass.Uint16(0)
+        if valid:
+            own = ptx.bf16_to_f32(qb)
+            other = cute.arch.shuffle_sync_bfly(own, 1)
+            o = Float32(0.0)
+            if d % 2 == 0:
+                o = self.q_rope_even(own, other, c, s)
+            else:
+                o = self.q_rope_odd(other, own, c, s)
+            o = ptx.mul_rn(o, inv_qs)
+            byte = cutlass.Uint16(
+                Uint32(ptx.cvt_rn_satfinite_e4m3x2_f32(o, Float32(0.0))) & Uint32(0xFF)
+            )
+        return byte
+
+    @cute.jit
+    def p8_ldg_s64_if(self, addr: Int64, valid):
+        v = Int64(0)
+        if valid:
+            v = ptx.ld_global_s64(addr)
+        return v
+
+    @cute.jit
+    def p8_rope_at(self, valid, pos: Int64, pair: Int32, cache: Int64, stride: Int64):
+        """The cos / sin of one q_pe RoPE pair with the position already loaded."""
+        c = Float32(0.0)
+        s = Float32(0.0)
+        if valid:
+            c = self.rope_value(cache, stride, pos, pair, self.rope_cache_fp32)
+            s = self.rope_value(cache, stride, pos, 32 + pair, self.rope_cache_fp32)
+        return c, s
 
     @cute.jit
     def head_cta16(
