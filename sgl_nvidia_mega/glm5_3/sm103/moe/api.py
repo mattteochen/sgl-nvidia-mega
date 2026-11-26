@@ -45,6 +45,7 @@ ENGINE_SMEM = {"g1": 227440, "g2": 229968, "g4": 223664}
 #                             is built (1..3, default 1)
 #   ..._MOE16_FASTTAB=1       lane-parallel unit table (batched id loads, no union list)
 #   ..._MOE16_SHARED_WEIGHT=w schedule weight of the shared quarter in units (default 4)
+#   ..._MOE16_SHARED_FILL=1   the shared clusters also take up to cap - weight routed units
 #   ..._MOE16_CLUSTERS=n      g4 grid in clusters, at most the co-resident count (0 off)
 MOE16_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_MOE16_"
 
@@ -70,10 +71,11 @@ def g4_knobs() -> dict:
 
 
 def g4_schedule_knobs() -> dict:
-    """The g4 schedule's choices from the environment: shared-quarter weight and grid
-    cap in clusters (0: the co-resident count)."""
+    """The g4 schedule's choices from the environment: shared-quarter weight, shared
+    fill and grid cap in clusters (0: the co-resident count)."""
     return {
         "shared_weight": _env_int("SHARED_WEIGHT", S.G4_SHARED_WEIGHT),
+        "fill_shared": _env_int("SHARED_FILL", 0) != 0,
         "clusters": _env_int("CLUSTERS", 0),
     }
 
@@ -284,7 +286,10 @@ class SmallMMoe:
             for nc in sorted({nclusters, min(nclusters, 32)}):
                 self.tables[(mode, nc)] = build(nc, shared).to(device)
         self.tables[("g4", self.g4_clusters)] = S.g4_table(
-            self.g4_clusters, shared, shared_weight=sk["shared_weight"]
+            self.g4_clusters,
+            shared,
+            shared_weight=sk["shared_weight"],
+            fill_shared=sk["fill_shared"],
         ).to(device)
 
     def clusters(self, mode: str, rows: int) -> int:
