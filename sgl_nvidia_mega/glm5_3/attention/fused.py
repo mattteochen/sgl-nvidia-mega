@@ -132,6 +132,13 @@ NEXT_QKV_A_PREFETCH_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_NEXT_QKV_A_PREFETCH"
 
 
 _OPROJ_STAGE_MIN_ROWS = int(os.environ.get(OPROJ_STAGE_MIN_ROWS_ENV, "1") or "1")
+# SGLANG_NVIDIA_MEGAKERNEL_GLM_SPARSE_MT_MIN_ROWS=n (0 = off): verify rows n..16 run the sparse MLA core on the
+# multi-tile flash decode (ll.sparse_mla_fd: clusters of 8 / 6 / 4 CTAs streaming several 128-position tiles, so
+# 9-16 rows fit one wave instead of the 16-CTA clusters' two or three). Its P rounding and merge order are
+# TRTLLM-Gen's (the stock decode's), not the 16-CTA kernel's: numerics change. Row counts the device cannot hold
+# in one wave of multi-tile clusters keep the 16-CTA kernel. Read at build.
+SPARSE_MT_MIN_ROWS_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_SPARSE_MT_MIN_ROWS"
+_SPARSE_MT_MIN_ROWS = int(os.environ.get(SPARSE_MT_MIN_ROWS_ENV, "0") or "0")
 
 
 def _env_bytes(name: str, default: int, full: int) -> int:
@@ -275,6 +282,8 @@ class FusedAttention(AttentionStep):
         self.max_rows = cap = kernel_rows(rows)
         self.uv = fn[f"uv.{cap}"]
         self.sparse = fn[f"sparse.{sparse_warps(rows)}"]
+        # multi-tile CTAs per row (0: the 16-CTA kernel above)
+        self.mt_splits = getattr(glue, "sparse_mt", {}).get(rows, 0)
         self.pro = fn[f"prologue.{cap}"]
         # the target's layers that reuse the previous top-k: the end-trigger prologue
         self.pro_end = fn.get(f"prologue_end.{cap}")
@@ -488,6 +497,20 @@ class FusedAttention(AttentionStep):
         out = torch.empty(
             (rows, HEADS, KV_LORA), dtype=torch.bfloat16, device=q_fp8.device
         )
+        if self.mt_splits:
+            from sgl_nvidia_mega.glm5_3.ll import sparse_mla as fd
+
+            # physical rows, every position used (masks: id < 0, id >= cache rows)
+            return fd.flash_decode(
+                q_fp8,
+                kv.view(-1, MQA_DIM),
+                ids,
+                self.glue.mt_lens,
+                _f32(bmm1_scale * LOG2E),
+                out=out,
+                splits=self.mt_splits,
+                out_scale=1.0,
+            )
         self.sparse(
             *_i64(q_fp8.data_ptr(), kv.data_ptr()),  # q, kv
             *_i64(ids.data_ptr(), out.data_ptr()),  # ids, out
@@ -700,6 +723,7 @@ class AttentionGlue:
             qkv_a_shared=shared,
             qkv_a_shared_dn=bool(shared) and "dnorm" in SLOTS,
         )
+        self.sparse_mt = self._sparse_mt_plan(rows)
         for name, (kernel, key, args) in specs.items():
             fn = compile_cached(
                 kernel, key, lambda k=kernel, a=args: cute.compile(k, *a)
@@ -718,6 +742,34 @@ class AttentionGlue:
                     "NVIDIA megakernel: GLM-5.3 / GLM-5.2: deferred input norm: "
                     "epilogue-scaled q_a / kv_a projection built"
                 )
+
+    def _sparse_mt_plan(self, rows: Tuple[int, ...]) -> Dict[int, int]:
+        """{verify rows: multi-tile CTAs per row} for the rows the multi-tile flash
+        decode serves (SPARSE_MT_MIN_ROWS_ENV); the device's co-resident clusters set
+        the split (one wave with one cluster of headroom), the same on every rank of
+        one device type."""
+        lo = _SPARSE_MT_MIN_ROWS
+        # the target's verify only (the draft layer keeps its stock sparse MLA)
+        want = sorted(m for m in rows if self.target and lo > 0 and max(lo, 9) <= m <= 16)
+        if not want:
+            return {}
+        from sgl_nvidia_mega.glm5_3.ll import sparse_mla as fd
+
+        caps = fd.device_caps(HEADS, with_mt=True, with_fold=False)
+        plan = {m: fd.mt_splits_for_rows(m, caps.mt_rows) for m in want}
+        plan = {m: s for m, s in plan.items() if s}
+        if plan:
+            dev = torch.device("cuda", torch.cuda.current_device())
+            self.mt_lens = torch.full((16,), TOPK, dtype=torch.int32, device=dev)
+        logger.info(
+            "NVIDIA megakernel: GLM-5.3 / GLM-5.2: sparse MLA on the multi-tile flash "
+            "decode at rows %s (CTAs per row %s; co-resident clusters %s) (%s)",
+            sorted(plan),
+            [plan[m] for m in sorted(plan)],
+            list(zip(fd.MT_SPLITS, caps.mt_rows)),
+            "target",
+        )
+        return plan
 
     def step_reasons(self, model, forward_batch, view) -> List[str]:
         """Host-only facts the attention kernels need beyond the stock copies
