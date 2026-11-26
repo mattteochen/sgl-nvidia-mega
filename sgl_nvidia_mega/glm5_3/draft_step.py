@@ -464,21 +464,41 @@ class FusedDraft:
             self._rp_why = "waiting for the target's hops"
 
     def eh_prepared(self, eh_input: torch.Tensor):
-        """``DRAFT_FRONT_ENV``: the row-parallel eh_proj summed through the draft layer's
-        input norm in the hop (``draft_attention.PreparedInput``), or None (the column
-        shard): an engaged step at ``ROWPAR_MIN_ROWS``-8 rows once the target's hops
-        serve the sum."""
+        """``DRAFT_FRONT_ENV``: eh_proj summed through the draft layer's input norm in
+        the hop (``draft_attention.PreparedInput``), or None:
+        * at ``ROWPAR_MIN_ROWS``-8 rows: row-parallel matmul + ``allreduce_rmsnorm``;
+        * at 1 row (when ``1 in self._eh``): column-sharded ``EhProjShard(1)`` into the
+          zero-padded buffer + ``allreduce_rmsnorm`` (eliminates the standalone draft
+          ``input_layernorm`` launch on every draft-decode step)."""
         rows = eh_input.shape[0]
         if (
             not self._rp_ready
             or not self.engaged()
-            or not ROWPAR_MIN_ROWS <= rows <= HOP_ROWS
+            or not 1 <= rows <= HOP_ROWS
             or not eh_input.is_contiguous()
         ):
             return None
-        part = torch.matmul(
-            eh_input[:, self._rp_win : self._rp_win + ROWPAR_WINDOW], self._rp_w.t()
-        )
+        if rows >= ROWPAR_MIN_ROWS:
+            part = torch.matmul(
+                eh_input[:, self._rp_win : self._rp_win + ROWPAR_WINDOW], self._rp_w.t()
+            )
+        elif rows in self._eh:
+            from cutlass import Int32, Int64
+
+            k, fn = self._eh[rows]
+            part = self._pad[:rows]
+            fn(
+                Int64(self.eh_weight.data_ptr()),
+                Int64(eh_input.data_ptr()),
+                Int64(part.data_ptr()),
+                Int32(self.n_local),
+                Int32(HIDDEN),
+                Int32(self.col_off),
+                Int32(k.grid(self.n_local)),
+                cu_stream(),
+            )
+        else:
+            return None
         out_res = torch.empty_like(part)
         out_norm = torch.empty_like(part)
         self._hops.allreduce_rmsnorm(
