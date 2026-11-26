@@ -260,7 +260,7 @@ class MoeGlue:
         for name in sorted({"route", "finalize"} | modes):
             kernel, args = self.specs[name]
             constexprs = {"unit": name, "shared": True}
-            if hasattr(kernel, "knobs"):  # the g4 engine's opt-in forms
+            if hasattr(kernel, "knobs"):  # the engines' opt-in forms
                 constexprs.update(kernel.knobs())
             self.fn[name] = compile_cached(
                 kernel,
@@ -380,5 +380,9 @@ def build(model, derived) -> Optional[MoeGlue]:
         "shared weight g1 %d, g2 %d",
         _moe_api.g12_schedule_knobs("g1")["shared_weight"],
         _moe_api.g12_schedule_knobs("g2")["shared_weight"],
+    )
+    logger.info(
+        "NVIDIA megakernel: GLM-5.3 / GLM-5.2: one- / two-request MoE engine form pre %d",
+        _moe_api.g12_knobs()["pre"],
     )
     return MoeGlue(api, layers, specs)
