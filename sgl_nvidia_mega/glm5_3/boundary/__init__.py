@@ -235,6 +235,14 @@ class HopFamily:
         megakernel_agree(
             kernels.fold_limits(), what="GLM-5.3 / GLM-5.2 split-fold row limits"
         )
+        if kernels.form:
+            # engagement line of the opt-in fold forms (the T90a in-job gate reads it)
+            logger.info(
+                "NVIDIA megakernel: GLM-5.3 / GLM-5.2: MoE fold forms %s "
+                "(split / cluster-free deferred-norm split row limits %s)",
+                ",".join(sorted(kernels.form)),
+                kernels.fold_limits()[:2],
+            )
         self.kernels = kernels
 
     def register_sites(self, names: dict) -> None:
