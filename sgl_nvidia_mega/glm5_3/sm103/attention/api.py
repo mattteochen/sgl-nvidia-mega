@@ -60,6 +60,8 @@ def compile_specs(
     prologue16_overlap: bool = False,
     prologue16_kv_split: bool = False,
     prologue8_overlap: bool = False,
+    prologue_push: bool = False,
+    prologue_f32x2: bool = False,
 ) -> dict[str, tuple]:
     """The attention units for row capacities ``caps`` and sparse-MLA warp counts
     ``warps``. ``numerics`` is the engine's ``PrologueNumerics`` value table and
@@ -77,7 +79,10 @@ def compile_specs(
     ``prologue16_kv_split`` builds ``prologue[_end].16`` with the kv cluster's rows
     8..15 on their own CTAs (same outputs).
     ``prologue8_overlap`` builds the 8-row prologues in the overlapped issue order
-    (``MlaPrologue(overlap8=True)``: same outputs)."""
+    (``MlaPrologue(overlap8=True)``: same outputs).
+    ``prologue_push`` / ``prologue_f32x2`` add the pushed q_nope hand-off / the packed
+    branch-free normalize to the overlapped forms (``MlaPrologue(push=True)`` /
+    ``f32x2=True``; same outputs)."""
     from .indexer_q_proj import IndexerQProj
     from .mla_prologue import MlaPrologue
     from .mla_uv_proj import MlaUvProj
@@ -106,6 +111,12 @@ def compile_specs(
         overlap8 = prologue8_overlap and cap == 8
         if overlap8:
             key["overlap8"] = True
+        ov = overlap8 or overlap16
+        push, f32x2 = bool(prologue_push and ov), bool(prologue_f32x2 and ov)
+        if push:
+            key["push"] = True
+        if f32x2:
+            key["f32x2"] = True
         specs[f"prologue.{cap}"] = (
             MlaPrologue(
                 cap,
@@ -116,6 +127,8 @@ def compile_specs(
                 overlap16=overlap16,
                 kv_split=kvs,
                 overlap8=overlap8,
+                push=push,
+                f32x2=f32x2,
             ),
             key,
             args["prologue"],
@@ -132,6 +145,8 @@ def compile_specs(
                     overlap16=overlap16,
                     kv_split=kvs,
                     overlap8=overlap8,
+                    push=push,
+                    f32x2=f32x2,
                 ),
                 {**key, "trigger_at_end": True},
                 args["prologue"],

@@ -72,6 +72,16 @@ def _stg_v4_if(addr, words, valid):
     return code, "l,r,r,r,r,r", (addr, *words, Int32(Boolean(valid)))
 
 
+@ptx.ptx_arith((Float32, Float32))
+def _mul_f32x2(a0, a1, b0, b1):
+    """``mul.rn.f32x2``: (a0 b0, a1 b1), each rounded to nearest as ``mul.rn.f32``."""
+    code = (
+        "{ .reg .b64 a, b, d; mov.b64 a, {$2, $3}; mov.b64 b, {$4, $5}; "
+        "mul.rn.f32x2 d, a, b; mov.b64 {$0, $1}, d; }"
+    )
+    return code, "=f,=f,f,f,f,f", (a0, a1, b0, b1)
+
+
 # probe builds (benchmarks only): per CTA, PROBE_MARKS x {clock64, globaltimer} u64 slots
 PROBE_MARKS = 16
 
@@ -223,7 +233,7 @@ RED_UK_ROW = 64 + 4
 RED16O_BYTES = 8 * 2 * 8 * RED_QB_ROW * 4  # 18,432 (the absorb partials: 8,704)
 
 
-def layout(max_rows, overlap16=False):
+def layout(max_rows, overlap16=False, push=False):
     off = {"wqb": 0, "wuk": WQB_BYTES}
     off["xs"] = off["wuk"] + WUK_BYTES
     if max_rows == 8:
@@ -231,6 +241,14 @@ def layout(max_rows, overlap16=False):
         off["qn"] = off["pub"] + max_rows * 32 * 2
         off["red"] = off["qn"] + max_rows * QN_STRIDE
         off["ssq"] = off["red"] + 8 * 2 * 32 * 16
+    elif push:
+        # 16 rows, pushed hand-off: peers write the q_nope rows (QN) as soon as their
+        # own partials are summed, so QN cannot alias this CTA's token rows; the
+        # partials still do (no published rows: no PUB region)
+        off["red"] = off["xs"]
+        off["qn"] = off["xs"] + max_rows * XS_STRIDE
+        off["pub"] = off["qn"]
+        off["ssq"] = off["qn"] + max_rows * QN_STRIDE
     else:
         # 16 rows: the partials and the gathered q_nope rows alias the token rows,
         # which are dead once the q_b products are done (a CTA barrier separates them)
@@ -268,6 +286,8 @@ class MlaPrologue:
         overlap8: bool = False,
         kv_split: bool = False,
         probe: bool = False,
+        push: bool = False,
+        f32x2: bool = False,
     ):
         if max_rows not in (8, 16):
             raise ValueError(f"max_rows must be 8 or 16, got {max_rows}")
@@ -283,6 +303,13 @@ class MlaPrologue:
         self.kv_split = kv_split
         # benchmark builds: phase timestamps to the top-k pointer (shared layers only)
         self.probe = probe
+        if (push or f32x2) and not (overlap8 or overlap16):
+            raise ValueError("push / f32x2 apply to the overlap8 / overlap16 forms")
+        # push: the q_nope hand-off as st.async pushes into every rank's QN rows,
+        # completing on its mbarrier (no release barrier, no remote gather)
+        self.push = push
+        # f32x2: the q_a normalize branch-free with packed f32x2 multiplies
+        self.f32x2 = f32x2
         self.num = numerics
         self.rope_cache_fp32 = rope_cache_fp32
         self.index_rope_cache_fp32 = index_rope_cache_fp32
@@ -292,7 +319,7 @@ class MlaPrologue:
             )
         self.index_scale_ue8m0x4 = index_scale_ue8m0x4
         self.trigger_at_end = trigger_at_end
-        self.off = layout(max_rows, overlap16)
+        self.off = layout(max_rows, overlap16, push)
         if overlap8:
             self.off = layout_overlap8(self.off)
 
@@ -875,8 +902,11 @@ class MlaPrologue:
         strided = self.num.norm_order == "strided_8x256"
         # constant weights: q_b slice (two 64 KiB halves) + W_UK^T slice (24 KiB),
         # before the PDL wait
+        qbar = bar + 8  # push: this CTA's QN barrier
         if tid == 0:
             ptx.mbarrier_init(bar, 1)
+            if cutlass.const_expr(self.push):
+                ptx.mbarrier_init(qbar, 1)
             ptx.fence_mbarrier_init_release_cluster()
             ptx.fence_proxy_async_shared_cta()
             ptx.mbarrier_arrive_expect_tx(bar, WQB_BYTES + WUK_BYTES)
@@ -890,9 +920,17 @@ class MlaPrologue:
                     bar,
                 )
             ptx.bulk_copy_g2s(base + off["wuk"], src_uk, WUK_BYTES, bar)
+            if cutlass.const_expr(self.push):
+                # every q_nope rank's rows of this CTA: 6 x rows x 64 bytes
+                ptx.mbarrier_arrive_expect_tx(
+                    qbar, (NOPE // 32) * 64 * rows, ".release.cluster"
+                )
         qw = ptx.ld_global_nc_v4(q_norm_w + Int64(tid) * 16)
         inv_qs = ptx.rcp_rn(ptx.ld_global_nc_f32(q_scale))
         ptx.sync_threads()
+        if cutlass.const_expr(self.push):
+            # co-start: every peer's QN barrier exists before this CTA pushes
+            ptx.cluster_arrive_relaxed()
 
         self.wait_q_inputs()
 
@@ -903,11 +941,19 @@ class MlaPrologue:
         pos = self.p8_ldg_s64_if(positions + Int64(tid // 32) * 8, rope_ok)
         qv = []
         for n in cutlass.range_constexpr(max_rows):
-            qv.append(
-                self.load16(
-                    q_c + (Int64(n) * q_c_stride + Int64(tid * 8)) * 2, n < rows
+            if cutlass.const_expr(self.f32x2):
+                # rows predicated, not branched
+                qv.append(
+                    ptx.ld_global_v4_if(
+                        q_c + (Int64(n) * q_c_stride + Int64(tid * 8)) * 2, n < rows
+                    )
                 )
-            )
+            else:
+                qv.append(
+                    self.load16(
+                        q_c + (Int64(n) * q_c_stride + Int64(tid * 8)) * 2, n < rows
+                    )
+                )
         pr = ((r - NOPE // 32) * 32 + lane) // 2
         rope_c, rope_s = self.p8_rope_at(rope_ok, pos, pr, rope_cache, rope_stride)
         if cutlass.const_expr(strided):
@@ -935,7 +981,26 @@ class MlaPrologue:
                         _lds_f32_pred(s_ssq + (w * max_rows + n) * 4, n < rows)
                     )
                 ss.append(part)
-        for n in cutlass.range_constexpr(max_rows):
+        qc_on = (qc_out != Int64(0)) & (h == 0) & (r == 0)
+        for n in cutlass.range_constexpr(max_rows if self.f32x2 else 0):
+            # f32x2: every row computed (an unused row is never stored), stores
+            # predicated: no per-row branch; the multiplies packed
+            # (own names: the DSL types a name over the whole function, not per trace)
+            snf = Float32(0.0)
+            if cutlass.const_expr(strided):
+                snf = ss[n]
+            else:
+                for w in cutlass.range_constexpr(8):
+                    snf = ptx.add_rn(snf, ss[n][w])
+            rrf = ptx.rsqrt_approx(ptx.fma_rn(snf, Float32(1.0 / Q_LORA), q_eps))
+            pkf = self.norm_words(qv[n], rrf, wv)
+            _sts_v4_if(s_xs + n * XS_STRIDE + tid * 16, pkf, n < rows)
+            _stg_v4_if(
+                qc_out + (Int64(n) * qc_out_stride + Int64(tid * 8)) * 2,
+                pkf,
+                qc_on & (n < rows),
+            )
+        for n in cutlass.range_constexpr(0 if self.f32x2 else max_rows):
             if n < rows:
                 sn = Float32(0.0)
                 if cutlass.const_expr(strided):
@@ -1011,17 +1076,25 @@ class MlaPrologue:
         for w in cutlass.range_constexpr(8):
             v = ptx.add_rn(v, parts[w])
         qb = ptx.cvt_rn_bf16_f32(v)
-        if r < NOPE // 32:
-            if red_ok:
-                ptx.st_shared_b16(s_pub + (n * 32 + rho) * 2, qb)
+        if cutlass.const_expr(self.push):
+            ptx.cluster_wait_acquire()  # co-start
+            self.push_qnope(base, qbar, r, n, lane, qb, (r < NOPE // 32) & red_ok)
+        else:
+            if r < NOPE // 32:
+                if red_ok:
+                    ptx.st_shared_b16(s_pub + (n * 32 + rho) * 2, qb)
         # the RoPE ranks keep their FP8 q_pe byte (stored at the end)
         rope_b = self.p8_q_rope_byte(
             is_rope, (r - NOPE // 32) * 32 + rho, qb, rope_c, rope_s, inv_qs
         )
         # q_nope hand-off: ranks 0..5 published 32 rows each
-        self.handoff(base, tid, rows)
-        self.done_reading()
-        ptx.sync_threads()
+        if cutlass.const_expr(self.push):
+            ptx.mbarrier_wait_parity(qbar, 0, ".acquire.cluster")
+            ptx.cluster_arrive_relaxed()  # exit: waited before this CTA leaves
+        else:
+            self.handoff(base, tid, rows)
+            self.done_reading()
+            ptx.sync_threads()
         # W_UK absorb: rows l in [64 r, 64 r + 64) (4 tiles), K = 192 (6 k-steps); warp
         # -> (tile w % 4, half w // 4)
         tile = warp % 4
@@ -1479,8 +1552,11 @@ class MlaPrologue:
         s_qn = base + off["qn"]
         strided = self.num.norm_order == "strided_8x256"
         self.mark(0, tid)
+        qbar = bar + 8  # push: this CTA's QN barrier
         if tid == 0:
             ptx.mbarrier_init(bar, 1)
+            if cutlass.const_expr(self.push):
+                ptx.mbarrier_init(qbar, 1)
             ptx.fence_mbarrier_init_release_cluster()
             ptx.fence_proxy_async_shared_cta()
             ptx.mbarrier_arrive_expect_tx(bar, WQB_BYTES + WUK_BYTES)
@@ -1494,9 +1570,17 @@ class MlaPrologue:
                     bar,
                 )
             ptx.bulk_copy_g2s(base + off["wuk"], src_uk, WUK_BYTES, bar)
+            if cutlass.const_expr(self.push):
+                # every q_nope rank's rows of this CTA: 6 x rows x 64 bytes
+                ptx.mbarrier_arrive_expect_tx(
+                    qbar, (NOPE // 32) * 64 * rows, ".release.cluster"
+                )
         qw = ptx.ld_global_nc_v4(q_norm_w + Int64(tid) * 16)
         inv_qs = ptx.rcp_rn(ptx.ld_global_nc_f32(q_scale))
         ptx.sync_threads()
+        if cutlass.const_expr(self.push):
+            # co-start: every peer's QN barrier exists before this CTA pushes
+            ptx.cluster_arrive_relaxed()
         self.mark(1, tid)
 
         self.wait_q_inputs()
@@ -1567,16 +1651,7 @@ class MlaPrologue:
             qc_on = (qc_out != Int64(0)) & (h == 0) & (r == 0)
             for n in cutlass.range_constexpr(max_rows):
                 rr = ptx.rsqrt_approx(ptx.fma_rn(ss[n], Float32(1.0 / Q_LORA), q_eps))
-                words = []
-                for e in cutlass.range_constexpr(4):
-                    x0, x1 = ptx.bf16x2_to_f32x2(raw[n][e])
-                    words.append(
-                        ptx.cvt_rn_bf16x2_f32(
-                            ptx.mul_rn(ptx.mul_rn(x0, rr), wv[2 * e]),
-                            ptx.mul_rn(ptx.mul_rn(x1, rr), wv[2 * e + 1]),
-                        )
-                    )
-                packed = (words[0], words[1], words[2], words[3])
+                packed = self.norm_words(raw[n], rr, wv)
                 _sts_v4_if(s_xs + n * XS_STRIDE + tid * 16, packed, n < rows)
                 _stg_v4_if(
                     qc_out + (Int64(n) * qc_out_stride + Int64(tid * 8)) * 2,
@@ -1667,6 +1742,8 @@ class MlaPrologue:
         # q_nope ranks publish their BF16 rows; the RoPE ranks keep their FP8 q_pe bytes
         # in registers and store them with the absorbed columns at the end, so no global
         # store is outstanding at the cluster barriers' release
+        if cutlass.const_expr(self.push):
+            ptx.cluster_wait_acquire()  # co-start
         qbs = []
         for it in cutlass.range_constexpr(2):
             idx = tid + THREADS * it
@@ -1676,35 +1753,38 @@ class MlaPrologue:
             for w in cutlass.range_constexpr(8):
                 v = ptx.add_rn(v, parts[it][w])
             qb = ptx.cvt_rn_bf16_f32(v)
-            if r < NOPE // 32:
-                if idx < 32 * rows:
-                    ptx.st_shared_b16(s_pub + (n * 32 + rho) * 2, qb)
+            if cutlass.const_expr(self.push):
+                self.push_qnope(
+                    base, qbar, r, n, lane, qb, (r < NOPE // 32) & (idx < 32 * rows)
+                )
+            else:
+                if r < NOPE // 32:
+                    if idx < 32 * rows:
+                        ptx.st_shared_b16(s_pub + (n * 32 + rho) * 2, qb)
             qbs.append(qb)
         self.mark(9, tid)
-        self.publish()
-        self.mark(10, tid)
-        gv = []
-        for it in cutlass.range_constexpr(2):
-            gv.append(self.gather_load(base, tid + THREADS * it, rows))
-        # the RoPE ranks' q_pe bytes after the hand-off (they take no part in it), while
-        # the remote loads are in flight
-        rope_b = []
-        for it in cutlass.range_constexpr(2):
-            rope_b.append(
-                self.q_rope_byte(
-                    r >= NOPE // 32,
-                    (r - NOPE // 32) * 32 + (tid + THREADS * it) % 32,
-                    qbs[it],
-                    rope_c[it],
-                    rope_s[it],
-                    inv_qs,
+        if cutlass.const_expr(self.push):
+            rope_b = []
+            for it in cutlass.range_constexpr(2):
+                rope_b.append(
+                    self.q_rope_byte(
+                        r >= NOPE // 32,
+                        (r - NOPE // 32) * 32 + (tid + THREADS * it) % 32,
+                        qbs[it],
+                        rope_c[it],
+                        rope_s[it],
+                        inv_qs,
+                    )
                 )
+            self.mark(10, tid)
+            ptx.mbarrier_wait_parity(qbar, 0, ".acquire.cluster")
+            ptx.cluster_arrive_relaxed()  # exit: waited before this CTA leaves
+            self.mark(11, tid)
+        else:
+            rb0, rb1 = self.handoff16o(
+                base, tid, rows, r, qbs, rope_c, rope_s, inv_qs
             )
-        for it in cutlass.range_constexpr(2):
-            self.gather_store(base, tid + THREADS * it, rows, gv[it])
-        self.done_reading()
-        ptx.sync_threads()
-        self.mark(11, tid)
+            rope_b = [rb0, rb1]
         tile = warp % 4
         half = warp // 4
         cw = [z4, z4]
@@ -1834,6 +1914,79 @@ class MlaPrologue:
                 a = self._probe_base + Int64((Int32(cta_) * PROBE_MARKS + k) * 16)
                 ptx.st_global_u64(a, _clock64())
                 ptx.st_global_u64(a + Int64(8), ptx_sys.globaltimer())
+
+    @cute.jit
+    def handoff16o(self, base: Int32, tid: Int32, rows: Int32, r: Int32, qbs, rope_c, rope_s, inv_qs: Float32):
+        """overlap16 without push: the cluster-barrier hand-off (publish, both gather
+        slots' remote loads, the RoPE ranks' q_pe bytes while they are in flight, the
+        local stores, done reading); returns the q_pe bytes."""
+        self.publish()
+        self.mark(10, tid)
+        gv = []
+        for it in cutlass.range_constexpr(2):
+            gv.append(self.gather_load(base, tid + THREADS * it, rows))
+        rope_b = []
+        for it in cutlass.range_constexpr(2):
+            rope_b.append(
+                self.q_rope_byte(
+                    r >= NOPE // 32,
+                    (r - NOPE // 32) * 32 + (tid + THREADS * it) % 32,
+                    qbs[it],
+                    rope_c[it],
+                    rope_s[it],
+                    inv_qs,
+                )
+            )
+        for it in cutlass.range_constexpr(2):
+            self.gather_store(base, tid + THREADS * it, rows, gv[it])
+        self.done_reading()
+        ptx.sync_threads()
+        self.mark(11, tid)
+        return rope_b[0], rope_b[1]
+
+    @cute.jit
+    def push_qnope(
+        self, base: Int32, qbar: Int32, r: Int32, n: Int32, lane: Int32, qb, valid
+    ):
+        """push: a warp's 32 q_nope values of row n (lane = column) to every rank's QN
+        row n, columns 32 r ..: lane pairs packed by a shuffle, 8-value chunks by four,
+        then lane l stores chunk l / 8 to rank l % 8 (one st.async.v4 each),
+        completing on that rank's QN barrier. ``valid`` is warp-uniform."""
+        q32 = Uint32(qb)
+        pk = q32 | (Uint32(cute.arch.shuffle_sync_bfly(q32, 1)) << Uint32(16))
+        c = lane // 8
+        w0 = Uint32(cute.arch.shuffle_sync(pk, 8 * c))
+        w1 = Uint32(cute.arch.shuffle_sync(pk, 8 * c + 2))
+        w2 = Uint32(cute.arch.shuffle_sync(pk, 8 * c + 4))
+        w3 = Uint32(cute.arch.shuffle_sync(pk, 8 * c + 6))
+        if valid:
+            d = lane % 8
+            raddr = ptx.mapa_shared_cluster(
+                base + self.off["qn"] + n * QN_STRIDE + r * 64 + c * 16, d
+            )
+            ptx.st_async_v4_b32(
+                raddr, w0, w1, w2, w3, ptx.mapa_shared_cluster(qbar, d)
+            )
+
+    @cute.jit
+    def norm_words(self, raw, rr: Float32, wv):
+        """A row's 8 normalized q_a values (bf16(x rr w), the products rounded as
+        head_cta's), as 4 BF16x2 words; f32x2: the multiplies packed."""
+        words = []
+        for e in cutlass.range_constexpr(4):
+            x0, x1 = ptx.bf16x2_to_f32x2(raw[e])
+            if cutlass.const_expr(self.f32x2):
+                a0, a1 = _mul_f32x2(x0, x1, rr, rr)
+                y0, y1 = _mul_f32x2(a0, a1, wv[2 * e], wv[2 * e + 1])
+                words.append(ptx.cvt_rn_bf16x2_f32(y0, y1))
+            else:
+                words.append(
+                    ptx.cvt_rn_bf16x2_f32(
+                        ptx.mul_rn(ptx.mul_rn(x0, rr), wv[2 * e]),
+                        ptx.mul_rn(ptx.mul_rn(x1, rr), wv[2 * e + 1]),
+                    )
+                )
+        return words[0], words[1], words[2], words[3]
 
     @cute.jit
     def store_normed(
