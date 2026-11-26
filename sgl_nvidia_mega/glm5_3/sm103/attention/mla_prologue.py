@@ -51,9 +51,18 @@ from dataclasses import dataclass
 import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
-from cutlass import Boolean, Float32, Int32, Int64, Uint32
+from cutlass import Boolean, Float32, Int32, Int64, Uint32, Uint64
 
 from ..primitives import ptx_core as ptx
+from ..primitives import ptx_sys
+
+# probe builds (benchmarks only): per CTA, PROBE_MARKS x {clock64, globaltimer} u64 slots
+PROBE_MARKS = 16
+
+
+@ptx.ptx_op(Uint64)
+def _clock64():
+    return "mov.u64 $0, %clock64;", "=l", ()
 
 
 @ptx.ptx_op(Float32)
@@ -200,6 +209,7 @@ class MlaPrologue:
         trigger_at_end: bool = False,
         overlap16: bool = False,
         kv_split: bool = False,
+        probe: bool = False,
     ):
         if max_rows not in (8, 16):
             raise ValueError(f"max_rows must be 8 or 16, got {max_rows}")
@@ -210,6 +220,8 @@ class MlaPrologue:
         self.max_rows = max_rows
         self.overlap16 = overlap16
         self.kv_split = kv_split
+        # benchmark builds: phase timestamps to the top-k pointer (shared layers only)
+        self.probe = probe
         self.num = numerics
         self.rope_cache_fp32 = rope_cache_fp32
         self.index_rope_cache_fp32 = index_rope_cache_fp32
@@ -381,6 +393,8 @@ class MlaPrologue:
             ptx.pdl_launch_dependents()
         cluster_id = cta // CLUSTER
         r = cta % CLUSTER
+        if cutlass.const_expr(self.probe):
+            self._probe_base = topk
         if cluster_id < HEADS:
             if cutlass.const_expr(self.overlap16):
                 self.head_cta16o(
@@ -449,6 +463,7 @@ class MlaPrologue:
                     qc_out_stride,
                 )
         else:
+            self.mark(0, tid)
             self.kv_cta(
                 r,
                 tid,
@@ -484,6 +499,7 @@ class MlaPrologue:
                 topk_stride,
                 topk_width,
             )
+            self.mark(13, tid)
             self.release_outputs()
         if cutlass.const_expr(self.trigger_at_end):
             ptx.pdl_launch_dependents()
@@ -1064,6 +1080,7 @@ class MlaPrologue:
         s_pub = base + off["pub"]
         s_qn = base + off["qn"]
         strided = self.num.norm_order == "strided_8x256"
+        self.mark(0, tid)
         if tid == 0:
             ptx.mbarrier_init(bar, 1)
             ptx.fence_mbarrier_init_release_cluster()
@@ -1082,8 +1099,10 @@ class MlaPrologue:
         qw = ptx.ld_global_nc_v4(q_norm_w + Int64(tid) * 16)
         inv_qs = ptx.rcp_rn(ptx.ld_global_nc_f32(q_scale))
         ptx.sync_threads()
+        self.mark(1, tid)
 
         self.wait_q_inputs()
+        self.mark(2, tid)
 
         # RoPE CTAs: the two (token, pair) slots' positions first, then the q rows, then
         # the cos / sin loads that need the positions
@@ -1117,6 +1136,7 @@ class MlaPrologue:
         for n in cutlass.range_constexpr(max_rows):
             if n < rows:
                 ptx.st_shared_v4(s_xs + n * XS_STRIDE + tid * 16, qv[n])
+        self.mark(3, tid)
         if cutlass.const_expr(strided):
             ptx.sync_threads()
             if warp + 8 < rows:
@@ -1127,6 +1147,7 @@ class MlaPrologue:
         else:
             self.q_norm_sums_contiguous(s_ssq, qv, warp, lane, rows)
         ptx.sync_threads()
+        self.mark(4, tid)
         wv = []
         for e in cutlass.range_constexpr(4):
             lo, hi = ptx.bf16x2_to_f32x2(qw[e])
@@ -1165,8 +1186,10 @@ class MlaPrologue:
                         s_xs, raw_n, rr, wv, n, tid, h, r, qc_out, qc_out_stride
                     )
         ptx.sync_threads()
+        self.mark(5, tid)
 
         self.wait_weights(bar)
+        self.mark(6, tid)
 
         g = lane // 4
         t = lane % 4
@@ -1193,6 +1216,7 @@ class MlaPrologue:
                     )
         # the partials reuse the token rows: every warp must be done reading them
         self.rows_dead()
+        self.mark(7, tid)
         # each accumulator to its (warp, token tile, token, q_b row) word: the C fragment
         # holds rows g / g + 8 of tile j, tokens 2 t / 2 t + 1 (no bank conflict)
         for j in cutlass.range_constexpr(2):
@@ -1211,6 +1235,7 @@ class MlaPrologue:
                         cc[e],
                     )
         self.sync_partials()
+        self.mark(8, tid)
         # both (row, column) slots' partials first (a warp reads 32 consecutive words),
         # then the sums in warp order
         parts = []
@@ -1253,7 +1278,9 @@ class MlaPrologue:
                     inv_qs,
                 )
             )
+        self.mark(9, tid)
         self.publish()
+        self.mark(10, tid)
         gv = []
         for it in cutlass.range_constexpr(2):
             gv.append(self.gather_load(base, tid + THREADS * it, rows))
@@ -1261,6 +1288,7 @@ class MlaPrologue:
             self.gather_store(base, tid + THREADS * it, rows, gv[it])
         self.done_reading()
         ptx.sync_threads()
+        self.mark(11, tid)
         tile = warp % 4
         half = warp // 4
         cw = [z4, z4]
@@ -1296,6 +1324,7 @@ class MlaPrologue:
                     cw[tt][e],
                 )
         self.sync_partials()
+        self.mark(12, tid)
         nk = (64 * max_rows + THREADS - 1) // THREADS
         pa = []
         pb = []
@@ -1347,8 +1376,10 @@ class MlaPrologue:
                         + Int64(h * MQA_DIM + KV_LORA + d),
                         rope_b[it],
                     )
+        self.mark(13, tid)
         self.release_outputs()
         self.exit_wait()
+        self.mark(14, tid)
 
     @cute.jit
     def q_rope_byte(
@@ -1377,6 +1408,16 @@ class MlaPrologue:
                 Uint32(ptx.cvt_rn_satfinite_e4m3x2_f32(o, Float32(0.0))) & Uint32(0xFF)
             )
         return byte
+
+    @cute.jit
+    def mark(self, k: cutlass.Constexpr[int], tid: Int32):
+        """Probe builds: thread 0 stores {clock64, globaltimer} to slot k of its CTA."""
+        if cutlass.const_expr(self.probe):
+            if tid == 0:
+                cta_, _, _ = cute.arch.block_idx()
+                a = self._probe_base + Int64((Int32(cta_) * PROBE_MARKS + k) * 16)
+                ptx.st_global_u64(a, _clock64())
+                ptx.st_global_u64(a + Int64(8), ptx_sys.globaltimer())
 
     @cute.jit
     def store_normed(
