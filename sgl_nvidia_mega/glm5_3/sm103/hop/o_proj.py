@@ -91,7 +91,14 @@ class OProjArProduce(Transport):
 
     sync_ctas = 1  # the start-edge synchronization CTA
 
-    def __init__(self, *, router: bool = False, max_rows: int = 8):
+    def __init__(
+        self,
+        *,
+        router: bool = False,
+        max_rows: int = 8,
+        async_stage: bool = False,
+        epoch_overlap: bool = False,
+    ):
         if max_rows not in (8, 16) or (max_rows == 16 and not router):
             raise ValueError(
                 "provided for up to 8 rows, or up to 16 rows with the router"
@@ -100,9 +107,17 @@ class OProjArProduce(Transport):
         # rows 9..16: a second n8 token tile per mma (same A fragments, same k order),
         # and the
         # activations staged by 16-byte cp.async copies (one wait before the epoch
-        # barrier)
+        # barrier); ``async_stage``: the copies also up to 8 rows (opt-in form: every
+        # copy of a thread in flight at once instead of one load -> store at a time;
+        # the same bytes land in shared memory)
         self.two_tiles = max_rows == 16
-        self.async_stage = max_rows == 16
+        self.async_stage = max_rows == 16 or async_stage
+        if epoch_overlap and self.async_stage:
+            # opt-in form: the copies are awaited inside the epoch read, after its
+            # control loads were issued (the served forms keep their attributes)
+            self.epoch_overlap = True
+
+    epoch_overlap = False
 
     def smem_bytes(self):
         gemv = (
@@ -132,7 +147,7 @@ class OProjArProduce(Transport):
 
     @cute.jit
     def stage_done(self):
-        if cutlass.const_expr(self.async_stage):
+        if cutlass.const_expr(self.async_stage and not self.epoch_overlap):
             # this thread's copies landed; the epoch barrier publishes them
             sys_ops.cp_async_wait_all()
 
@@ -334,7 +349,8 @@ class OProjArProduce(Transport):
             if t < 8:
                 # a slow GEMV CTA between its trigger and its read of E
                 self.delay(mb, 6)
-        self.epoch_begin(mb, es, True)  # its CTA barrier also covers the staging
+        # its CTA barrier also covers the staging
+        self.epoch_begin(mb, es, True, 0, self.epoch_overlap)
         pz = es.pz[0]
         c0 = Float32(0.0)
         c1 = Float32(0.0)
@@ -501,7 +517,7 @@ class OProjArProduce(Transport):
             self.stage16(xs_base + Uint32(2 * (mm * RXS_STRIDE + kc * 8)), src)
             i = i + GEMV_THREADS
         self.stage_done()
-        self.epoch_begin(mb, es, True)
+        self.epoch_begin(mb, es, True, 0, self.epoch_overlap)
         hi0 = Float32(0.0)
         hi1 = Float32(0.0)
         hi2 = Float32(0.0)

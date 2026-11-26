@@ -179,11 +179,14 @@ class Transport:
         es: EpochSmem,
         check: cutlass.Constexpr[bool],
         rt0: cutlass.Constexpr[int] = 0,
+        async_wait: cutlass.Constexpr[bool] = False,
     ) -> Uint32:
         """Every thread, after ``griddepcontrol.wait``. Threads ``rt0 .. rt0 + 7`` read
         ``E`` and one row epoch each (rows ``max_rows`` > 8 use threads ``rt0 .. rt0 +
         max_rows - 1``), thread ``rt0`` the error word, and (``check``) acquire the
-        acknowledgement of rank ``t - rt0``; the CTA barrier publishes the snapshot."""
+        acknowledgement of rank ``t - rt0``; the CTA barrier publishes the snapshot
+        (``async_wait``: and the threads' ``cp.async`` copies, awaited just before
+        it)."""
         t = P.thread_index() - rt0
         nread: cutlass.Constexpr = max(WORLD, mb.max_rows)
         if t >= 0 and t < nread:
@@ -223,6 +226,9 @@ class Transport:
                                     t0 = now
                                 elif now - t0 > Uint64(self.timeout_ns):
                                     self.fail(mb, ERR_ACK_WAIT, 2, t, 0, e)
+        if cutlass.const_expr(async_wait):
+            # the caller's cp.async copies, which this barrier publishes
+            sys_ops.cp_async_wait_all()
         cute.arch.sync_threads()
         return es.e[0]
 

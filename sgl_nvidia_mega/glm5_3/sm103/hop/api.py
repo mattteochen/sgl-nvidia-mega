@@ -13,6 +13,9 @@
 * ``HopKernels``: the compiled units with the mailboxes of one tensor-parallel group,
   called with torch tensors; it chooses the fold form for a row count from the
   cooperative occupancy.
+* ``oproj_async_min_rows()`` / ``oproj_async_specs()``: the opt-in o_proj producer
+  forms that stage the activations with ``cp.async`` up to 8 rows, awaited inside the
+  epoch read (same outputs), and the row count from which ``HopKernels`` serves them.
 
 ``SGLANG_NVIDIA_MEGAKERNEL_GLM_HOP16_ROUTER_ROWS=1`` (read by ``unit_specs``, i.e. at
 build): the 9..16-row routing o_proj producer (mailbox instance B) stores its router
@@ -88,6 +91,21 @@ def fold_units(form=None) -> dict:
     if "split8dn" in form:
         units["moe_fold_split_dn_nc"] = MoeFoldArNormDn(split=True, nocluster=True)
     return units
+# From this row count on (up to 8 rows; unset or 0: off), the o_proj hop's producer is
+# the form that stages its activations with cp.async (every copy of a thread in flight
+# at once, awaited after the epoch read's control loads are issued; the same bytes, the
+# same outputs): units o_proj_produce[_router]_as.
+OPROJ_ASYNC_STAGE_MIN_ROWS_ENV = (
+    "SGLANG_NVIDIA_MEGAKERNEL_GLM_OPROJ_ASYNC_STAGE_MIN_ROWS"
+)
+
+
+def oproj_async_min_rows() -> int:
+    """The row count from which the async-staging producer forms serve (0: off)."""
+    value = int(os.environ.get(OPROJ_ASYNC_STAGE_MIN_ROWS_ENV, "0") or "0")
+    if not 0 <= value <= 8:
+        raise ValueError(f"{OPROJ_ASYNC_STAGE_MIN_ROWS_ENV}={value}: expected 0..8")
+    return value
 
 
 def hop16_router_rows(value=None) -> bool:
@@ -276,6 +294,24 @@ def unit_specs(
     return specs
 
 
+def oproj_async_specs():
+    """The opt-in producer forms (up to 8 rows) that stage the activations with
+    ``cp.async``, awaited inside the epoch read: ``o_proj_produce_as`` and
+    ``o_proj_produce_router_as``."""
+    return [
+        UnitSpec(
+            "o_proj_produce_as",
+            OProjArProduce(async_stage=True, epoch_overlap=True),
+            _args_produce(),
+        ),
+        UnitSpec(
+            "o_proj_produce_router_as",
+            OProjArProduce(router=True, async_stage=True, epoch_overlap=True),
+            _args_produce(),
+        ),
+    ]
+
+
 def _version(text, prefix):
     """(major, minor) of the first ``<prefix>X.Y`` in ``text``, else None."""
     i = text.find(prefix)
@@ -356,6 +392,8 @@ class HopKernels:
     # SPLIT8DN_MIN_ROWS rows; 0: not served)
     split8dn_rows: int = 0
     form: frozenset = frozenset()
+    # the async-staging producer forms serve from this row count on (0: off)
+    async_min_rows: int = 0
     _peers: dict = field(default_factory=dict)
 
     @classmethod
@@ -401,6 +439,7 @@ class HopKernels:
         self.form = fold_form()
         if "split8dn" in self.form and "moe_fold_split_dn_nc" in compiled:
             self.split8dn_rows = _split8_rows(device_index)
+        self.async_min_rows = oproj_async_min_rows()
         return self
 
     def fold_limits(self):
@@ -418,6 +457,13 @@ class HopKernels:
         if rows <= self.split_max_rows:
             return "moe_fold_split_dn"
         return "moe_fold_plain_dn"
+
+    def _producer(self, name, rows):
+        """The producer unit ``name`` serves ``rows``: its async-staging form from
+        ``async_min_rows`` up to 8 rows, when compiled."""
+        if 1 <= self.async_min_rows <= rows <= 8 and f"{name}_as" in self.compiled:
+            return self.compiled[f"{name}_as"]
+        return self.compiled[name]
 
     def reset(self):
         """Collective. Re-initialize the mailboxes and zero the router-partial words
@@ -526,7 +572,7 @@ class HopKernels:
         rows = Int32(x.shape[0])
         pr = self._rot(mb.peers, mb.rank)
         z = Int64(0)
-        self.compiled["o_proj_produce"](
+        self._producer("o_proj_produce", x.shape[0])(
             _p(x), _p(w_o), z, z, z, rows, *pr, *[z] * WORLD, *self._tail(mb, site)
         )
         self.compiled["o_proj_consume"](
@@ -554,7 +600,7 @@ class HopKernels:
         assert mb is not None, "hop mailbox instance B (9..16 rows) was not built"
         sfx = "16" if big else ""
         pr = self._rot(mb.peers, mb.rank)
-        self.compiled["o_proj_produce_router" + sfx](
+        self._producer("o_proj_produce_router" + sfx, rows)(
             _p(x),
             _p(w_o),
             _p(qh),
