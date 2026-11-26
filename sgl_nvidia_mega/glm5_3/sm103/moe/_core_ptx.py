@@ -7,7 +7,7 @@ then import it from there."""
 
 from __future__ import annotations
 
-from cutlass import Float32, Int32, Int64, Uint16, Uint32
+from cutlass import Float32, Int32, Int64, Uint16, Uint32, Uint64
 
 from ..primitives.ptx_core import ptx_arith, ptx_op
 
@@ -252,3 +252,25 @@ def st_async_v4_f32(remote, remote_bar, a, b, c, d):
             Float32(d),
         ),
     )
+
+
+# ------------------------------------------- L2 prefetch, trace counters (side-effecting)
+
+
+@ptx_op()
+def tma_prefetch_3d(tmap, x, y, z):
+    """L2 prefetch of one 3D tensor-map box (a hint; no output depends on it)."""
+    code = "cp.async.bulk.prefetch.tensor.3d.L2.global.tile [$0, {$1, $2, $3}];"
+    return code, "l,r,r,r", (Int64(tmap), Int32(x), Int32(y), Int32(z))
+
+
+@ptx_op(Uint64)
+def globaltimer():
+    """``%globaltimer`` (ns; trace builds only)."""
+    return "mov.u64 $0, %globaltimer;", "=l", ()
+
+
+@ptx_op()
+def red_add_u64(address, value):
+    """Relaxed GPU-scope ``red.add.u64`` into a global word (trace builds only)."""
+    return "red.global.add.u64 [$0], $1;", "l,l", (Int64(address), Uint64(value))

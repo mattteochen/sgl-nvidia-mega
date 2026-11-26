@@ -95,6 +95,7 @@ OFF_H = OFF_RECV + RECV_BUFS * RECV_BUF
 OFF_HBF = OFF_H + H_BUFS * H_BUF
 OFF_MISC = OFF_HBF + HBF_BYTES
 SMEM = 223664  # one CTA per SM
+SMEM_MAX = 232448  # sm_100 / sm_103 / sm_107 opt-in maximum per block
 
 MAX_UNITS = 17
 MAX_LIST = 128
@@ -156,16 +157,146 @@ UNIT_BYTES = U_SLOT + N
 assert OFF_MISC + M_UNITS + MAX_UNITS * UNIT_BYTES + 1024 <= SMEM
 
 
+def g4_layout(recv_bufs: int = RECV_BUFS, lookahead: int = LOOKAHEAD) -> dict:
+    """Shared-memory offsets, barrier block and size of a (receive buffers, FC2
+    lookahead) choice; the defaults give exactly the module constants above."""
+    if not 2 <= recv_bufs <= 8 or not 1 <= lookahead <= 4:
+        raise ValueError(f"engine16: recv_bufs {recv_bufs} / lookahead {lookahead}")
+    h_bufs = lookahead + 1
+    g = {"RECV_BUFS": recv_bufs, "LOOKAHEAD": lookahead, "H_BUFS": h_bufs}
+    g["OFF_H"] = OFF_RECV + recv_bufs * RECV_BUF
+    g["OFF_HBF"] = g["OFF_H"] + h_bufs * H_BUF
+    g["OFF_MISC"] = g["OFF_HBF"] + HBF_BYTES
+    g["B_SFA_FULL"] = B_HREADY + 8 * h_bufs
+    g["B_SFX_READY"] = g["B_SFA_FULL"] + 8 * RING
+    g["B_PRECV"] = g["B_SFX_READY"] + 8
+    g["B_PFREE"] = g["B_PRECV"] + 8 * recv_bufs
+    g["B_CONSUMED"] = g["B_PFREE"] + 8 * recv_bufs
+    g["M_TMEM"] = g["B_CONSUMED"] + 8 * recv_bufs
+    g["M_NUNITS"] = g["M_TMEM"] + 4
+    g["M_NEX"] = g["M_TMEM"] + 8
+    g["M_BM"] = _align16(g["M_TMEM"] + 12)
+    g["M_ELIST"] = g["M_BM"] + 4 * 8 * 4
+    g["M_EGM"] = g["M_ELIST"] + 4 * MAX_LIST
+    g["M_STAB"] = _align16(g["M_EGM"] + MAX_LIST)
+    g["M_UNITS"] = _align16(g["M_STAB"] + SCHED_BYTES)
+    # the default's slack past the unit table, kept for every choice
+    end = g["OFF_MISC"] + g["M_UNITS"] + MAX_UNITS * UNIT_BYTES
+    g["SMEM"] = end + SMEM - (OFF_MISC + M_UNITS + MAX_UNITS * UNIT_BYTES)
+    if g["SMEM"] > SMEM_MAX or T_SFB_H + 4 * h_bufs > T_SFA:
+        raise ValueError(f"engine16: recv_bufs {recv_bufs} / lookahead {lookahead}")
+    return g
+
+
+_DEFAULT = g4_layout()
+assert all(_DEFAULT[k] == globals()[k] for k in _DEFAULT), "engine16 layout"
+
+# Trace build (measurement only, never served): per CTA 32 u64 words at err + TRACE_OFF
+# + 256 * block, accumulated over launches (red.add) except the two absolute stamps.
+TRACE_OFF = 4096
+TR_ENTRY, TR_EXIT, TR_DUR = 0, 1, 2
+TR_PDL, TR_TREADY, TR_XREADY, TR_MMA_FIRST = 3, 4, 5, 6
+TR_STREAM_END, TR_MMA_END, TR_EPI_END = 7, 8, 9
+TR_W_EMPTY, TR_W_FULL, TR_W_SFA, TR_W_HREADY, TR_W_ACC2E, TR_W_ACC1E = (
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+)
+TR_W_ACC1F, TR_W_PFREE, TR_W_PRECV, TR_W_ACC2F = 16, 17, 18, 19
+TR_NUNITS, TR_NEX, TR_READOUT, TR_HCHAIN, TR_W_REL = 20, 21, 22, 23, 24
+TR_LAUNCHES = 31
+
+
 class Nvfp4MoeSmallM16:
     """``shared``: run the shared expert's four quarters in-engine (needs >= 8
     clusters). The expert list is the class-ordered union (module docstring).
 
     Call: as ``engine.Nvfp4MoeSmallM`` with ``split`` replaced by ``rows_per_request``:
     the rows of request q in byte q (1..4 for the present requests, 0 after the last).
+
+    Opt-in forms (build time; every one leaves each output bit unchanged):
+
+    * ``xpipe``: per unit, the epilogue pushes the partials of all its groups before it
+      waits for the first group's exchange (the sums and their order are unchanged);
+    * ``l2pf`` = D > 0: the producer prefetches the routed weights (FC1 boxes and
+      scales, FC2 record) of unit i + D into L2 when it starts unit i (units 1..D at
+      the start);
+    * ``recv_bufs``: exchange receive buffers (default 5);
+    * ``lookahead``: FC2(k) issues after FC1(k + lookahead) (default 2; h buffers =
+      lookahead + 1);
+    * ``trace`` (measurement only): per-CTA wait and phase times into the error
+      buffer's tail (``TRACE_OFF``).
     """
 
-    def __init__(self, shared: bool = True):
+    def __init__(
+        self,
+        shared: bool = True,
+        *,
+        xpipe: bool = False,
+        l2pf: int = 0,
+        recv_bufs: int = RECV_BUFS,
+        lookahead: int = LOOKAHEAD,
+        trace: bool = False,
+    ):
         self.shared = shared
+        self.xpipe = bool(xpipe)
+        self.l2pf = int(l2pf)
+        self.trace = bool(trace)
+        if not 0 <= self.l2pf <= 4:
+            raise ValueError(f"engine16: l2pf {l2pf}")
+        for k, v in g4_layout(recv_bufs, lookahead).items():
+            setattr(self, k, v)
+        if self.xpipe and self.RECV_BUFS < GROUPS:
+            raise ValueError("engine16: xpipe needs recv_bufs >= 4")
+
+    def knobs(self) -> dict:
+        """The build-time choices (compile-cache key)."""
+        return {
+            "xpipe": self.xpipe,
+            "l2pf": self.l2pf,
+            "recv_bufs": self.RECV_BUFS,
+            "lookahead": self.LOOKAHEAD,
+            "trace": self.trace,
+        }
+
+    # ------------------------------------------------------------ trace (measurement)
+    @cute.jit
+    def tr_addr(self, err, block, slot: cutlass.Constexpr[int]):
+        return err + TRACE_OFF + (Int64(block) * 32 + slot) * 8
+
+    @cute.jit
+    def tr_add(self, err, block, slot: cutlass.Constexpr[int], value):
+        if cutlass.const_expr(self.trace):
+            P.red_add_u64(self.tr_addr(err, block, slot), Uint64(value))
+
+    @cute.jit
+    def tr_since(self, err, block, slot: cutlass.Constexpr[int], t0):
+        """Add now - t0 to the slot (one lane calls)."""
+        if cutlass.const_expr(self.trace):
+            P.red_add_u64(self.tr_addr(err, block, slot), P.globaltimer() - t0)
+
+    @cute.jit
+    def twait(
+        self,
+        bar,
+        parity,
+        err,
+        block,
+        slot: cutlass.Constexpr[int],
+        lane,
+        sem_scope: cutlass.Constexpr[str] = "",
+    ):
+        """mbarrier wait; the trace build adds lane 0's wait time to the slot."""
+        if cutlass.const_expr(self.trace):
+            t0 = P.globaltimer()
+            C.mbarrier_wait_parity(bar, parity, sem_scope)
+            if lane == 0:
+                self.tr_since(err, block, slot, t0)
+        else:
+            C.mbarrier_wait_parity(bar, parity, sem_scope)
 
     @cute.jit
     def __call__(
@@ -249,12 +380,20 @@ class Nvfp4MoeSmallM16:
         C.mbarrier_wait_parity(bar, parity)
 
     @cute.jit
+    def wait_sfa(self, bar, parity, err, block, lane):
+        """The MMA warp's per-chunk scale wait (``wait_scales``; timed in trace builds)."""
+        if cutlass.const_expr(self.trace):
+            self.twait(bar, parity, err, block, TR_W_SFA, lane)
+        else:
+            self.wait_scales(bar, parity)
+
+    @cute.jit
     def hready_slot(self, i):
-        return i % H_BUFS
+        return i % self.H_BUFS
 
     @cute.jit
     def hready_phase(self, i):
-        return (i // H_BUFS) & 1
+        return (i // self.H_BUFS) & 1
 
     @cute.jit
     def order_scale_rows(self):
@@ -273,7 +412,7 @@ class Nvfp4MoeSmallM16:
     # ------------------------------------------------------------ helpers
     @cute.jit
     def ufield(self, misc, i, field: cutlass.Constexpr[int]):
-        return C.ld_shared_u32(misc + M_UNITS + i * UNIT_BYTES + field)
+        return C.ld_shared_u32(misc + self.M_UNITS + i * UNIT_BYTES + field)
 
     @cute.jit
     def rows_of(self, mqs, q):
@@ -303,6 +442,28 @@ class Nvfp4MoeSmallM16:
         C.bulk_copy_g2s(dst + 32768, src, 4096, bar, policy)
 
     @cute.jit
+    def prefetch_unit(self, tmap_ptr, sf13, fc2pack, misc, crank, u, nunits):
+        """L2 prefetch of routed unit u's FC1 boxes, FC1 scales and FC2 record (this
+        CTA's K range); nothing for u >= nunits or the shared quarter."""
+        if u < nunits:
+            if self.ufield(misc, u, U_SH) == Uint32(0):
+                e = Int32(self.ufield(misc, u, U_E))
+                j = Int32(self.ufield(misc, u, U_J))
+                for c in cutlass.range_constexpr(3):
+                    P.tma_prefetch_3d(tmap_ptr, 0, e * 512 + 128 * j, crank * 6 + 2 * c)
+                C.bulk_prefetch_l2(
+                    sf13
+                    + Int64(e) * SF13_PER_EXPERT
+                    + Int64(96 * j + 24 * crank) * 512,
+                    3 * 4096,
+                )
+                C.bulk_prefetch_l2(
+                    fc2pack
+                    + ((Int64(e) * 4 + Int64(j)) * 4 + Int64(crank)) * FC2_RECORD,
+                    FC2_RECORD,
+                )
+
+    @cute.jit
     def scan8(self, cnt, lane):
         incl = cnt
         for o in cutlass.range_constexpr(3):
@@ -326,15 +487,34 @@ class Nvfp4MoeSmallM16:
         pre,
         pre0,
         policy,
+        err,
+        block,
+        t0k,
     ):
         """Producer lane: stream order FC1(0), FC1(1), FC2(0), FC1(2), FC2(1), ..., on a
         ring of ``nring`` slots, then wait for the MMA warp's last commit on every slot.
         """
         it = pre + pre0
-        for kk in cutlass.range(nunits + LOOKAHEAD, unroll=1):
+        for kk in cutlass.range(nunits + self.LOOKAHEAD, unroll=1):
             for part in cutlass.range_constexpr(2):
-                i = kk if part == 0 else kk - LOOKAHEAD
+                i = kk if part == 0 else kk - self.LOOKAHEAD
                 if (i >= 0) & (i < nunits):
+                    if cutlass.const_expr(part == 0 and self.l2pf > 0):
+                        if i == 0:
+                            for d in cutlass.range_constexpr(1, self.l2pf + 1):
+                                self.prefetch_unit(
+                                    tmap_ptr, sf13, fc2pack, misc, crank, d, nunits
+                                )
+                        else:
+                            self.prefetch_unit(
+                                tmap_ptr,
+                                sf13,
+                                fc2pack,
+                                misc,
+                                crank,
+                                i + self.l2pf,
+                                nunits,
+                            )
                     ush = self.ufield(misc, i, U_SH)
                     if ush != Uint32(0):
                         uj = Int32(self.ufield(misc, i, U_J))
@@ -349,8 +529,13 @@ class Nvfp4MoeSmallM16:
                         for c in cutlass.range(c0, c1, unroll=1):
                             s = it % nring
                             if it >= nring:
-                                C.mbarrier_wait_parity(
-                                    misc + B_EMPTY + 8 * s, ((it // nring) - 1) & 1
+                                self.twait(
+                                    misc + B_EMPTY + 8 * s,
+                                    ((it // nring) - 1) & 1,
+                                    err,
+                                    block,
+                                    TR_W_EMPTY,
+                                    Int32(0),
                                 )
                             C.mbarrier_arrive_expect_tx(misc + B_FULL + 8 * s, SH_CHUNK)
                             C.bulk_copy_g2s(
@@ -379,8 +564,13 @@ class Nvfp4MoeSmallM16:
                         for c in cutlass.range(c0, c1, unroll=1):
                             s = it % nring
                             if it >= nring:
-                                C.mbarrier_wait_parity(
-                                    misc + B_EMPTY + 8 * s, ((it // nring) - 1) & 1
+                                self.twait(
+                                    misc + B_EMPTY + 8 * s,
+                                    ((it // nring) - 1) & 1,
+                                    err,
+                                    block,
+                                    TR_W_EMPTY,
+                                    Int32(0),
                                 )
                             nbytes = Int32(BIG)
                             if c == 4:
@@ -411,6 +601,8 @@ class Nvfp4MoeSmallM16:
                                     policy,
                                 )
                             it = it + 1
+        if cutlass.const_expr(self.trace):
+            self.tr_since(err, block, TR_STREAM_END, t0k)
         self.ring_tail(misc, it, nring)
 
     # ------------------------------------------------ warp 0: union, schedule, producer
@@ -434,6 +626,8 @@ class Nvfp4MoeSmallM16:
         my_sh,
         nring,
         lane,
+        block,
+        t0k,
     ):
         policy = C.l2_policy("evict_first")
         pre = Int32(0)
@@ -457,15 +651,18 @@ class Nvfp4MoeSmallM16:
         if lane == 0:
             C.mbarrier_arrive_expect_tx(misc + B_SBAR, SCHED_BYTES)
             C.bulk_copy_g2s(
-                misc + M_STAB,
+                misc + self.M_STAB,
                 sched + Int64(cl) * SCHED_BYTES,
                 SCHED_BYTES,
                 misc + B_SBAR,
                 C.l2_policy("evict_last"),
             )
-        C.st_shared_u32(misc + M_BM + 4 * lane, Uint32(0))
+        C.st_shared_u32(misc + self.M_BM + 4 * lane, Uint32(0))
         cute.arch.sync_warp()
         C.pdl_wait()
+        if cutlass.const_expr(self.trace):
+            if lane == 0:
+                self.tr_since(err, block, TR_PDL, t0k)
         # lane l holds (token l >> 3, slot l & 7) of each request; per-request bitmaps
         # by shared atomics
         badid = Int32(0)
@@ -484,7 +681,8 @@ class Nvfp4MoeSmallM16:
                 badid = Int32(1)
             if ok != 0:
                 P.atom_or_shared(
-                    misc + M_BM + 4 * (8 * q + (eq >> 5)), Uint32(1) << Uint32(eq & 31)
+                    misc + self.M_BM + 4 * (8 * q + (eq >> 5)),
+                    Uint32(1) << Uint32(eq & 31),
                 )
         if badid != 0:
             P.atom_or_global(err, ERR_BAD_ID)
@@ -494,10 +692,10 @@ class Nvfp4MoeSmallM16:
         wq2 = Uint32(0)
         wq3 = Uint32(0)
         if lane < NUM_EXPERTS // 32:
-            wq0 = C.ld_shared_u32(misc + M_BM + 4 * lane)
-            wq1 = C.ld_shared_u32(misc + M_BM + 4 * (8 + lane))
-            wq2 = C.ld_shared_u32(misc + M_BM + 4 * (16 + lane))
-            wq3 = C.ld_shared_u32(misc + M_BM + 4 * (24 + lane))
+            wq0 = C.ld_shared_u32(misc + self.M_BM + 4 * lane)
+            wq1 = C.ld_shared_u32(misc + self.M_BM + 4 * (8 + lane))
+            wq2 = C.ld_shared_u32(misc + self.M_BM + 4 * (16 + lane))
+            wq3 = C.ld_shared_u32(misc + self.M_BM + 4 * (24 + lane))
         wq = [wq0, wq1, wq2, wq3]
         # classes: experts of >= 3 requests, of exactly 2, of 1 (placement only)
         w0 = wq[0] | wq[1] | wq[2] | wq[3]
@@ -520,7 +718,7 @@ class Nvfp4MoeSmallM16:
         # issue now
         pre0 = Int32(0)
         self.wait_schedule(misc)
-        row0 = misc + M_STAB + 2 * SCHED_ROW * min(d0, MAX_LIST)
+        row0 = misc + self.M_STAB + 2 * SCHED_ROW * min(d0, MAX_LIST)
         code0 = Int32(-1)
         if P.ld_shared_s16(row0) > 0:
             code0 = P.ld_shared_s16(row0 + 2)
@@ -578,17 +776,17 @@ class Nvfp4MoeSmallM16:
             while bits != Uint32(0):
                 b = P.ctz(bits)
                 if k < MAX_LIST:
-                    C.st_shared_u32(misc + M_ELIST + 4 * k, 32 * lane + b)
+                    C.st_shared_u32(misc + self.M_ELIST + 4 * k, 32 * lane + b)
                     gm = Uint32(0)
                     for q in cutlass.range_constexpr(GROUPS):
                         gm = gm | (((wq[q] >> Uint32(b)) & Uint32(1)) << Uint32(q))
-                    P.st_shared_b8(misc + M_EGM + k, gm)
+                    P.st_shared_b8(misc + self.M_EGM + k, gm)
                 k = k + 1
                 bits = bits & (bits - Uint32(1))
         cute.arch.sync_warp()
         d = min(d0, MAX_LIST)
         self.wait_schedule(misc)
-        row = misc + M_STAB + 2 * SCHED_ROW * d
+        row = misc + self.M_STAB + 2 * SCHED_ROW * d
         nraw = P.ld_shared_s16(row)
         nunits = min(nraw, MAX_UNITS)
         if (lane == 0) & (nraw > MAX_UNITS):
@@ -596,7 +794,7 @@ class Nvfp4MoeSmallM16:
         gmu = Int32(0)
         if lane < nunits:
             code = P.ld_shared_s16(row + 2 + 2 * lane)
-            unit = misc + M_UNITS + lane * UNIT_BYTES
+            unit = misc + self.M_UNITS + lane * UNIT_BYTES
             if code < 0:
                 C.st_shared_u32(unit + U_E, Int32(-1))
                 C.st_shared_u32(unit + U_J, cl)
@@ -604,18 +802,18 @@ class Nvfp4MoeSmallM16:
                 gmu = gall
             else:
                 C.st_shared_u32(
-                    unit + U_E, C.ld_shared_u32(misc + M_ELIST + 4 * (code >> 2))
+                    unit + U_E, C.ld_shared_u32(misc + self.M_ELIST + 4 * (code >> 2))
                 )
                 C.st_shared_u32(unit + U_J, code & 3)
                 C.st_shared_u32(unit + U_SH, Int32(0))
-                gmu = P.ld_shared_u8(misc + M_EGM + (code >> 2))
+                gmu = P.ld_shared_u8(misc + self.M_EGM + (code >> 2))
             C.st_shared_u32(unit + U_GM, gmu)
         # exchanges of this cluster (one per (unit, group)), the same in its four CTAs
         nx = P.popc(gmu)
         for o in (16, 8, 4, 2, 1):
             nx = nx + cute.arch.shuffle_sync_bfly(nx, o)
         if lane == 0:
-            C.st_shared_u32(misc + M_NEX, nx)
+            C.st_shared_u32(misc + self.M_NEX, nx)
         cute.arch.sync_warp()
         if lane == 0:
             if (pre0 == 0) & (nunits > 0):  # noqa: SIM102
@@ -635,10 +833,15 @@ class Nvfp4MoeSmallM16:
                         policy,
                     )
                     pre0 = Int32(1)
-            C.st_shared_u32(misc + M_NUNITS, nunits)
+            C.st_shared_u32(misc + self.M_NUNITS, nunits)
         # Every lane arrives (count 32): each lane's own unit-record stores are
         # released by its own arrive (see the init of B_TREADY).
         C.mbarrier_arrive(misc + B_TREADY)
+        if cutlass.const_expr(self.trace):
+            if lane == 0:
+                self.tr_since(err, block, TR_TREADY, t0k)
+                self.tr_add(err, block, TR_NUNITS, nunits)
+                self.tr_add(err, block, TR_NEX, nx)
         cute.arch.sync_warp()
         if lane == 0:
             self.stream(
@@ -654,38 +857,62 @@ class Nvfp4MoeSmallM16:
                 pre,
                 pre0,
                 policy,
+                err,
+                block,
+                t0k,
             )
         cute.arch.sync_warp()
 
     # ------------------------------------------------------------ warp 1: MMA issue
     @cute.jit
-    def mma_warp(self, base, misc, nring):
+    def mma_warp(self, base, misc, nring, err, block, lane, t0k):
         lead = T.elect_leader()
         C.mbarrier_wait_parity(misc + B_TREADY, 0)
-        nunits = cute.arch.shuffle_sync(Int32(C.ld_shared_u32(misc + M_NUNITS)), 0)
-        tm = cute.arch.shuffle_sync(Int32(C.ld_shared_u32(misc + M_TMEM)), 0)
+        nunits = cute.arch.shuffle_sync(Int32(C.ld_shared_u32(misc + self.M_NUNITS)), 0)
+        tm = cute.arch.shuffle_sync(Int32(C.ld_shared_u32(misc + self.M_TMEM)), 0)
         if nunits > 0:
             C.mbarrier_wait_parity(misc + B_XREADY, 0)
-            self.wait_scales(misc + B_SFX_READY, 0)
+            self.wait_scales(misc + self.B_SFX_READY, 0)
             T.tc_fence_after()
         s_ring = base + OFF_RING
         it = Int32(0)
-        for k in cutlass.range(nunits + LOOKAHEAD, unroll=1):
+        for k in cutlass.range(nunits + self.LOOKAHEAD, unroll=1):
             shk = Int32(0)
             if k < nunits:
                 shk = cute.arch.shuffle_sync(Int32(self.ufield(misc, k, U_SH)), 0)
             if k < nunits:
                 b = k & 1
                 if k >= 2:
-                    C.mbarrier_wait_parity(
-                        misc + B_ACC1_EMPTY + 8 * b, ((k >> 1) - 1) & 1
+                    self.twait(
+                        misc + B_ACC1_EMPTY + 8 * b,
+                        ((k >> 1) - 1) & 1,
+                        err,
+                        block,
+                        TR_W_ACC1E,
+                        lane,
                     )
                     T.tc_fence_after()
                 if shk != 0:
                     for c in cutlass.range(SH_FC1_CHUNKS, unroll=1):
                         s = it % nring
-                        C.mbarrier_wait_parity(misc + B_FULL + 8 * s, (it // nring) & 1)
-                        self.wait_scales(misc + B_SFA_FULL + 8 * s, (it // nring) & 1)
+                        self.twait(
+                            misc + B_FULL + 8 * s,
+                            (it // nring) & 1,
+                            err,
+                            block,
+                            TR_W_FULL,
+                            lane,
+                        )
+                        if cutlass.const_expr(self.trace):
+                            if (it == 0) & (lane == 0):
+                                self.tr_since(err, block, TR_MMA_FIRST, t0k)
+                        self.wait_sfa(
+                            misc + self.B_SFA_FULL + 8 * s,
+                            (it // nring) & 1,
+                            err,
+                            block,
+                            lane,
+                        )
                         T.tc_fence_after()
                         a0 = T.smem_desc(s_ring + s * BIG, 128, 1024, 0)
                         b0 = T.smem_desc(base + OFF_XBF + 2048 * c, 128, XBF_GRP, 0)
@@ -710,8 +937,24 @@ class Nvfp4MoeSmallM16:
                 else:
                     for c in cutlass.range(3, unroll=1):
                         s = it % nring
-                        C.mbarrier_wait_parity(misc + B_FULL + 8 * s, (it // nring) & 1)
-                        self.wait_scales(misc + B_SFA_FULL + 8 * s, (it // nring) & 1)
+                        self.twait(
+                            misc + B_FULL + 8 * s,
+                            (it // nring) & 1,
+                            err,
+                            block,
+                            TR_W_FULL,
+                            lane,
+                        )
+                        if cutlass.const_expr(self.trace):
+                            if (it == 0) & (lane == 0):
+                                self.tr_since(err, block, TR_MMA_FIRST, t0k)
+                        self.wait_sfa(
+                            misc + self.B_SFA_FULL + 8 * s,
+                            (it // nring) & 1,
+                            err,
+                            block,
+                            lane,
+                        )
                         T.tc_fence_after()
                         a0 = T.smem_desc(s_ring + s * BIG, 16, 1024, 2)
                         b0 = T.smem_desc(base + OFF_X + 2048 * c, 128, X_GRP, 0)
@@ -735,22 +978,45 @@ class Nvfp4MoeSmallM16:
                         it = it + 1
                 T.tc_commit(lead, misc + B_ACC1_FULL + 8 * b)
                 cute.arch.sync_warp()
-            if (k >= LOOKAHEAD) & (k - LOOKAHEAD < nunits):
-                i = k - LOOKAHEAD
+            if (k >= self.LOOKAHEAD) & (k - self.LOOKAHEAD < nunits):
+                i = k - self.LOOKAHEAD
                 shi = cute.arch.shuffle_sync(Int32(self.ufield(misc, i, U_SH)), 0)
-                C.mbarrier_wait_parity(
-                    misc + B_HREADY + 8 * self.hready_slot(i), self.hready_phase(i)
+                self.twait(
+                    misc + B_HREADY + 8 * self.hready_slot(i),
+                    self.hready_phase(i),
+                    err,
+                    block,
+                    TR_W_HREADY,
+                    lane,
                 )
                 T.tc_fence_after()
                 if i > 0:
-                    C.mbarrier_wait_parity(misc + B_ACC2_EMPTY, (i - 1) & 1)
+                    self.twait(
+                        misc + B_ACC2_EMPTY, (i - 1) & 1, err, block, TR_W_ACC2E, lane
+                    )
                     T.tc_fence_after()
                 if shi != 0:
-                    bh = T.smem_desc(base + OFF_HBF, 128, 1024, 0)
+                    bh = T.smem_desc(base + self.OFF_HBF, 128, 1024, 0)
                     for c in cutlass.range(SH_FC1_CHUNKS, SH_CHUNKS, unroll=1):
                         s = it % nring
-                        C.mbarrier_wait_parity(misc + B_FULL + 8 * s, (it // nring) & 1)
-                        self.wait_scales(misc + B_SFA_FULL + 8 * s, (it // nring) & 1)
+                        self.twait(
+                            misc + B_FULL + 8 * s,
+                            (it // nring) & 1,
+                            err,
+                            block,
+                            TR_W_FULL,
+                            lane,
+                        )
+                        if cutlass.const_expr(self.trace):
+                            if (it == 0) & (lane == 0):
+                                self.tr_since(err, block, TR_MMA_FIRST, t0k)
+                        self.wait_sfa(
+                            misc + self.B_SFA_FULL + 8 * s,
+                            (it // nring) & 1,
+                            err,
+                            block,
+                            lane,
+                        )
                         T.tc_fence_after()
                         a0 = T.smem_desc(s_ring + s * BIG, 128, 1024, 0)
                         T.tc_burst(
@@ -772,12 +1038,28 @@ class Nvfp4MoeSmallM16:
                         cute.arch.sync_warp()
                         it = it + 1
                 else:
-                    hb = i % H_BUFS
-                    bh = T.smem_desc(base + OFF_H + H_BUF * hb, 128, 256, 0)
+                    hb = i % self.H_BUFS
+                    bh = T.smem_desc(base + self.OFF_H + H_BUF * hb, 128, 256, 0)
                     for c in cutlass.range(3, 5, unroll=1):
                         s = it % nring
-                        C.mbarrier_wait_parity(misc + B_FULL + 8 * s, (it // nring) & 1)
-                        self.wait_scales(misc + B_SFA_FULL + 8 * s, (it // nring) & 1)
+                        self.twait(
+                            misc + B_FULL + 8 * s,
+                            (it // nring) & 1,
+                            err,
+                            block,
+                            TR_W_FULL,
+                            lane,
+                        )
+                        if cutlass.const_expr(self.trace):
+                            if (it == 0) & (lane == 0):
+                                self.tr_since(err, block, TR_MMA_FIRST, t0k)
+                        self.wait_sfa(
+                            misc + self.B_SFA_FULL + 8 * s,
+                            (it // nring) & 1,
+                            err,
+                            block,
+                            lane,
+                        )
                         T.tc_fence_after()
                         a0 = T.smem_desc(s_ring + s * BIG, 128, 256, 0)
                         T.tc_burst(
@@ -800,6 +1082,9 @@ class Nvfp4MoeSmallM16:
                         it = it + 1
                 T.tc_commit(lead, misc + B_ACC2_FULL)
                 cute.arch.sync_warp()
+        if cutlass.const_expr(self.trace):
+            if lane == 0:
+                self.tr_since(err, block, TR_MMA_END, t0k)
         cute.arch.sync_warp()
 
     # -------------------------------------------------- warp 6: scale factors into TMEM
@@ -807,8 +1092,8 @@ class Nvfp4MoeSmallM16:
     def sf_warp(self, base, misc, nring):
         lead = T.elect_leader()
         C.mbarrier_wait_parity(misc + B_TREADY, 0)
-        nunits = cute.arch.shuffle_sync(Int32(C.ld_shared_u32(misc + M_NUNITS)), 0)
-        tm = cute.arch.shuffle_sync(Int32(C.ld_shared_u32(misc + M_TMEM)), 0)
+        nunits = cute.arch.shuffle_sync(Int32(C.ld_shared_u32(misc + self.M_NUNITS)), 0)
+        tm = cute.arch.shuffle_sync(Int32(C.ld_shared_u32(misc + self.M_TMEM)), 0)
         if nunits > 0:
             C.mbarrier_wait_parity(misc + B_XREADY, 0)
             T.tc_fence_after()
@@ -829,12 +1114,12 @@ class Nvfp4MoeSmallM16:
                     cps=X_CPS,
                     commit=False,
                 )
-            T.tc_commit(lead, misc + B_SFX_READY)
+            T.tc_commit(lead, misc + self.B_SFX_READY)
             cute.arch.sync_warp()
         it = Int32(0)
-        for k in cutlass.range(nunits + LOOKAHEAD, unroll=1):
+        for k in cutlass.range(nunits + self.LOOKAHEAD, unroll=1):
             for part in cutlass.range_constexpr(2):
-                i = k if part == 0 else k - LOOKAHEAD
+                i = k if part == 0 else k - self.LOOKAHEAD
                 if (i >= 0) & (i < nunits):
                     ush = cute.arch.shuffle_sync(Int32(self.ufield(misc, i, U_SH)), 0)
                     c0 = Int32(0)
@@ -854,7 +1139,7 @@ class Nvfp4MoeSmallM16:
                                 self.hready_phase(i),
                             )
                             T.tc_fence_after()
-                            hb = i % H_BUFS
+                            hb = i % self.H_BUFS
                             T.tc_burst(
                                 lead,
                                 0,
@@ -866,7 +1151,9 @@ class Nvfp4MoeSmallM16:
                                 0,
                                 0,
                                 tm + T_SFB_H + 4 * hb,
-                                T.smem_desc(base + OFF_H + H_BUF * hb + 512, 0, 128, 0),
+                                T.smem_desc(
+                                    base + self.OFF_H + H_BUF * hb + 512, 0, 128, 0
+                                ),
                                 cps=H_CPS,
                                 commit=False,
                             )
@@ -876,7 +1163,7 @@ class Nvfp4MoeSmallM16:
                         C.mbarrier_wait_parity(misc + B_FULL + 8 * s, (it // nring) & 1)
                         T.tc_fence_after()
                         if ush != 0:
-                            T.tc_commit(lead, misc + B_SFA_FULL + 8 * s)
+                            T.tc_commit(lead, misc + self.B_SFA_FULL + 8 * s)
                         else:
                             if cutlass.const_expr(part == 0):
                                 d = T.smem_desc(
@@ -891,7 +1178,7 @@ class Nvfp4MoeSmallM16:
                                     0,
                                     0,
                                     0,
-                                    misc + B_SFA_FULL + 8 * s,
+                                    misc + self.B_SFA_FULL + 8 * s,
                                     tm + T_SFA + 32 * s,
                                     d,
                                     cps=FC1_CPS,
@@ -909,7 +1196,7 @@ class Nvfp4MoeSmallM16:
                                     0,
                                     0,
                                     Int32(c == 3),
-                                    misc + B_SFA_FULL + 8 * s,
+                                    misc + self.B_SFA_FULL + 8 * s,
                                     tm + T_SFA + 32 * s,
                                     d,
                                     cps=FC2_CPS,
@@ -922,16 +1209,18 @@ class Nvfp4MoeSmallM16:
     @cute.jit
     def release_warp(self, misc, crank, lane):
         C.mbarrier_wait_parity(misc + B_TREADY, 0)
-        nex = cute.arch.shuffle_sync(Int32(C.ld_shared_u32(misc + M_NEX)), 0)
+        nex = cute.arch.shuffle_sync(Int32(C.ld_shared_u32(misc + self.M_NEX)), 0)
         cute.arch.cluster_wait()
         if lane == 0:
-            for e in cutlass.range(nex - RECV_BUFS, unroll=1):
-                p = e % RECV_BUFS
-                C.mbarrier_wait_parity(misc + B_CONSUMED + 8 * p, (e // RECV_BUFS) & 1)
+            for e in cutlass.range(nex - self.RECV_BUFS, unroll=1):
+                p = e % self.RECV_BUFS
+                C.mbarrier_wait_parity(
+                    misc + self.B_CONSUMED + 8 * p, (e // self.RECV_BUFS) & 1
+                )
                 for pr in cutlass.range_constexpr(CLUSTER):
                     if crank != pr:
                         P.mbarrier_arrive_remote(
-                            C.mapa_shared_cluster(misc + B_PFREE + 8 * p, pr)
+                            C.mapa_shared_cluster(misc + self.B_PFREE + 8 * p, pr)
                         )
         cute.arch.sync_warp()
 
@@ -1080,7 +1369,7 @@ class Nvfp4MoeSmallM16:
             P.st_global_b32f(w_fin + Int64(at) * 4, wt)
             P.st_global_b32f(g2s + Int64(at) * 4, g2v)
         if lane < nunits:
-            unit = misc + M_UNITS + lane * UNIT_BYTES
+            unit = misc + self.M_UNITS + lane * UNIT_BYTES
             if qw == 0:
                 g1 = Float32(1.0)
                 if mysh == 0:
@@ -1173,13 +1462,94 @@ class Nvfp4MoeSmallM16:
                 )
 
     @cute.jit
+    def xsend(self, v, e, misc, recv, crank, row, err, block, et):
+        """Exchange e: push this CTA's 128 x 4 partial ``v`` to the three peers (after
+        they have released receive buffer e % RECV_BUFS)."""
+        p = e % self.RECV_BUFS
+        use = e // self.RECV_BUFS
+        if use >= 1:
+            self.twait(
+                misc + self.B_PFREE + 8 * p,
+                (use - 1) & 1,
+                err,
+                block,
+                TR_W_PFREE,
+                et,
+                ".acquire.cluster",
+            )
+        lbar = misc + self.B_PRECV + 8 * p
+        v0, v1, v2, v3 = v
+        for pr in cutlass.range_constexpr(CLUSTER):
+            if crank != pr:
+                # our slot in peer pr's buffer: our rank, skipping the peer's own
+                sslot = crank
+                if crank > pr:
+                    sslot = crank - 1
+                laddr = recv + ((p * 3 + sslot) * 128 + row) * 16
+                P.st_async_v4_f32(
+                    C.mapa_shared_cluster(laddr, pr),
+                    C.mapa_shared_cluster(lbar, pr),
+                    v0,
+                    v1,
+                    v2,
+                    v3,
+                )
+
+    @cute.jit
+    def xsum(self, v, e, misc, recv, crank, row, err, block, et):
+        """Exchange e: wait for the three peers' partials, sum the four in rank order."""
+        p = e % self.RECV_BUFS
+        use = e // self.RECV_BUFS
+        self.twait(
+            misc + self.B_PRECV + 8 * p,
+            use & 1,
+            err,
+            block,
+            TR_W_PRECV,
+            et,
+            ".acquire.cluster",
+        )
+        v0, v1, v2, v3 = v
+        acc = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
+        for src in cutlass.range_constexpr(CLUSTER):
+            p0, p1, p2, p3 = v0, v1, v2, v3
+            if crank != src:
+                rslot = Int32(src)
+                if src > crank:
+                    rslot = Int32(src - 1)
+                p0, p1, p2, p3 = P.ld_shared_v4_f32(
+                    recv + ((p * 3 + rslot) * 128 + row) * 16
+                )
+            acc = [
+                P.add_f32(acc[0], p0),
+                P.add_f32(acc[1], p1),
+                P.add_f32(acc[2], p2),
+                P.add_f32(acc[3], p3),
+            ]
+        return acc
+
+    @cute.jit
     def readout(
-        self, i, rows, mqs, rbs, shpartials, pq, misc, crank, lane_base, row, lane
+        self,
+        i,
+        rows,
+        mqs,
+        rbs,
+        shpartials,
+        pq,
+        misc,
+        crank,
+        lane_base,
+        row,
+        lane,
+        err,
+        block,
+        et,
     ):
         """FC2(i): per group, the 12 tiles' 4 columns -> partials slots (routed) or
         shared_partials (shared quarter); release the accumulator after the last group's
         loads."""
-        C.mbarrier_wait_parity(misc + B_ACC2_FULL, i & 1)
+        self.twait(misc + B_ACC2_FULL, i & 1, err, block, TR_W_ACC2F, et)
         T.tc_fence_after()
         C.fence_proxy_async_shared_cta()
         gm = Int32(self.ufield(misc, i, U_GM))
@@ -1198,7 +1568,12 @@ class Nvfp4MoeSmallM16:
                 if self.ufield(misc, i, U_SH) == Uint32(0):
                     for n in cutlass.range_constexpr(REQ_ROWS):
                         sl = P.ld_shared_s8(
-                            misc + M_UNITS + i * UNIT_BYTES + U_SLOT + REQ_ROWS * g + n
+                            misc
+                            + self.M_UNITS
+                            + i * UNIT_BYTES
+                            + U_SLOT
+                            + REQ_ROWS * g
+                            + n
                         )
                         if (n < mg) & (sl >= 0):
                             uj = Int32(self.ufield(misc, i, U_J))
@@ -1222,7 +1597,7 @@ class Nvfp4MoeSmallM16:
                             if n < mg:
                                 s = C.ld_shared_f32(
                                     misc
-                                    + M_UNITS
+                                    + self.M_UNITS
                                     + i * UNIT_BYTES
                                     + U_TOK
                                     + 4 * (REQ_ROWS * g + n)
@@ -1270,6 +1645,8 @@ class Nvfp4MoeSmallM16:
         warp,
         lane,
         tid,
+        err,
+        t0k,
     ):
         qd = warp & 3
         et = tid - 64
@@ -1278,18 +1655,21 @@ class Nvfp4MoeSmallM16:
         zero = (Uint32(0), Uint32(0), Uint32(0), Uint32(0))
         for i in cutlass.range(et, XSF_BYTES // 16, 128, unroll=1):
             C.st_shared_v4(base + OFF_XSF + 16 * i, zero)
-        for i in cutlass.range(et, H_BUFS * H_BUF // 16, 128, unroll=1):
-            C.st_shared_v4(base + OFF_H + 16 * i, zero)
+        for i in cutlass.range(et, self.H_BUFS * H_BUF // 16, 128, unroll=1):
+            C.st_shared_v4(base + self.OFF_H + 16 * i, zero)
         for i in cutlass.range(et, HBF_BYTES // 16, 128, unroll=1):
-            C.st_shared_v4(base + OFF_HBF + 16 * i, zero)
+            C.st_shared_v4(base + self.OFF_HBF + 16 * i, zero)
         # the zeroing and the quantization's scale-byte stores touch the same 16-byte
         # rows
         self.order_scale_rows()
         self.wait_inputs()
         self.quantize_x(x, gs1, mqs, rbs, base, misc, crank, my_sh, et, lane)
+        if cutlass.const_expr(self.trace):
+            if et == 0:
+                self.tr_since(err, block, TR_XREADY, t0k)
         C.mbarrier_wait_parity(misc + B_TREADY, 0)
-        nunits = Int32(C.ld_shared_u32(misc + M_NUNITS))
-        nex = Int32(C.ld_shared_u32(misc + M_NEX))
+        nunits = Int32(C.ld_shared_u32(misc + self.M_NUNITS))
+        nex = Int32(C.ld_shared_u32(misc + self.M_NEX))
         self.token_data(
             ids,
             topw,
@@ -1311,7 +1691,7 @@ class Nvfp4MoeSmallM16:
         lane_base = tm + Int32(32 * qd) * 65536
         recv = base + OFF_RECV
         ex = Int32(0)
-        for k in cutlass.range(nunits + LOOKAHEAD, unroll=1):
+        for k in cutlass.range(nunits + self.LOOKAHEAD, unroll=1):
             if k < nunits:
                 i = k
                 b = i & 1
@@ -1320,90 +1700,148 @@ class Nvfp4MoeSmallM16:
                 if et == 0:
                     for gi in cutlass.range(ng, unroll=1):
                         C.mbarrier_arrive_expect_tx(
-                            misc + B_PRECV + 8 * ((ex + gi) % RECV_BUFS),
+                            misc + self.B_PRECV + 8 * ((ex + gi) % self.RECV_BUFS),
                             3 * 128 * 16,
                             ".relaxed.cluster",
                         )
-                C.mbarrier_wait_parity(misc + B_ACC1_FULL + 8 * b, (i >> 1) & 1)
+                self.twait(
+                    misc + B_ACC1_FULL + 8 * b, (i >> 1) & 1, err, block, TR_W_ACC1F, et
+                )
+                if cutlass.const_expr(self.trace):
+                    th = P.globaltimer()
                 T.tc_fence_after()
                 va = T.tmem_load4_masked(lane_base + T_ACC1 + N * b, gm)
                 T.tc_fence_before()
                 cute.arch.sync_warp()
                 if lane == 0:
                     C.mbarrier_arrive(misc + B_ACC1_EMPTY + 8 * b)
-                g1 = C.ld_shared_f32(misc + M_UNITS + i * UNIT_BYTES + U_G1)
+                g1 = C.ld_shared_f32(misc + self.M_UNITS + i * UNIT_BYTES + U_G1)
                 ush = self.ufield(misc, i, U_SH)
-                gi = Int32(0)
-                for g in cutlass.range_constexpr(GROUPS):
-                    if ((gm >> g) & 1) != 0:
-                        mg = self.rows_of(mqs, g)
-                        v0, v1, v2, v3 = va[g]
-                        e = ex + gi
-                        p = e % RECV_BUFS
-                        use = e // RECV_BUFS
-                        gi = gi + 1
-                        if use >= 1:
-                            C.mbarrier_wait_parity(
-                                misc + B_PFREE + 8 * p,
-                                (use - 1) & 1,
+                if cutlass.const_expr(self.xpipe):
+                    gi = Int32(0)
+                    for g in cutlass.range_constexpr(GROUPS):
+                        if ((gm >> g) & 1) != 0:
+                            self.xsend(
+                                va[g], ex + gi, misc, recv, crank, row, err, block, et
+                            )
+                            gi = gi + 1
+                    gi = Int32(0)
+                    for g in cutlass.range_constexpr(GROUPS):
+                        if ((gm >> g) & 1) != 0:
+                            mg = self.rows_of(mqs, g)
+                            e = ex + gi
+                            gi = gi + 1
+                            acc = self.xsum(
+                                va[g], e, misc, recv, crank, row, err, block, et
+                            )
+                            p = e % self.RECV_BUFS
+                            cute.arch.sync_warp()
+                            # bar.sync (PTX 8.9.4): all lanes' reads precede the release
+                            cute.arch.barrier(barrier_id=3 + qd, number_of_threads=32)
+                            if (lane == 0) & (e + self.RECV_BUFS < nex):
+                                C.mbarrier_arrive(misc + self.B_CONSUMED + 8 * p)
+                            if ush != Uint32(0):
+                                self.shared_h(
+                                    acc, mg, REQ_ROWS * g, base + self.OFF_HBF, qd, lane
+                                )
+                            else:
+                                self.routed_h(
+                                    acc,
+                                    g1,
+                                    gs2,
+                                    mg,
+                                    REQ_ROWS * g,
+                                    base + self.OFF_H + H_BUF * (i % self.H_BUFS),
+                                    qd,
+                                    lane,
+                                )
+                else:
+                    gi = Int32(0)
+                    for g in cutlass.range_constexpr(GROUPS):
+                        if ((gm >> g) & 1) != 0:
+                            mg = self.rows_of(mqs, g)
+                            v0, v1, v2, v3 = va[g]
+                            e = ex + gi
+                            p = e % self.RECV_BUFS
+                            use = e // self.RECV_BUFS
+                            gi = gi + 1
+                            if use >= 1:
+                                self.twait(
+                                    misc + self.B_PFREE + 8 * p,
+                                    (use - 1) & 1,
+                                    err,
+                                    block,
+                                    TR_W_PFREE,
+                                    et,
+                                    ".acquire.cluster",
+                                )
+                            lbar = misc + self.B_PRECV + 8 * p
+                            for pr in cutlass.range_constexpr(CLUSTER):
+                                if crank != pr:
+                                    # our slot in peer pr's buffer: our rank, skipping the
+                                    # peer's own
+                                    sslot = crank
+                                    if crank > pr:
+                                        sslot = crank - 1
+                                    laddr = recv + ((p * 3 + sslot) * 128 + row) * 16
+                                    P.st_async_v4_f32(
+                                        C.mapa_shared_cluster(laddr, pr),
+                                        C.mapa_shared_cluster(lbar, pr),
+                                        v0,
+                                        v1,
+                                        v2,
+                                        v3,
+                                    )
+                            self.twait(
+                                misc + self.B_PRECV + 8 * p,
+                                use & 1,
+                                err,
+                                block,
+                                TR_W_PRECV,
+                                et,
                                 ".acquire.cluster",
                             )
-                        lbar = misc + B_PRECV + 8 * p
-                        for pr in cutlass.range_constexpr(CLUSTER):
-                            if crank != pr:
-                                # our slot in peer pr's buffer: our rank, skipping the
-                                # peer's own
-                                sslot = crank
-                                if crank > pr:
-                                    sslot = crank - 1
-                                laddr = recv + ((p * 3 + sslot) * 128 + row) * 16
-                                P.st_async_v4_f32(
-                                    C.mapa_shared_cluster(laddr, pr),
-                                    C.mapa_shared_cluster(lbar, pr),
-                                    v0,
-                                    v1,
-                                    v2,
-                                    v3,
-                                )
-                        C.mbarrier_wait_parity(
-                            misc + B_PRECV + 8 * p, use & 1, ".acquire.cluster"
-                        )
-                        acc = [Float32(0.0), Float32(0.0), Float32(0.0), Float32(0.0)]
-                        for src in cutlass.range_constexpr(CLUSTER):
-                            p0, p1, p2, p3 = v0, v1, v2, v3
-                            if crank != src:
-                                rslot = Int32(src)
-                                if src > crank:
-                                    rslot = Int32(src - 1)
-                                p0, p1, p2, p3 = P.ld_shared_v4_f32(
-                                    recv + ((p * 3 + rslot) * 128 + row) * 16
-                                )
                             acc = [
-                                P.add_f32(acc[0], p0),
-                                P.add_f32(acc[1], p1),
-                                P.add_f32(acc[2], p2),
-                                P.add_f32(acc[3], p3),
+                                Float32(0.0),
+                                Float32(0.0),
+                                Float32(0.0),
+                                Float32(0.0),
                             ]
-                        cute.arch.sync_warp()
-                        # bar.sync (PTX 8.9.4): all lanes' reads precede the release
-                        cute.arch.barrier(barrier_id=3 + qd, number_of_threads=32)
-                        if (lane == 0) & (e + RECV_BUFS < nex):
-                            C.mbarrier_arrive(misc + B_CONSUMED + 8 * p)
-                        if ush != Uint32(0):
-                            self.shared_h(
-                                acc, mg, REQ_ROWS * g, base + OFF_HBF, qd, lane
-                            )
-                        else:
-                            self.routed_h(
-                                acc,
-                                g1,
-                                gs2,
-                                mg,
-                                REQ_ROWS * g,
-                                base + OFF_H + H_BUF * (i % H_BUFS),
-                                qd,
-                                lane,
-                            )
+                            for src in cutlass.range_constexpr(CLUSTER):
+                                p0, p1, p2, p3 = v0, v1, v2, v3
+                                if crank != src:
+                                    rslot = Int32(src)
+                                    if src > crank:
+                                        rslot = Int32(src - 1)
+                                    p0, p1, p2, p3 = P.ld_shared_v4_f32(
+                                        recv + ((p * 3 + rslot) * 128 + row) * 16
+                                    )
+                                acc = [
+                                    P.add_f32(acc[0], p0),
+                                    P.add_f32(acc[1], p1),
+                                    P.add_f32(acc[2], p2),
+                                    P.add_f32(acc[3], p3),
+                                ]
+                            cute.arch.sync_warp()
+                            # bar.sync (PTX 8.9.4): all lanes' reads precede the release
+                            cute.arch.barrier(barrier_id=3 + qd, number_of_threads=32)
+                            if (lane == 0) & (e + self.RECV_BUFS < nex):
+                                C.mbarrier_arrive(misc + self.B_CONSUMED + 8 * p)
+                            if ush != Uint32(0):
+                                self.shared_h(
+                                    acc, mg, REQ_ROWS * g, base + self.OFF_HBF, qd, lane
+                                )
+                            else:
+                                self.routed_h(
+                                    acc,
+                                    g1,
+                                    gs2,
+                                    mg,
+                                    REQ_ROWS * g,
+                                    base + self.OFF_H + H_BUF * (i % self.H_BUFS),
+                                    qd,
+                                    lane,
+                                )
                 ex = ex + ng
                 C.fence_proxy_async_shared_cta()
                 cute.arch.sync_warp()
@@ -1411,9 +1849,14 @@ class Nvfp4MoeSmallM16:
                 cute.arch.barrier(barrier_id=3 + qd, number_of_threads=32)
                 if lane == 0:
                     C.mbarrier_arrive(misc + B_HREADY + 8 * self.hready_slot(i))
-            if (k >= LOOKAHEAD) & (k - LOOKAHEAD < nunits):
+                if cutlass.const_expr(self.trace):
+                    if et == 0:
+                        self.tr_since(err, block, TR_HCHAIN, th)
+            if (k >= self.LOOKAHEAD) & (k - self.LOOKAHEAD < nunits):
+                if cutlass.const_expr(self.trace):
+                    tr0 = P.globaltimer()
                 self.readout(
-                    k - LOOKAHEAD,
+                    k - self.LOOKAHEAD,
                     rows,
                     mqs,
                     rbs,
@@ -1424,7 +1867,16 @@ class Nvfp4MoeSmallM16:
                     lane_base,
                     row,
                     lane,
+                    err,
+                    block,
+                    et,
                 )
+                if cutlass.const_expr(self.trace):
+                    if et == 0:
+                        self.tr_since(err, block, TR_READOUT, tr0)
+        if cutlass.const_expr(self.trace):
+            if et == 0:
+                self.tr_since(err, block, TR_EPI_END, t0k)
 
     # ------------------------------------------------------------ kernel
     @cute.kernel
@@ -1456,11 +1908,14 @@ class Nvfp4MoeSmallM16:
         block, _, _ = cute.arch.block_idx()
         warp = tid // 32
         lane = tid % 32
+        t0k = 0
+        if cutlass.const_expr(self.trace):
+            t0k = P.globaltimer()
         sm = SmemAllocator().allocate_tensor(
-            cutlass.Uint8, cute.make_layout(SMEM), 1024
+            cutlass.Uint8, cute.make_layout(self.SMEM), 1024
         )
         base = Int32(sm.iterator.toint())
-        misc = base + OFF_MISC
+        misc = base + self.OFF_MISC
         crank = Int32(cute.arch.block_idx_in_cluster())
         cl = block // CLUSTER
         # the kernel declares no cluster shape (the launch sets it): refuse any
@@ -1483,23 +1938,23 @@ class Nvfp4MoeSmallM16:
             C.mbarrier_init(misc + B_ACC2_FULL, 1)
             C.mbarrier_init(misc + B_ACC2_EMPTY, 4)
             for s in cutlass.range_constexpr(RING):
-                C.mbarrier_init(misc + B_SFA_FULL + 8 * s, 1)
-            C.mbarrier_init(misc + B_SFX_READY, 1)
-            for b in cutlass.range_constexpr(H_BUFS):
+                C.mbarrier_init(misc + self.B_SFA_FULL + 8 * s, 1)
+            C.mbarrier_init(misc + self.B_SFX_READY, 1)
+            for b in cutlass.range_constexpr(self.H_BUFS):
                 C.mbarrier_init(misc + B_HREADY + 8 * b, 4)
-            for p in cutlass.range_constexpr(RECV_BUFS):
-                C.mbarrier_init(misc + B_PRECV + 8 * p, 1)
-                C.mbarrier_init(misc + B_PFREE + 8 * p, 3)
-                C.mbarrier_init(misc + B_CONSUMED + 8 * p, 4)
+            for p in cutlass.range_constexpr(self.RECV_BUFS):
+                C.mbarrier_init(misc + self.B_PRECV + 8 * p, 1)
+                C.mbarrier_init(misc + self.B_PFREE + 8 * p, 3)
+                C.mbarrier_init(misc + self.B_CONSUMED + 8 * p, 4)
             C.fence_mbarrier_init_release_cluster()
         if warp == 1:
-            T.tmem_alloc(misc + M_TMEM, 512)
+            T.tmem_alloc(misc + self.M_TMEM, 512)
         T.tc_fence_before()
         cute.arch.sync_threads()
         T.tc_fence_after()
         cute.arch.cluster_arrive_relaxed(aligned=True)
         # TMEM base, read by every thread once the allocation is visible
-        tm = Int32(C.ld_shared_u32(misc + M_TMEM))
+        tm = Int32(C.ld_shared_u32(misc + self.M_TMEM))
         # per-request rows (byte q of mqs) and first global rows (byte q of rbs = sum of
         # the earlier rows)
         rbs = (mqs << 8) * 0x01010101
@@ -1532,9 +1987,11 @@ class Nvfp4MoeSmallM16:
                 my_sh,
                 nring,
                 lane,
+                block,
+                t0k,
             )
         elif warp == 1:
-            self.mma_warp(base, misc, nring)
+            self.mma_warp(base, misc, nring, err, block, lane, t0k)
         elif warp == SF_WARP:
             self.sf_warp(base, misc, nring)
         elif warp == RELEASE_WARP:
@@ -1565,12 +2022,21 @@ class Nvfp4MoeSmallM16:
                 warp,
                 lane,
                 tid,
+                err,
+                t0k,
             )
         if (warp < 2) | (warp == SF_WARP):
             cute.arch.cluster_wait()
         T.tc_fence_before()
         cute.arch.sync_threads()
         T.tc_fence_after()
+        if cutlass.const_expr(self.trace):
+            if tid == 0:
+                t1 = P.globaltimer()
+                C.st_global_u64(self.tr_addr(err, block, TR_ENTRY), t0k)
+                C.st_global_u64(self.tr_addr(err, block, TR_EXIT), t1)
+                self.tr_add(err, block, TR_DUR, t1 - t0k)
+                self.tr_add(err, block, TR_LAUNCHES, 1)
         if warp == 1:
             T.tmem_free(tm, 512)
         cute.arch.cluster_arrive(aligned=True)

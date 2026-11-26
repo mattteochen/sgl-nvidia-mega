@@ -19,6 +19,7 @@ output). With bit 1 clear the scratch buffers are the output (the fold ABI: ``pa
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 
@@ -33,6 +34,43 @@ REQUEST_ROWS = 4
 SHARED_PARTS = 4
 MIN_CLUSTERS_SHARED = 8
 ENGINE_SMEM = {"g1": 227440, "g2": 229968, "g4": 223664}
+
+# Opt-in forms of the four-request engine (mode g4, 9..16 rows), read at build; the
+# defaults are the served form. Every form leaves each output bit unchanged.
+#   ..._MOE16_XPIPE=1         per unit, push all groups' K-split partials before waiting
+#   ..._MOE16_L2PF=D          L2 prefetch of unit i + D's routed weights at unit i (0 off)
+#   ..._MOE16_RECV_BUFS=n     exchange receive buffers (default 5)
+#   ..._MOE16_LOOKAHEAD=n     FC2(k) after FC1(k + n) (default 2)
+#   ..._MOE16_SHARED_WEIGHT=w schedule weight of the shared quarter in units (default 4)
+#   ..._MOE16_CLUSTERS=n      g4 grid in clusters, at most the co-resident count (0 off)
+MOE16_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_MOE16_"
+
+
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(MOE16_ENV + name, "").strip()
+    return int(raw) if raw else default
+
+
+def g4_knobs() -> dict:
+    """The g4 engine's build-time choices from the environment (defaults: served)."""
+    from .engine import LOOKAHEAD
+    from .engine16 import RECV_BUFS
+
+    return {
+        "xpipe": _env_int("XPIPE", 0) != 0,
+        "l2pf": _env_int("L2PF", 0),
+        "recv_bufs": _env_int("RECV_BUFS", RECV_BUFS),
+        "lookahead": _env_int("LOOKAHEAD", LOOKAHEAD),
+    }
+
+
+def g4_schedule_knobs() -> dict:
+    """The g4 schedule's choices from the environment: shared-quarter weight and grid
+    cap in clusters (0: the co-resident count)."""
+    return {
+        "shared_weight": _env_int("SHARED_WEIGHT", S.G4_SHARED_WEIGHT),
+        "clusters": _env_int("CLUSTERS", 0),
+    }
 
 
 @dataclass
@@ -188,7 +226,7 @@ def compile_specs(shared: bool = True) -> dict[str, tuple[object, tuple]]:
         "g1": (Nvfp4MoeSmallM("g1", shared), eng(4, 4)),
         "g2": (Nvfp4MoeSmallM("g2", shared), eng(8, 4)),
         "g4": (
-            Nvfp4MoeSmallM16(shared),
+            Nvfp4MoeSmallM16(shared, **g4_knobs()),
             eng(16, pack_rows((4, 4, 4, 4))),
         ),
         "finalize": (
@@ -227,12 +265,26 @@ class SmallMMoe:
         self.shared = shared
         self.device = device
         self.scratch = Scratch(device)
+        sk = g4_schedule_knobs()
+        self.g4_clusters = nclusters
+        if sk["clusters"] > 0:
+            self.g4_clusters = min(nclusters, sk["clusters"])
+        if shared and self.g4_clusters < MIN_CLUSTERS_SHARED:
+            raise ValueError(
+                "small-M MoE: the in-engine shared expert needs "
+                f">= {MIN_CLUSTERS_SHARED} clusters"
+            )
         self.tables = {}
-        for mode, build in (("g1", S.g1_table), ("g2", S.g2_table), ("g4", S.g4_table)):
+        for mode, build in (("g1", S.g1_table), ("g2", S.g2_table)):
             for nc in sorted({nclusters, min(nclusters, 32)}):
                 self.tables[(mode, nc)] = build(nc, shared).to(device)
+        self.tables[("g4", self.g4_clusters)] = S.g4_table(
+            self.g4_clusters, shared, shared_weight=sk["shared_weight"]
+        ).to(device)
 
     def clusters(self, mode: str, rows: int) -> int:
+        if mode == "g4":
+            return self.g4_clusters
         return min(self.nclusters, 32) if mode == "g1" and rows == 1 else self.nclusters
 
     def __call__(

@@ -259,9 +259,12 @@ class MoeGlue:
         modes = {self.api.mode_for(moe_split(m)) for m in rows if 1 <= m <= MAX_ROWS}
         for name in sorted({"route", "finalize"} | modes):
             kernel, args = self.specs[name]
+            constexprs = {"unit": name, "shared": True}
+            if hasattr(kernel, "knobs"):  # the g4 engine's opt-in forms
+                constexprs.update(kernel.knobs())
             self.fn[name] = compile_cached(
                 kernel,
-                {"unit": name, "shared": True},
+                constexprs,
                 lambda k=kernel, a=args: cute.compile(k, *a),
             )
         nclusters = self.api.default_clusters(self.device)
