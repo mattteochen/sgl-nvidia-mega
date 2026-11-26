@@ -30,7 +30,15 @@ head CTA issues each phase's loads before that phase's stores and keeps its glob
 q_pe stores out of the hand-off; same outputs), ``kv_split`` (16 rows only: the
 kv cluster's rows 8..15 run on CTAs 2 (MLA rows) and 3 (index-K rows) beside rows 0..7 on
 CTAs 0 and 1, instead of a second pass of the same warps; the top-k fill moves to CTAs
-4..7; per row the same operations, so the same outputs), ``numerics``
+4..7; per row the same operations, so the same outputs), with ``overlap16`` and the
+strided sums: ``row_norm`` (warp w loads q rows w / w + 8 in the strided-sum lane
+layout, row w first, sums and normalizes each from its registers and stores only the
+normalized rows: no shared-memory round trip for the sums, no CTA-wide normalize phase;
+each head CTA stores 1 KiB of ``qc_out`` from its XS slots after the q_b products; per
+row the same operations, so the same outputs), with ``push``: ``early_arm`` (the QN
+barrier is armed by a CTA-scope arrive before the weight bulk copies are issued, instead
+of a cluster-scope release arrive after them, which waited ~1.5 us for the copies
+before the PDL wait; same outputs), ``numerics``
 (``PrologueNumerics``: the sum orders, rounding points and scale rule, each named by
 the arithmetic it selects), ``rope_cache_fp32`` and ``index_rope_cache_fp32`` (cos /
 sin caches FP32, else BF16; layout [positions, 64] = cos | sin),
@@ -288,6 +296,8 @@ class MlaPrologue:
         probe: bool = False,
         push: bool = False,
         f32x2: bool = False,
+        row_norm: bool = False,
+        early_arm: bool = False,
     ):
         if max_rows not in (8, 16):
             raise ValueError(f"max_rows must be 8 or 16, got {max_rows}")
@@ -319,6 +329,14 @@ class MlaPrologue:
             )
         self.index_scale_ue8m0x4 = index_scale_ue8m0x4
         self.trigger_at_end = trigger_at_end
+        if row_norm and not (overlap16 and numerics.norm_order == "strided_8x256"):
+            raise ValueError("row_norm applies to overlap16 with the strided q_a sums")
+        if early_arm and not (overlap16 and push):
+            raise ValueError("early_arm applies to overlap16 with push")
+        # row_norm: the q rows summed and normalized by the warp that loads them
+        self.row_norm = row_norm
+        # early_arm: the QN barrier armed (CTA scope) before the weight bulk copies
+        self.early_arm = early_arm
         self.off = layout(max_rows, overlap16, push)
         if overlap8:
             self.off = layout_overlap8(self.off)
@@ -1551,6 +1569,7 @@ class MlaPrologue:
         s_pub = base + off["pub"]
         s_qn = base + off["qn"]
         strided = self.num.norm_order == "strided_8x256"
+        rn = self.row_norm
         self.mark(0, tid)
         qbar = bar + 8  # push: this CTA's QN barrier
         if tid == 0:
@@ -1559,6 +1578,12 @@ class MlaPrologue:
                 ptx.mbarrier_init(qbar, 1)
             ptx.fence_mbarrier_init_release_cluster()
             ptx.fence_proxy_async_shared_cta()
+            if cutlass.const_expr(self.early_arm):
+                # every q_nope rank's rows of this CTA: 6 x rows x 64 bytes. A CTA-scope
+                # arrive before the copies: the waiters acquire the peers' pushes, not this
+                # thread's prior writes, so no cluster-scope release (which waited for the
+                # copies in flight); the co-start barrier still orders the init
+                ptx.mbarrier_arrive_expect_tx(qbar, (NOPE // 32) * 64 * rows)
             ptx.mbarrier_arrive_expect_tx(bar, WQB_BYTES + WUK_BYTES)
             src_qb = w_qb + Int64(h * 16 + 2 * r) * ((Q_LORA // 32) * 1024)
             src_uk = w_uk + Int64(h * 32 + 4 * r) * ((NOPE // 32) * 1024)
@@ -1570,12 +1595,27 @@ class MlaPrologue:
                     bar,
                 )
             ptx.bulk_copy_g2s(base + off["wuk"], src_uk, WUK_BYTES, bar)
-            if cutlass.const_expr(self.push):
+            if cutlass.const_expr(self.push and not self.early_arm):
                 # every q_nope rank's rows of this CTA: 6 x rows x 64 bytes
                 ptx.mbarrier_arrive_expect_tx(
                     qbar, (NOPE // 32) * 64 * rows, ".release.cluster"
                 )
+        self.mark(15, tid)  # probe: thread 0's barrier / copy block done
         qw = ptx.ld_global_nc_v4(q_norm_w + Int64(tid) * 16)
+        nw = []
+        if cutlass.const_expr(rn):
+            # row_norm: the norm weights of this lane's chunks l + 32 b (b = 0..7) of a
+            # row, "+ 0" applied in FP32 and repacked (exact: BF16 values)
+            for b in cutlass.range_constexpr(8):
+                q_w = ptx.ld_global_nc_v4(q_norm_w + Int64(lane + 32 * b) * 16)
+                words = []
+                for e in cutlass.range_constexpr(4):
+                    lo, hi = ptx.bf16x2_to_f32x2(q_w[e])
+                    if cutlass.const_expr(self.num.norm_weight_plus_zero):
+                        lo = ptx.add_rn(lo, Float32(0.0))
+                        hi = ptx.add_rn(hi, Float32(0.0))
+                    words.append(ptx.cvt_rn_bf16x2_f32(lo, hi))
+                nw.append(words)
         inv_qs = ptx.rcp_rn(ptx.ld_global_nc_f32(q_scale))
         ptx.sync_threads()
         if cutlass.const_expr(self.push):
@@ -1600,12 +1640,30 @@ class MlaPrologue:
             )
         # rows are predicated, not branched, so the scheduler can interleave them
         qv = []
-        for n in cutlass.range_constexpr(max_rows):
-            qv.append(
-                ptx.ld_global_v4_if(
-                    q_c + (Int64(n) * q_c_stride + Int64(tid * 8)) * 2, n < rows
+        if cutlass.const_expr(rn):
+            # row_norm: warp w loads rows w and w + 8, lane l chunks l + 32 b (the lane
+            # layout of the strided sums) into qv[8 half + b], row w first (it lands
+            # first, so its sums and normalize overlap row w + 8's loads)
+            for hf in cutlass.range_constexpr(2):
+                for b in cutlass.range_constexpr(8):
+                    qv.append(
+                        ptx.ld_global_v4_if(
+                            q_c
+                            + (
+                                Int64(warp + 8 * hf) * q_c_stride
+                                + Int64((lane + 32 * b) * 8)
+                            )
+                            * 2,
+                            warp + 8 * hf < rows,
+                        )
+                    )
+        else:
+            for n in cutlass.range_constexpr(max_rows):
+                qv.append(
+                    ptx.ld_global_v4_if(
+                        q_c + (Int64(n) * q_c_stride + Int64(tid * 8)) * 2, n < rows
+                    )
                 )
-            )
         rope_c = [Float32(0.0), Float32(0.0)]
         rope_s = [Float32(0.0), Float32(0.0)]
         for it in cutlass.range_constexpr(2):
@@ -1616,19 +1674,23 @@ class MlaPrologue:
                 rope_cache,
                 rope_stride,
             )
-        for n in cutlass.range_constexpr(max_rows):
-            _sts_v4_if(s_xs + n * XS_STRIDE + tid * 16, qv[n], n < rows)
-        self.mark(3, tid)
-        if cutlass.const_expr(strided):
-            ptx.sync_threads()
-            if warp + 8 < rows:
-                self.q_norm_pair_strided(s_xs, s_ssq, warp, lane)
-            else:
-                if warp < rows:
-                    self.q_norm_row_strided(s_xs, s_ssq, warp, lane)
+        if cutlass.const_expr(rn):
+            self.row_norm16(s_xs, qv, nw, tid, warp, lane, rows, q_eps)
         else:
-            self.q_norm_sums_contiguous(s_ssq, qv, warp, lane, rows)
-        ptx.sync_threads()
+            for n in cutlass.range_constexpr(max_rows):
+                _sts_v4_if(s_xs + n * XS_STRIDE + tid * 16, qv[n], n < rows)
+            self.mark(3, tid)
+            if cutlass.const_expr(strided):
+                ptx.sync_threads()
+                if warp + 8 < rows:
+                    self.q_norm_pair_strided(s_xs, s_ssq, warp, lane)
+                else:
+                    if warp < rows:
+                        self.q_norm_row_strided(s_xs, s_ssq, warp, lane)
+            else:
+                self.q_norm_sums_contiguous(s_ssq, qv, warp, lane, rows)
+        if cutlass.const_expr(not rn):
+            ptx.sync_threads()
         self.mark(4, tid)
         wv = []
         for e in cutlass.range_constexpr(4):
@@ -1638,7 +1700,7 @@ class MlaPrologue:
                 hi = ptx.add_rn(hi, Float32(0.0))
             wv.append(lo)
             wv.append(hi)
-        if cutlass.const_expr(strided):
+        if cutlass.const_expr(strided and not rn):
             # every row's sum of squares and raw row, then the normalized rows
             ss = []
             raw = []
@@ -1658,7 +1720,7 @@ class MlaPrologue:
                     packed,
                     qc_on & (n < rows),
                 )
-        else:
+        elif cutlass.const_expr(not rn):
             for n in cutlass.range_constexpr(max_rows):
                 if n < rows:
                     s = Float32(0.0)
@@ -1699,6 +1761,18 @@ class MlaPrologue:
                     )
                     c[j * 2 + tt] = ptx.mma_m16n8k16_bf16(
                         (lo[2], hi[2], lo[3], hi[3]), (bq[2], bq[3]), c1
+                    )
+        if cutlass.const_expr(rn):
+            # the q_a output (indexer layers): every head CTA holds all normalized rows,
+            # so head CTA q = 8 h + r stores row q / 4, chunks 64 (q % 4) .. + 63 (1 KiB)
+            # from its XS slot before the partials reuse it
+            if qc_out != Int64(0):
+                n_q = (h * 8 + r) // 4
+                c_q = ((h * 8 + r) % 4) * 64 + tid
+                if (tid < 64) & (n_q < rows):
+                    ptx.st_global_v4(
+                        qc_out + (Int64(n_q) * qc_out_stride + Int64(c_q * 8)) * 2,
+                        ptx.ld_shared_v4(s_xs + n_q * XS_STRIDE + c_q * 16),
                     )
         # the partials reuse the token rows: every warp must be done reading them
         self.rows_dead()
@@ -1876,6 +1950,51 @@ class MlaPrologue:
         self.release_outputs()
         self.exit_wait()
         self.mark(14, tid)
+
+    @cute.jit
+    def row_norm16(
+        self,
+        s_xs: Int32,
+        qv,
+        nw,
+        tid: Int32,
+        warp: Int32,
+        lane: Int32,
+        rows: Int32,
+        q_eps: Float32,
+    ):
+        """row_norm: warp w's rows w / w + 8 (``qv[8 half + b]`` = chunk l + 32 b of
+        lane l), one after the other: the row summed in q_norm_row_strided's order from
+        registers; after the butterfly every lane holds the row's sum (each step adds
+        the same two values in either order), so each lane normalizes its chunks with
+        head_cta16's arithmetic and stores them to the row's XS slot. No branch: an
+        unused row is computed and not stored."""
+        wf = []
+        for b in cutlass.range_constexpr(8):
+            wb = []
+            for e in cutlass.range_constexpr(4):
+                lo, hi = ptx.bf16x2_to_f32x2(nw[b][e])
+                wb.append(lo)
+                wb.append(hi)
+            wf.append(wb)
+        for hf in cutlass.range_constexpr(2):
+            sm = Float32(0.0)
+            for b in cutlass.range_constexpr(8):
+                for e in cutlass.range_constexpr(4):
+                    lo, hi = ptx.bf16x2_to_f32x2(qv[8 * hf + b][e])
+                    sm = ptx.add_rn(sm, ptx.mul_rn(lo, lo))
+                    sm = ptx.add_rn(sm, ptx.mul_rn(hi, hi))
+            for k in cutlass.range_constexpr(5):
+                sm = ptx.add_rn(sm, cute.arch.shuffle_sync_bfly(sm, 1 << k))
+            rr = ptx.rsqrt_approx(ptx.fma_rn(sm, Float32(1.0 / Q_LORA), q_eps))
+            for b in cutlass.range_constexpr(8):
+                _sts_v4_if(
+                    s_xs + (warp + 8 * hf) * XS_STRIDE + (lane + 32 * b) * 16,
+                    self.norm_words(qv[8 * hf + b], rr, wf[b]),
+                    warp + 8 * hf < rows,
+                )
+            if cutlass.const_expr(hf == 0):
+                self.mark(3, tid)
 
     @cute.jit
     def q_rope_byte(
