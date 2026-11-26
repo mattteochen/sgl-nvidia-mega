@@ -22,6 +22,7 @@ which consumes the fold hop's deferred input norm.
 from __future__ import annotations
 
 import logging
+import os
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -120,6 +121,21 @@ INDEX_Q_ROPE_FORM = "mul_sub"
 NEXT_QKV_A_PREFETCH_BYTES = 8 << 20
 O_PROJ_STAGE_SLAB_BYTES = 48 * 2048 * 2
 O_PROJ_STAGE_PREFIX_BYTES = 122_880
+# Measurement knobs (read at build; prefetches are hints, so no output changes):
+# SGLANG_NVIDIA_MEGAKERNEL_GLM_OPROJ_STAGE_PREFIX bytes of each o_proj slab (0 .. 196,608; "full" = the whole slab) and
+# SGLANG_NVIDIA_MEGAKERNEL_GLM_NEXT_QKV_A_PREFETCH bytes of the next layer's q_a / kv_a weight.
+OPROJ_STAGE_PREFIX_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_OPROJ_STAGE_PREFIX"
+NEXT_QKV_A_PREFETCH_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_NEXT_QKV_A_PREFETCH"
+
+
+def _env_bytes(name: str, default: int, full: int) -> int:
+    raw = os.environ.get(name, "").strip().lower()
+    if not raw:
+        return default
+    value = full if raw == "full" else int(raw)
+    if not 0 <= value <= full:
+        raise ValueError(f"{name}={raw!r}: expected 0..{full} bytes or 'full'")
+    return value
 EVICT_LAST = 0
 
 Slot = Tuple[int, int, int, int, int]
@@ -175,7 +191,9 @@ def _o_proj_stage_slot(w: torch.Tensor) -> Slot:
         w,
         w.numel() * w.element_size(),
         O_PROJ_STAGE_SLAB_BYTES,
-        O_PROJ_STAGE_PREFIX_BYTES,
+        _env_bytes(
+            OPROJ_STAGE_PREFIX_ENV, O_PROJ_STAGE_PREFIX_BYTES, O_PROJ_STAGE_SLAB_BYTES
+        ),
     )
 
 
@@ -591,7 +609,12 @@ class AttentionGlue:
             rope_f32.add(_rope_cache_fp32(rope, "RoPE cache"))
             args = LayerArgs(
                 w_uv=derived.add("attention.uv_proj", pack_uv_proj(kv_b)).data_ptr(),
-                stage0=_prefetch_slot(nxt, NEXT_QKV_A_PREFETCH_BYTES),
+                stage0=_prefetch_slot(
+                    nxt,
+                    _env_bytes(
+                        NEXT_QKV_A_PREFETCH_ENV, NEXT_QKV_A_PREFETCH_BYTES, 1 << 30
+                    ),
+                ),
                 w_qb=derived.add("attention.q_b", pack_q_b(q_b)).data_ptr(),
                 w_uk=derived.add("attention.w_uk_t", pack_w_uk_t(kv_b)).data_ptr(),
                 q_norm_w=attn.q_a_layernorm.weight,
