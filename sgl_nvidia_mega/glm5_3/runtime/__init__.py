@@ -595,17 +595,29 @@ def _hops_for_draft(model, family) -> None:
     registered for the draft under the shared embedding table."""
     import cutlass.cute as cute
 
-    from sgl_nvidia_mega.glm5_3.draft_step import SITE_NAMES
+    from sgl_nvidia_mega.glm5_3.draft_step import SITE_NAMES, draft_front_mode
     from sgl_nvidia_mega.glm5_3.runtime.compile import compile_cached
     from sgl_nvidia_mega.glm5_3.sm103.hop import api as hop_api
 
-    unit = {s.name: s for s in hop_api.unit_specs(plain_allreduce=True)}["allreduce"]
-    family.kernels.compiled.setdefault(
-        "allreduce",
-        compile_cached(
-            unit.obj, unit.constexprs, lambda: cute.compile(unit.obj, *unit.args)
-        ),
-    )
+    # DRAFT_FRONT_ENV=rowpar: also the residual-free all-reduce + RMSNorm (the
+    # row-parallel eh_proj sum through the draft layer's input norm)
+    names = ("allreduce", "allreduce_rmsnorm") if draft_front_mode() else ("allreduce",)
+    units = {
+        s.name: s
+        for s in hop_api.unit_specs(
+            plain_allreduce=True, allreduce_rmsnorm="allreduce_rmsnorm" in names
+        )
+    }
+    for name in names:
+        unit = units[name]
+        family.kernels.compiled.setdefault(
+            name,
+            compile_cached(
+                unit.obj,
+                unit.constexprs,
+                lambda unit=unit: cute.compile(unit.obj, *unit.args),
+            ),
+        )
     family.register_sites(SITE_NAMES)
     register_target_hops(model.model.embed_tokens.weight, family.kernels)
 

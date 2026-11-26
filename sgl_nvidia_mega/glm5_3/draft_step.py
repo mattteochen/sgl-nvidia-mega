@@ -17,6 +17,12 @@ kernels inside the draft-decode and draft-extend CUDA graphs.
 * the draft top-1 runs as a distributed argmax over each rank's logit shard (one cooperative kernel that exchanges a
   (value, index) candidate per row through a symmetric-memory mailbox) instead of the logits all-gather; the stock
   ``draft_topk1_postprocess`` then reads a one-hot logits row, so the token it picks is unchanged;
+* ``SGLANG_NVIDIA_MEGAKERNEL_GLM_DRAFT_FRONT=rowpar`` (default off): with the target's hops and a draft attention step
+  group, ``eh_proj`` runs row-parallel (each rank multiplies its 1536-column K window of the front's output with the
+  same columns of the weight, cuBLAS) and the hop family's residual-free all-reduce + RMSNorm sums the partials and
+  applies the draft layer's input norm in one launch (``draft_attention.PreparedInput``: the attention prepare is
+  skipped). Each partial rounds to BF16 before the sum and the norm is the hop's, so only the draft's proposals can
+  change (acceptance); at most 8 rows per launch (wider steps keep the column shard).
 * slot ``draft_rowselect``: in the draft extend the layer keeps only the ``select_index`` rows (one per request:
   the rows its LM head reads) after the post-attention norm, so the MLP, its all-reduce and the final norm run on
   one row per request (the attention still writes every row's KV and indexer key).
@@ -92,7 +98,11 @@ SGLANG_READS = {
         "start",
         "complete_output",
         "final_norm",
+        # DRAFT_FRONT_ENV: the summed eh_proj is the stream's written residual
+        "set_written",
     ),
+    # DRAFT_FRONT_ENV: the draft layer's input norm, applied in the hop
+    "srt/layers/layernorm.py": ("weight", "variance_epsilon"),
     "srt/model_executor/forward_batch_info.py": (
         "ForwardBatch",
         "spec_info",
@@ -110,7 +120,7 @@ SGLANG_READS = {
         "FULL",
     ),
     "srt/speculative/eagle_info.py|srt/speculative/*.py": ("select_index",),
-    "srt/models/deepseek_v2.py": ("DeepseekV2MoE", "_enable_a2a_moe"),
+    "srt/models/deepseek_v2.py": ("DeepseekV2MoE", "_enable_a2a_moe", "input_layernorm"),
     # the replaced model's modules and its logits processor (and the residual module
     # as the NextN model imports it)
     "srt/models/deepseek_nextn.py": (
@@ -203,10 +213,13 @@ TOP1_EXTEND_ROWS = 8
 TOP1_TIMEOUT_S = 30.0
 # call-site ids of the draft's waits in the error record (the target's hops use layer * 4 + kind)
 SITE_TOP1_DECODE, SITE_TOP1_EXTEND, SITE_EH_GATHER = 1001, 1002, 1003
+# DRAFT_FRONT_ENV: the row-parallel eh_proj sum + input norm (ll.draft's TP4 sum is 1004)
+SITE_EH_NORM = 1005
 SITE_NAMES = {
     SITE_TOP1_DECODE: "draft top-1 (decode)",
     SITE_TOP1_EXTEND: "draft top-1 (extend)",
     SITE_EH_GATHER: "draft eh gather",
+    SITE_EH_NORM: "draft eh_proj sum + input norm",
 }
 # rows per hop launch (the target's mailbox instance A); 12 / 16 rows run as two launches
 HOP_ROWS = 8
@@ -224,6 +237,24 @@ ONE_HOT_FILL = -torch.finfo(torch.float32).max
 # lanes per candidate of SGLang's draft top-1 partials (kernels/ops/speculative/topk1.py:
 # DRAFT_TOPK1_PARTIAL_LANES)
 PARTIAL_LANES = 4
+# the draft front (off unless "rowpar"): eh_proj row-parallel + the hop's all-reduce with the input norm
+DRAFT_FRONT_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_DRAFT_FRONT"
+# the TP8 K window of a rank (2H / 8 input columns: ranks 0-3 the embedding half, 4-7 the hidden half)
+ROWPAR_WORLD = 8
+ROWPAR_WINDOW = 2 * HIDDEN // ROWPAR_WORLD
+
+
+def draft_front_mode() -> Optional[str]:
+    """``DRAFT_FRONT_ENV``: "rowpar", or None (the column shard and its gather)."""
+    mode = os.environ.get(DRAFT_FRONT_ENV, "").strip().lower()
+    if mode in ("", "0", "off"):
+        return None
+    if mode != "rowpar":
+        raise ValueError(
+            f"NVIDIA megakernel: GLM-5.3 / GLM-5.2 draft: {DRAFT_FRONT_ENV}={mode!r} "
+            "(expected rowpar or unset)"
+        )
+    return mode
 
 
 def eh_rows(widths) -> tuple:
@@ -271,6 +302,15 @@ class FusedDraft:
         self.binding = binding
         # the top-1 wait bound: TOP1_TIMEOUT_S within SGLang's wait deadline
         self.top1_timeout_ns = int(min(TOP1_TIMEOUT_S, deadline_s) * 1e9)
+        # DRAFT_FRONT_ENV: this rank's K window of eh_proj, the input norm, and whether the
+        # target's hops serve the sum (decided at the first capture, on every rank alike)
+        self.front_mode = draft_front_mode()
+        self._rp_w: Optional[torch.Tensor] = None
+        self._rp_win = 0
+        self._rp_gamma: Optional[torch.Tensor] = None
+        self._rp_eps = 0.0
+        self._rp_ready = False
+        self._rp_why = "off"
         self._arm(nextn)
 
     def _arm(self, nextn) -> None:
@@ -294,6 +334,8 @@ class FusedDraft:
                 "the GLM-5.3 / GLM-5.2 shape"
             )
         self.eh_weight = w[self.col_off : self.col_off + self.n_local].contiguous()
+        if self.front_mode:
+            self._arm_rowpar(nextn, w)
         specs = compile_specs(
             eh_rows=self.eh_rows,
             top1_rows=(TOP1_DECODE_ROWS, TOP1_EXTEND_ROWS),
@@ -318,15 +360,15 @@ class FusedDraft:
         torch.cuda.synchronize(dev)
         # every rank has built the same draft kernels (also the barrier before any
         # rank's first use of the mailboxes)
-        megakernel_agree(
-            (
-                self.eh_rows,
-                TOP1_DECODE_ROWS,
-                TOP1_EXTEND_ROWS,
-                self._attn_family is not None,
-            ),
-            what="GLM-5.3 / GLM-5.2 draft kernels built",
+        built = (
+            self.eh_rows,
+            TOP1_DECODE_ROWS,
+            TOP1_EXTEND_ROWS,
+            self._attn_family is not None,
         )
+        if self.front_mode:
+            built += (self._rp_w is not None,)
+        megakernel_agree(built, what="GLM-5.3 / GLM-5.2 draft kernels built")
         self.armed = True
 
     def summary(self) -> str:
@@ -340,6 +382,42 @@ class FusedDraft:
             + ("yes" if self.row_select else "no")
         )
 
+    def _arm_rowpar(self, nextn, w: torch.Tensor) -> None:
+        """``DRAFT_FRONT_ENV``: this rank's K window of eh_proj ([H, 2H / 8], 18 MiB) and
+        the draft layer's input norm; the hop unit is the target's (``_attach_target_hops``)."""
+        norm = nextn.model.decoder.input_layernorm
+        gamma = norm.weight
+        if self.world != ROWPAR_WORLD:
+            self._rp_why = f"TP{self.world} (served at TP{ROWPAR_WORLD})"
+        elif gamma.dtype != torch.bfloat16 or tuple(gamma.shape) != (HIDDEN,):
+            self._rp_why = f"input norm weight {tuple(gamma.shape)} {gamma.dtype}"
+        else:
+            self._rp_win = self.rank * ROWPAR_WINDOW
+            self._rp_w = w[:, self._rp_win : self._rp_win + ROWPAR_WINDOW].contiguous()
+            self._rp_gamma, self._rp_eps = gamma, float(norm.variance_epsilon)
+            self._rp_why = "waiting for the target's hops"
+
+    def eh_prepared(self, eh_input: torch.Tensor):
+        """``DRAFT_FRONT_ENV``: the row-parallel eh_proj summed through the draft layer's
+        input norm in the hop (``draft_attention.PreparedInput``), or None (the column
+        shard): an engaged step at 1-8 rows once the target's hops serve the sum."""
+        rows = eh_input.shape[0]
+        if (
+            not self._rp_ready
+            or not self.engaged()
+            or not 1 <= rows <= HOP_ROWS
+            or not eh_input.is_contiguous()
+        ):
+            return None
+        part = torch.matmul(
+            eh_input[:, self._rp_win : self._rp_win + ROWPAR_WINDOW], self._rp_w.t()
+        )
+        out_res = torch.empty_like(part)
+        out_norm = torch.empty_like(part)
+        self._hops.allreduce_rmsnorm(
+            part, self._rp_gamma, out_res, out_norm, site=SITE_EH_NORM
+        )
+        return draft_attention.PreparedInput(out_norm, out_res)
     def _arm_attention(self, nextn) -> None:
         """Build and compile the draft layer's attention kernels; a reason on any rank
         stops every rank (the draft slot is requested)."""
@@ -389,12 +467,40 @@ class FusedDraft:
             self.error_record = hops.err
         else:
             self._errors = runtime.ErrorReporter([self.failure])
+        if self.front_mode:
+            self._attach_rowpar(hops, megakernel_agree)
         logger.info(
             "NVIDIA megakernel: GLM-5.3 / GLM-5.2 draft: hops on the target's "
             "mailbox: %s (rank %d)",
             "eh gather" if self._hops is not None else "no",
             self.rank,
         )
+
+    def _attach_rowpar(self, hops, megakernel_agree) -> None:
+        """``DRAFT_FRONT_ENV``: serve the row-parallel front when this rank has its window,
+        the target's hops carry the all-reduce + RMSNorm unit and their eps is the input
+        norm's; every rank must agree."""
+        why = self._rp_why if self._rp_w is None else ""
+        if not why and hops is None:
+            why = "the target's hops are not served"
+        elif not why and "allreduce_rmsnorm" not in hops.compiled:
+            why = "the hops have no all-reduce + RMSNorm unit"
+        elif not why and float(hops.eps) != self._rp_eps:
+            why = f"the hops' eps {hops.eps} is not the input norm's {self._rp_eps}"
+        megakernel_agree(
+            why == "", what="GLM-5.3 / GLM-5.2 draft: row-parallel eh_proj served"
+        )
+        self._rp_ready = why == ""
+        self._rp_why = why or "served"
+        if self.rank == 0:
+            logger.info(
+                "NVIDIA megakernel: GLM-5.3 / GLM-5.2 draft: %s=rowpar: %s",
+                DRAFT_FRONT_ENV,
+                "eh_proj row-parallel (K window %d) + the hops' all-reduce + input RMSNorm at 1-%d rows"
+                % (ROWPAR_WINDOW, HOP_ROWS)
+                if self._rp_ready
+                else f"declined ({why}); the column shard and its gather serve",
+            )
 
     def failure(self) -> Optional[dict]:
         """The timeout record of the draft's waits (host memory: readable after the CUDA
@@ -743,13 +849,24 @@ class FusedDraft:
                     model.hnorm.weight,
                     model.enorm.variance_epsilon,
                 )
-            hidden_states = self.eh_proj(eh_input)
+            # DRAFT_FRONT_ENV: only for a step group, which takes the normed input
+            hidden_states = (
+                self.eh_prepared(eh_input) if attention is not None else None
+            )
+            if hidden_states is None:
+                hidden_states = self.eh_proj(eh_input)
             if hidden_states is None:
                 hidden_states = model.eh_proj(eh_input)
         else:
             hidden_states = model.embed_input_ids(input_ids, forward_batch)
 
-        residual_batch.start(forward_batch)
+        prepared = isinstance(hidden_states, draft_attention.PreparedInput)
+        if prepared:
+            # the hop applied the draft layer's input norm: the attention prepare is skipped
+            residual_batch.set_written(hidden_states.residual, forward_batch)
+            hidden_states = hidden_states.norm
+        else:
+            residual_batch.start(forward_batch)
         index_topk_share = IndexTopKShareState.from_mtp_carry(forward_batch)
         with get_global_expert_distribution_recorder().disable_this_region():
             decoder = model.decoder
@@ -760,6 +877,7 @@ class FusedDraft:
                     attention,
                     view=view,
                     ffn_rows=ffn_rows,
+                    **({"prepared": True} if prepared else {}),
                 )
             hidden_states, topk_indices = decoder(
                 positions,

@@ -155,9 +155,11 @@ def _args_apply():
     return (*[_z()] * 4, Float32(1e-5), Int32(1), cu.CUstream(0))
 
 
-def unit_specs(*, plain_allreduce: bool = False):
+def unit_specs(*, plain_allreduce: bool = False, allreduce_rmsnorm: bool = False):
     """The compile units of the forward hops (instance A: up to 8 rows; instance B:
-    9..16)."""
+    9..16). ``plain_allreduce``: also the plain all-reduce (the draft's eh gather);
+    ``allreduce_rmsnorm``: also the residual-free all-reduce + RMSNorm (the draft's
+    row-parallel eh_proj sum with the draft layer's input norm)."""
     specs = [
         UnitSpec(
             "allreduce_norm", AllreduceNormHop(residual=True, norm=True), _args_ar()
@@ -187,6 +189,14 @@ def unit_specs(*, plain_allreduce: bool = False):
         specs.append(
             UnitSpec(
                 "allreduce", AllreduceNormHop(residual=False, norm=False), _args_ar()
+            )
+        )
+    if allreduce_rmsnorm:
+        specs.append(
+            UnitSpec(
+                "allreduce_rmsnorm",
+                AllreduceNormHop(residual=False, norm=True),
+                _args_ar(),
             )
         )
     return specs
@@ -388,6 +398,26 @@ class HopKernels:
             z,
             _p(out),
             z,
+            Float32(self.eps),
+            Int32(partial.shape[0]),
+            *self._rot(mb.peers, mb.rank),
+            *self._tail(mb, site),
+        )
+
+    def allreduce_rmsnorm(self, partial, gamma, out_res, out_norm, site=0):
+        """Residual-free all-reduce + RMSNorm of ``partial`` [rows <= 8, 6144] bf16:
+        ``out_res`` = the rank-order fp32 sum rounded once to bf16, ``out_norm`` =
+        RMSNorm(out_res) * gamma (the hop's norm arithmetic), on mailbox instance A.
+        Needs ``unit_specs(allreduce_rmsnorm=True)``'s unit."""
+        if partial.shape[0] > 8:
+            raise ValueError("the all-reduce + RMSNorm serves at most 8 rows per call")
+        mb = self.mbox_a
+        self.compiled["allreduce_rmsnorm"](
+            _p(partial),
+            Int64(0),
+            _p(gamma),
+            _p(out_res),
+            _p(out_norm),
             Float32(self.eps),
             Int32(partial.shape[0]),
             *self._rot(mb.peers, mb.rank),
