@@ -232,6 +232,9 @@ class Nvfp4MoeSmallM16:
       lookahead + 1);
     * ``pre`` = n (1..3): unit 0's first n FC1 chunks issue as soon as unit 0 is known,
       before the union list and unit table are built (default 1);
+    * ``rfirst``: per step k the epilogue reads out FC2(k - lookahead) before the h chain
+      of unit k (frees the single FC2 accumulator sooner);
+    * ``xhoist``: the x quantization issues both halves' loads before quantizing;
     * ``fasttab``: the producer loads the four requests' ids back to back and decodes
       every unit's expert and group mask lane-parallel from the class bitmaps (no
       union list), so the unit table is ready sooner (same records);
@@ -249,6 +252,8 @@ class Nvfp4MoeSmallM16:
         lookahead: int = LOOKAHEAD,
         pre: int = 1,
         fasttab: bool = False,
+        rfirst: bool = False,
+        xhoist: bool = False,
         trace: bool = False,
     ):
         self.shared = shared
@@ -256,6 +261,8 @@ class Nvfp4MoeSmallM16:
         self.l2pf = int(l2pf)
         self.pre = int(pre)
         self.fasttab = bool(fasttab)
+        self.rfirst = bool(rfirst)
+        self.xhoist = bool(xhoist)
         self.trace = bool(trace)
         if not 0 <= self.l2pf <= 4:
             raise ValueError(f"engine16: l2pf {l2pf}")
@@ -275,6 +282,8 @@ class Nvfp4MoeSmallM16:
             "lookahead": self.LOOKAHEAD,
             "pre": self.pre,
             "fasttab": self.fasttab,
+            "rfirst": self.rfirst,
+            "xhoist": self.xhoist,
             "trace": self.trace,
         }
 
@@ -1450,70 +1459,142 @@ class Nvfp4MoeSmallM16:
 
     # ------------------------------------------------------------ warps 2..5
     @cute.jit
+    def x_load(self, raw, hf, x, mqs, rbs, crank, et):
+        """Half hf of this thread's x blocks (BF16, 6 x 32 B) into ``raw`` (zeros for
+        invalid rows)."""
+        for ii in cutlass.range_constexpr(6):
+            b = et + 128 * (hf * 6 + ii)
+            n = b // 96
+            kb = b % 96
+            for w in cutlass.range_constexpr(8):
+                raw[8 * ii + w] = Uint32(0)
+            if (n & 3) < self.rows_of(mqs, n >> 2):
+                grow = self.first_row_of(rbs, n >> 2) + (n & 3)
+                src = x + (Int64(grow) * HIDDEN + K_CTA * crank + 16 * kb) * 2
+                lo = P.ld_cg_v4_u32(src)
+                hi = P.ld_cg_v4_u32(src + 16)
+                for w in cutlass.range_constexpr(4):
+                    raw[8 * ii + w] = lo[w]
+                    raw[8 * ii + 4 + w] = hi[w]
+
+    @cute.jit
+    def x_quant(self, raw, hf, gs1, mqs, base, my_sh, et):
+        """Half hf: the BF16 image (shared clusters) and the NVFP4 image + scales."""
+        xbf = base + OFF_XBF
+        for ii in cutlass.range_constexpr(6):
+            b = et + 128 * (hf * 6 + ii)
+            n = b // 96
+            kb = b % 96
+            if cutlass.const_expr(self.shared):  # noqa: SIM102
+                if my_sh != 0:
+                    gb = xbf + (n >> 3) * XBF_GRP + (n & 7) * 16
+                    C.st_shared_v4(
+                        gb + (2 * kb) * 128,
+                        tuple(raw[8 * ii + w] for w in range(4)),
+                    )
+                    C.st_shared_v4(
+                        gb + (2 * kb + 1) * 128,
+                        tuple(raw[8 * ii + 4 + w] for w in range(4)),
+                    )
+            w0 = Uint32(0)
+            w1 = Uint32(0)
+            sfb = Uint32(0)
+            if (n & 3) < self.rows_of(mqs, n >> 2):
+                pairs = [P.bf16x2_unpack(raw[8 * ii + w]) for w in range(8)]
+                v = [f for pr in pairs for f in pr]
+                amax = Float32(0.0)
+                for q in cutlass.range_constexpr(16):
+                    amax = T.max_f32(amax, T.abs_f32(v[q]))
+                osc, sfb = T.nvfp4_block_scale(amax, gs1)
+                q0 = [P.mul_f32(v[q], osc) for q in range(8)]
+                q1 = [P.mul_f32(v[8 + q], osc) for q in range(8)]
+                w0 = T.e2m1x8(*q0)
+                w1 = T.e2m1x8(*q1)
+            P.st_shared_v2_u32(
+                base
+                + OFF_X
+                + (n >> 3) * X_GRP
+                + (kb >> 1) * 128
+                + (n & 7) * 16
+                + (kb & 1) * 8,
+                w0,
+                w1,
+            )
+            P.st_shared_b8(base + OFF_XSF + (kb >> 2) * 256 + n * 16 + (kb & 3), sfb)
+
+    @cute.jit
     def quantize_x(self, x, gs1, mqs, rbs, base, misc, crank, my_sh, et, lane):
         """The activations x (BF16) of this CTA's K range into the NVFP4 image +
         scale windows (routed operand) and, on the shared-expert clusters, the BF16
         image. Image row n = 4 q + t: request q row t (valid t < rows(q)); invalid
         rows are zero."""
-        xbf = base + OFF_XBF
-        for hf in cutlass.range(2, unroll=1):
-            raw = cute.make_rmem_tensor(cute.make_layout(48), Uint32)
-            for ii in cutlass.range_constexpr(6):
-                b = et + 128 * (hf * 6 + ii)
-                n = b // 96
-                kb = b % 96
-                for w in cutlass.range_constexpr(8):
-                    raw[8 * ii + w] = Uint32(0)
-                if (n & 3) < self.rows_of(mqs, n >> 2):
-                    grow = self.first_row_of(rbs, n >> 2) + (n & 3)
-                    src = x + (Int64(grow) * HIDDEN + K_CTA * crank + 16 * kb) * 2
-                    lo = P.ld_cg_v4_u32(src)
-                    hi = P.ld_cg_v4_u32(src + 16)
-                    for w in cutlass.range_constexpr(4):
-                        raw[8 * ii + w] = lo[w]
-                        raw[8 * ii + 4 + w] = hi[w]
-            for ii in cutlass.range_constexpr(6):
-                b = et + 128 * (hf * 6 + ii)
-                n = b // 96
-                kb = b % 96
-                if cutlass.const_expr(self.shared):  # noqa: SIM102
-                    if my_sh != 0:
-                        gb = xbf + (n >> 3) * XBF_GRP + (n & 7) * 16
-                        C.st_shared_v4(
-                            gb + (2 * kb) * 128,
-                            tuple(raw[8 * ii + w] for w in range(4)),
-                        )
-                        C.st_shared_v4(
-                            gb + (2 * kb + 1) * 128,
-                            tuple(raw[8 * ii + 4 + w] for w in range(4)),
-                        )
-                w0 = Uint32(0)
-                w1 = Uint32(0)
-                sfb = Uint32(0)
-                if (n & 3) < self.rows_of(mqs, n >> 2):
-                    pairs = [P.bf16x2_unpack(raw[8 * ii + w]) for w in range(8)]
-                    v = [f for pr in pairs for f in pr]
-                    amax = Float32(0.0)
-                    for q in cutlass.range_constexpr(16):
-                        amax = T.max_f32(amax, T.abs_f32(v[q]))
-                    osc, sfb = T.nvfp4_block_scale(amax, gs1)
-                    q0 = [P.mul_f32(v[q], osc) for q in range(8)]
-                    q1 = [P.mul_f32(v[8 + q], osc) for q in range(8)]
-                    w0 = T.e2m1x8(*q0)
-                    w1 = T.e2m1x8(*q1)
-                P.st_shared_v2_u32(
-                    base
-                    + OFF_X
-                    + (n >> 3) * X_GRP
-                    + (kb >> 1) * 128
-                    + (n & 7) * 16
-                    + (kb & 1) * 8,
-                    w0,
-                    w1,
-                )
-                P.st_shared_b8(
-                    base + OFF_XSF + (kb >> 2) * 256 + n * 16 + (kb & 3), sfb
-                )
+        if cutlass.const_expr(self.xhoist):
+            raw0 = cute.make_rmem_tensor(cute.make_layout(48), Uint32)
+            raw1 = cute.make_rmem_tensor(cute.make_layout(48), Uint32)
+            self.x_load(raw0, 0, x, mqs, rbs, crank, et)
+            self.x_load(raw1, 1, x, mqs, rbs, crank, et)
+            self.x_quant(raw0, 0, gs1, mqs, base, my_sh, et)
+            self.x_quant(raw1, 1, gs1, mqs, base, my_sh, et)
+        else:
+            xbf = base + OFF_XBF
+            for hf in cutlass.range(2, unroll=1):
+                raw = cute.make_rmem_tensor(cute.make_layout(48), Uint32)
+                for ii in cutlass.range_constexpr(6):
+                    b = et + 128 * (hf * 6 + ii)
+                    n = b // 96
+                    kb = b % 96
+                    for w in cutlass.range_constexpr(8):
+                        raw[8 * ii + w] = Uint32(0)
+                    if (n & 3) < self.rows_of(mqs, n >> 2):
+                        grow = self.first_row_of(rbs, n >> 2) + (n & 3)
+                        src = x + (Int64(grow) * HIDDEN + K_CTA * crank + 16 * kb) * 2
+                        lo = P.ld_cg_v4_u32(src)
+                        hi = P.ld_cg_v4_u32(src + 16)
+                        for w in cutlass.range_constexpr(4):
+                            raw[8 * ii + w] = lo[w]
+                            raw[8 * ii + 4 + w] = hi[w]
+                for ii in cutlass.range_constexpr(6):
+                    b = et + 128 * (hf * 6 + ii)
+                    n = b // 96
+                    kb = b % 96
+                    if cutlass.const_expr(self.shared):  # noqa: SIM102
+                        if my_sh != 0:
+                            gb = xbf + (n >> 3) * XBF_GRP + (n & 7) * 16
+                            C.st_shared_v4(
+                                gb + (2 * kb) * 128,
+                                tuple(raw[8 * ii + w] for w in range(4)),
+                            )
+                            C.st_shared_v4(
+                                gb + (2 * kb + 1) * 128,
+                                tuple(raw[8 * ii + 4 + w] for w in range(4)),
+                            )
+                    w0 = Uint32(0)
+                    w1 = Uint32(0)
+                    sfb = Uint32(0)
+                    if (n & 3) < self.rows_of(mqs, n >> 2):
+                        pairs = [P.bf16x2_unpack(raw[8 * ii + w]) for w in range(8)]
+                        v = [f for pr in pairs for f in pr]
+                        amax = Float32(0.0)
+                        for q in cutlass.range_constexpr(16):
+                            amax = T.max_f32(amax, T.abs_f32(v[q]))
+                        osc, sfb = T.nvfp4_block_scale(amax, gs1)
+                        q0 = [P.mul_f32(v[q], osc) for q in range(8)]
+                        q1 = [P.mul_f32(v[8 + q], osc) for q in range(8)]
+                        w0 = T.e2m1x8(*q0)
+                        w1 = T.e2m1x8(*q1)
+                    P.st_shared_v2_u32(
+                        base
+                        + OFF_X
+                        + (n >> 3) * X_GRP
+                        + (kb >> 1) * 128
+                        + (n & 7) * 16
+                        + (kb & 1) * 8,
+                        w0,
+                        w1,
+                    )
+                    P.st_shared_b8(
+                        base + OFF_XSF + (kb >> 2) * 256 + n * 16 + (kb & 3), sfb
+                    )
         C.fence_proxy_async_shared_cta()
         cute.arch.sync_warp()
         # bar.sync (PTX 8.9.4): all lanes' stores precede the release
@@ -1916,6 +1997,24 @@ class Nvfp4MoeSmallM16:
         recv = base + OFF_RECV
         ex = Int32(0)
         for k in cutlass.range(nunits + self.LOOKAHEAD, unroll=1):
+            if cutlass.const_expr(self.rfirst):
+                self.readout_step(
+                    k,
+                    nunits,
+                    rows,
+                    mqs,
+                    rbs,
+                    shpartials,
+                    pq,
+                    misc,
+                    crank,
+                    lane_base,
+                    row,
+                    lane,
+                    err,
+                    block,
+                    et,
+                )
             if k < nunits:
                 i = k
                 b = i & 1
@@ -2076,11 +2175,10 @@ class Nvfp4MoeSmallM16:
                 if cutlass.const_expr(self.trace):
                     if et == 0:
                         self.tr_since(err, block, TR_HCHAIN, th)
-            if (k >= self.LOOKAHEAD) & (k - self.LOOKAHEAD < nunits):
-                if cutlass.const_expr(self.trace):
-                    tr0 = P.globaltimer()
-                self.readout(
-                    k - self.LOOKAHEAD,
+            if cutlass.const_expr(not self.rfirst):
+                self.readout_step(
+                    k,
+                    nunits,
                     rows,
                     mqs,
                     rbs,
@@ -2095,12 +2193,52 @@ class Nvfp4MoeSmallM16:
                     block,
                     et,
                 )
-                if cutlass.const_expr(self.trace):
-                    if et == 0:
-                        self.tr_since(err, block, TR_READOUT, tr0)
         if cutlass.const_expr(self.trace):
             if et == 0:
                 self.tr_since(err, block, TR_EPI_END, t0k)
+
+    @cute.jit
+    def readout_step(
+        self,
+        k,
+        nunits,
+        rows,
+        mqs,
+        rbs,
+        shpartials,
+        pq,
+        misc,
+        crank,
+        lane_base,
+        row,
+        lane,
+        err,
+        block,
+        et,
+    ):
+        """Step k's readout: FC2(k - lookahead) when it exists."""
+        if (k >= self.LOOKAHEAD) & (k - self.LOOKAHEAD < nunits):
+            if cutlass.const_expr(self.trace):
+                tr0 = P.globaltimer()
+            self.readout(
+                k - self.LOOKAHEAD,
+                rows,
+                mqs,
+                rbs,
+                shpartials,
+                pq,
+                misc,
+                crank,
+                lane_base,
+                row,
+                lane,
+                err,
+                block,
+                et,
+            )
+            if cutlass.const_expr(self.trace):
+                if et == 0:
+                    self.tr_since(err, block, TR_READOUT, tr0)
 
     # ------------------------------------------------------------ kernel
     @cute.kernel
