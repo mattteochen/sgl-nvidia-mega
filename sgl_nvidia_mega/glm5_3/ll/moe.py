@@ -367,9 +367,17 @@ class LlMoeFamily:
                 layers[i] = (mlp, RoutedArgs.of_layer(mlp))
             elif isinstance(mlp, DeepseekV2MLP):
                 why = dense_reason(mlp)
-                if why is not None:
+                if why is None:
+                    dense[i] = mlp
+                elif not getattr(
+                    getattr(mlp, "down_proj", None), "reduce_results", False
+                ):
+                    # Quantized dense layers (e.g. GLM-5.3 NVFP4 FP8 layers 0-2) keep
+                    # MlpSteps.forward (returns un-reduced partial to ll.hops) so all
+                    # 75 MoE layers still run ll.moe / ll.moe.nvfp4.
+                    continue
+                else:
                     raise ValueError(f"layer {i}: {why}")
-                dense[i] = mlp
             else:
                 raise ValueError(f"layer {i}: MLP {type(mlp).__name__}")
         return cls(layers, dense)
@@ -445,6 +453,8 @@ class LlMlp(MlpSteps):
         step.nvfp4_input = None
         if lid in self.f.dense:
             return dense_forward(self.f.dense[lid], x)
+        if lid not in self.f.layers:
+            return super().forward(layer, x, buffer, step)
         mlp, args = self.f.layers[lid]
         if nvfp4 is not None and (nvfp4.layer_id != lid or nvfp4.norm is not x):
             raise RuntimeError(
