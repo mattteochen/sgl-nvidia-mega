@@ -343,7 +343,7 @@ class FusedAttention(AttentionStep):
         self.front = fn.get(f"front.{cap}") if glue.target and glue.idx_split else None
         self.fork_after_iq = glue.idx_split == 2
         self._rows = rows
-        self._split_layers: Dict[int, bool] = {}  # first pass: layer id -> split
+        self._split_layers: Dict[int, bool] = {}  # first forward: layer id -> split
         self._split_logged = False
 
     def runs_indexer(self, attn, step: StepContext) -> bool:
@@ -489,16 +489,15 @@ class FusedAttention(AttentionStep):
     # ------------------------------------------------ the indexer-layer prologue split
     def indexer_split(self, attn, step: StepContext, run_indexer: bool) -> Optional[str]:
         """``"qkv"`` / ``"iq"`` (where P_back forks) on the layers whose prologue
-        splits, else None (called for every layer: the first pass is logged)."""
+        splits, else None (called for every layer: the first forward is logged)."""
         if self.front is None:
             return None
         split = run_indexer and self.runs_indexer(attn, step)
         if not self._split_logged:
-            lid = attn.layer_id
-            if lid in self._split_layers:
+            # the first forward of this width, logged at its last layer
+            self._split_layers[attn.layer_id] = split
+            if attn.layer_id == self.glue.last_layer_id:
                 self._log_split()
-            else:
-                self._split_layers[lid] = split
         if not split:
             return None
         return "iq" if self.fork_after_iq else "qkv"
@@ -850,6 +849,7 @@ class AttentionGlue:
         self.split_stream = (
             torch.cuda.Stream(device=dev) if self.idx_split else None
         )
+        self.last_layer_id = max(layer.self_attn.layer_id for layer in layers)
 
     def compile(self, rows: Tuple[int, ...]) -> None:
         import cutlass.cute as cute
