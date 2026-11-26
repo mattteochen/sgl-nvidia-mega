@@ -380,7 +380,16 @@ class FusedDraft:
             f"draft: eh_proj shard rows {list(self.eh_rows)}, top-1 rows <= "
             f"{TOP1_DECODE_ROWS} / {TOP1_EXTEND_ROWS}; derived eh_proj shard "
             f"{self.eh_weight.numel() * 2 / 2**20:.1f} MiB; attention kernels: "
-            + ("MLA prologue + extend q_a / kv_a GEMM" if self._attn_family else "no")
+            + (
+                "MLA prologue + extend q_a / kv_a GEMM"
+                + (
+                    " + sparse MLA + value up-projection"
+                    if draft_attention.draft_sparse_mla_on()
+                    else ""
+                )
+                if self._attn_family
+                else "no"
+            )
             + "; draft-extend MLP on the select_index rows: "
             + ("yes" if self.row_select else "no")
         )
