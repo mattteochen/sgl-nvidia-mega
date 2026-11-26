@@ -171,6 +171,18 @@ PROLOGUE_PUSH_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE_PUSH"
 PROLOGUE_F32X2_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_PROLOGUE_F32X2"
 _PROLOGUE_PUSH = os.environ.get(PROLOGUE_PUSH_ENV, "0").strip() not in ("", "0")
 _PROLOGUE_F32X2 = os.environ.get(PROLOGUE_F32X2_ENV, "0").strip() not in ("", "0")
+# SGLANG_NVIDIA_MEGAKERNEL_GLM_IDX_SPLIT=1: on the target's layers with their own indexer, the prologue splits in two
+# launches: P_front (IndexerFront: the q_a norm the indexer query projection reads and the index-K rows the logits read)
+# on the current stream ahead of the indexer, P_back (the stock MlaPrologue with has_indexer 0 and no q_a out, the
+# end-trigger form of the shared layers: q_b, W_UK, RoPE + FP8 query, MLA rows) on a side stream forked after the q_a /
+# kv_a projection (at 9-16 rows before the stock key / head-gate projection, which moves after the fork) and joined
+# before the sparse MLA. =2 forks P_back after the indexer query projection instead. Same outputs, bit for bit. The
+# layers without their own indexer and the draft are unchanged. Read at build.
+IDX_SPLIT_ENV = "SGLANG_NVIDIA_MEGAKERNEL_GLM_IDX_SPLIT"
+_IDX_SPLIT = (os.environ.get(IDX_SPLIT_ENV, "0").strip() or "0")
+if _IDX_SPLIT not in ("0", "1", "2"):
+    raise ValueError(f"{IDX_SPLIT_ENV}={_IDX_SPLIT!r}: expected 0, 1 or 2")
+_IDX_SPLIT = int(_IDX_SPLIT)
 
 
 def _env_bytes(name: str, default: int, full: int) -> int:
@@ -327,6 +339,12 @@ class FusedAttention(AttentionStep):
         self.qa_s_dn = fn.get(f"qkv_a_shared_dn.{cap}")  # + deferred input norm
         # (slot dnorm; the composition wires its producer when ``takes_deferred_norm``)
         self.takes_deferred_norm = self.qa_s_dn is not None
+        # the indexer-layer prologue split (IDX_SPLIT_ENV; target only): P_front, or None
+        self.front = fn.get(f"front.{cap}") if glue.target and glue.idx_split else None
+        self.fork_after_iq = glue.idx_split == 2
+        self._rows = rows
+        self._split_layers: Dict[int, bool] = {}  # first pass: layer id -> split
+        self._split_logged = False
 
     def runs_indexer(self, attn, step: StepContext) -> bool:
         """Whether this layer's indexer runs in this forward: the layers with their
@@ -355,7 +373,9 @@ class FusedAttention(AttentionStep):
             raise _fail(f"indexer layer {attn.layer_id} got a deferred input norm")
         if self.qa is None:
             qkv = super().qkv_a(attn, x, step)
-            step.index_kw, _ = attn.indexer.wk_weights_proj(x)
+            if self.front is None:
+                step.index_kw, _ = attn.indexer.wk_weights_proj(x)
+            # else the split's P_front projects it after the fork (_index_kw)
             return qkv
         w = self.glue.layers[attn.layer_id].w_qkva
         qkv, step.index_kw = self._small_m(self.qa, w, x, index_kw=True)
@@ -390,13 +410,19 @@ class FusedAttention(AttentionStep):
         return qkv, kw
 
     def prologue(
-        self, attn, qkv_latent: torch.Tensor, step: StepContext
+        self,
+        attn,
+        qkv_latent: torch.Tensor,
+        step: StepContext,
+        full: Optional[bool] = None,
+        stream=None,
     ) -> PrologueOut:
         from cutlass import Float32, Int32
 
         rows = qkv_latent.shape[0]
         _check_rows(qkv_latent, rows, QKV_A_ROWS, torch.bfloat16, "q_a / kv_a latent")
-        full = self.runs_indexer(attn, step)
+        if full is None:
+            full = self.runs_indexer(attn, step)
         dev = qkv_latent.device
         la = self.glue.layers[attn.layer_id]
         loc = step.forward_batch.out_cache_loc
@@ -455,10 +481,91 @@ class FusedAttention(AttentionStep):
             *_i64(0, 0),  # topk, topk_stride: unused
             Int32(0),  # topk_width: unused
             *_i64(*_addr(qc)),  # qc_out, qc_out_stride
-            cu_stream(dev),
+            cu_stream(dev) if stream is None else _cu(stream),
         )
         step.q_fp8 = mqa
         return PrologueOut(qc, None, None, None, None)
+
+    # ------------------------------------------------ the indexer-layer prologue split
+    def indexer_split(self, attn, step: StepContext, run_indexer: bool) -> Optional[str]:
+        """``"qkv"`` / ``"iq"`` (where P_back forks) on the layers whose prologue
+        splits, else None (called for every layer: the first pass is logged)."""
+        if self.front is None:
+            return None
+        split = run_indexer and self.runs_indexer(attn, step)
+        if not self._split_logged:
+            lid = attn.layer_id
+            if lid in self._split_layers:
+                self._log_split()
+            else:
+                self._split_layers[lid] = split
+        if not split:
+            return None
+        return "iq" if self.fork_after_iq else "qkv"
+
+    def _log_split(self) -> None:
+        self._split_logged = True
+        on = sorted(k for k, v in self._split_layers.items() if v)
+        off = sorted(k for k, v in self._split_layers.items() if not v)
+        logger.info(
+            "NVIDIA megakernel: GLM-5.3 / GLM-5.2: indexer-layer prologue split engaged "
+            "at %d rows: %d layers split (P_front + P_back, fork after %s), %d layers "
+            "unsplit; split layers %s (%s=%d)",
+            self._rows,
+            len(on),
+            "the indexer query" if self.fork_after_iq else "q_a / kv_a",
+            len(off),
+            on,
+            IDX_SPLIT_ENV,
+            self.glue.idx_split,
+        )
+
+    def split_stream(self, attn):
+        return self.glue.split_stream
+
+    def prologue_front(
+        self, attn, x, qkv_latent: torch.Tensor, step: StepContext
+    ) -> torch.Tensor:
+        """P_front on the current stream: the q_a norm (returned: the indexer query
+        projection's input) and the index-K rows of this layer."""
+        from cutlass import Float32, Int32
+
+        rows = qkv_latent.shape[0]
+        _check_rows(qkv_latent, rows, QKV_A_ROWS, torch.bfloat16, "q_a / kv_a latent")
+        self._index_kw(attn.indexer, x, step)  # at 9-16 rows the stock projection
+        kw = step.index_kw
+        _check_rows(kw, rows, INDEX_KW, torch.bfloat16, "indexer key projection")
+        la = self.glue.layers[attn.layer_id]
+        loc = step.forward_batch.out_cache_loc
+        pos = step.positions
+        _check_index(loc, rows, "cache slots")
+        _check_index(pos, rows, "positions")
+        buf = step.view.kv_pool.get_index_k_with_scale_buffer(layer_id=attn.layer_id)
+        dev = qkv_latent.device
+        qc = torch.empty((rows, Q_LORA), dtype=torch.bfloat16, device=dev)
+        self.front(
+            *_i64(*_addr(qkv_latent)),  # q_c, q_c_stride
+            *_i64(*_addr(kw)),  # idx_k, idx_k_stride
+            *_i64(pos.data_ptr(), loc.data_ptr(), loc.data_ptr()),  # positions, slots
+            Int32(rows),
+            *_i64(la.q_norm_w.data_ptr()),
+            Float32(la.q_eps),
+            *_i64(la.ik_w.data_ptr(), la.ik_b.data_ptr()),
+            Float32(la.ik_eps),
+            *_i64(*_addr(la.index_rope)),  # index_rope_cache, index_rope_stride
+            *_i64(buf.data_ptr(), buf.stride(0) * buf.element_size(), INDEX_PAGE),
+            *_i64(*_addr(qc)),  # qc_out, qc_out_stride
+            cu_stream(dev),
+        )
+        return qc
+
+    def prologue_back(
+        self, attn, qkv_latent: torch.Tensor, step: StepContext, stream
+    ) -> PrologueOut:
+        """P_back on ``stream``: the prologue of a layer without its own indexer (the
+        end-trigger form when built), its FP8 query left in ``step.q_fp8``; outputs
+        allocated on the current stream."""
+        return self.prologue(attn, qkv_latent, step, full=False, stream=stream)
 
     def _done(self, *args) -> None:
         """A step the prologue did: the index-K rows, the W_UK absorption.
@@ -735,8 +842,14 @@ class AttentionGlue:
             args.w_scale = _f32(ix.softmax_scale * ix.n_heads**-0.5)
         if len(rope_f32) != 1 or len(index_rope_f32) > 1:
             raise _fail("RoPE cache dtypes differ by layer", ValueError)
+        # the indexer-layer prologue split (IDX_SPLIT_ENV): the target's only, and only
+        # with layers that run their own indexer
+        self.idx_split = _IDX_SPLIT if self.target and index_rope_f32 else 0
         self.rope_f32 = rope_f32.pop()
         self.index_rope_f32 = index_rope_f32.pop() if index_rope_f32 else True
+        self.split_stream = (
+            torch.cuda.Stream(device=dev) if self.idx_split else None
+        )
 
     def compile(self, rows: Tuple[int, ...]) -> None:
         import cutlass.cute as cute
@@ -762,7 +875,18 @@ class AttentionGlue:
             prologue8_overlap=_PROLOGUE8_OVERLAP,
             prologue_push=_PROLOGUE_PUSH,
             prologue_f32x2=_PROLOGUE_F32X2,
+            idx_front=bool(self.idx_split),
         )
+        if self.idx_split:
+            logger.info(
+                "NVIDIA megakernel: GLM-5.3 / GLM-5.2: indexer-layer prologue split built: "
+                "P_front %s, P_back = %s on a side stream forked after %s (%s=%d)",
+                sorted(k for k in specs if k.startswith("front.")),
+                sorted(k for k in specs if k.startswith("prologue_end.")),
+                "the indexer query" if self.idx_split == 2 else "q_a / kv_a",
+                IDX_SPLIT_ENV,
+                self.idx_split,
+            )
         if _PROLOGUE16_OVERLAP and "prologue.16" in specs:
             logger.info(
                 "NVIDIA megakernel: GLM-5.3 / GLM-5.2: 16-row MLA prologue in the "
@@ -908,6 +1032,12 @@ class AttentionGlue:
         if f"uv.{kernel_rows(rows)}" not in self.fn:
             return None
         return FusedAttention(self, rows)
+
+
+def _cu(stream):
+    import cuda.bindings.driver as cuda
+
+    return cuda.CUstream(stream.cuda_stream)
 
 
 def _allow_cluster16(compiled):

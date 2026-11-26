@@ -32,6 +32,7 @@ def example_args() -> dict[str, tuple]:
         "index_q": (z,) * 8 + (f, one, z, z, z, z, s),
         "qkv_a": (z, z, z, one, z, z, z, z, s),
         "qkv_a_dn": (z, z, z, one, z, z, z, z, z, f, s),
+        "front": (z,) * 7 + (one, z, f, z, z, f) + (z,) * 5 + (z, z, s),
         "prologue": (z,) * 11
         + (one, one)
         + (z,) * 4
@@ -62,6 +63,7 @@ def compile_specs(
     prologue8_overlap: bool = False,
     prologue_push: bool = False,
     prologue_f32x2: bool = False,
+    idx_front: bool = False,
 ) -> dict[str, tuple]:
     """The attention units for row capacities ``caps`` and sparse-MLA warp counts
     ``warps``. ``numerics`` is the engine's ``PrologueNumerics`` value table and
@@ -82,7 +84,11 @@ def compile_specs(
     (``MlaPrologue(overlap8=True)``: same outputs).
     ``prologue_push`` / ``prologue_f32x2`` add the pushed q_nope hand-off / the packed
     branch-free normalize to the overlapped forms (``MlaPrologue(push=True)`` /
-    ``f32x2=True``; same outputs)."""
+    ``f32x2=True``; same outputs).
+    ``idx_front`` adds ``front.<cap>``: the indexer's share of the prologue as its own
+    launch (``IndexerFront``: the q_a norm out and the index-K rows, the prologue's
+    arithmetic), for the indexer-layer prologue split."""
+    from .indexer_front import IndexerFront
     from .indexer_q_proj import IndexerQProj
     from .mla_prologue import MlaPrologue
     from .mla_uv_proj import MlaUvProj
@@ -150,6 +156,19 @@ def compile_specs(
                 ),
                 {**key, "trigger_at_end": True},
                 args["prologue"],
+            )
+        if idx_front:
+            fkey = {
+                "max_rows": cap,
+                **dataclasses.asdict(numerics),
+                "index_rope_cache_fp32": index_rope_cache_fp32,
+            }
+            if index_scale_ue8m0x4:
+                fkey["index_scale_ue8m0x4"] = True
+            specs[f"front.{cap}"] = (
+                IndexerFront(cap, numerics, index_rope_cache_fp32, index_scale_ue8m0x4),
+                fkey,
+                args["front"],
             )
         key = {
             "max_rows": cap,
