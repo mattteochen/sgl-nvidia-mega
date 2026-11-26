@@ -206,7 +206,10 @@ TR_W_EMPTY, TR_W_FULL, TR_W_SFA, TR_W_HREADY, TR_W_ACC2E, TR_W_ACC1E = (
     15,
 )
 TR_W_ACC1F, TR_W_PFREE, TR_W_PRECV, TR_W_ACC2F = 16, 17, 18, 19
-TR_NUNITS, TR_NEX, TR_READOUT, TR_HCHAIN, TR_W_REL = 20, 21, 22, 23, 24
+TR_NUNITS, TR_NEX, TR_READOUT, TR_HCHAIN, TR_IDS, TR_PRE0 = 20, 21, 22, 23, 24, 25
+# absolute stamps of the last launch (st)
+TR_PDL_ABS, TR_FIRST_ABS, TR_SEND_ABS = 26, 27, 28
+TR_ABS = (TR_ENTRY, TR_EXIT, TR_PDL_ABS, TR_FIRST_ABS, TR_SEND_ABS)
 TR_LAUNCHES = 31
 
 
@@ -227,6 +230,8 @@ class Nvfp4MoeSmallM16:
     * ``recv_bufs``: exchange receive buffers (default 5);
     * ``lookahead``: FC2(k) issues after FC1(k + lookahead) (default 2; h buffers =
       lookahead + 1);
+    * ``pre`` = n (1..3): unit 0's first n FC1 chunks issue as soon as unit 0 is known,
+      before the union list and unit table are built (default 1);
     * ``trace`` (measurement only): per-CTA wait and phase times into the error
       buffer's tail (``TRACE_OFF``).
     """
@@ -239,14 +244,18 @@ class Nvfp4MoeSmallM16:
         l2pf: int = 0,
         recv_bufs: int = RECV_BUFS,
         lookahead: int = LOOKAHEAD,
+        pre: int = 1,
         trace: bool = False,
     ):
         self.shared = shared
         self.xpipe = bool(xpipe)
         self.l2pf = int(l2pf)
+        self.pre = int(pre)
         self.trace = bool(trace)
         if not 0 <= self.l2pf <= 4:
             raise ValueError(f"engine16: l2pf {l2pf}")
+        if not 1 <= self.pre <= 3:
+            raise ValueError(f"engine16: pre {pre}")
         for k, v in g4_layout(recv_bufs, lookahead).items():
             setattr(self, k, v)
         if self.xpipe and self.RECV_BUFS < GROUPS:
@@ -259,6 +268,7 @@ class Nvfp4MoeSmallM16:
             "l2pf": self.l2pf,
             "recv_bufs": self.RECV_BUFS,
             "lookahead": self.LOOKAHEAD,
+            "pre": self.pre,
             "trace": self.trace,
         }
 
@@ -603,6 +613,7 @@ class Nvfp4MoeSmallM16:
                             it = it + 1
         if cutlass.const_expr(self.trace):
             self.tr_since(err, block, TR_STREAM_END, t0k)
+            C.st_global_u64(self.tr_addr(err, block, TR_SEND_ABS), P.globaltimer())
         self.ring_tail(misc, it, nring)
 
     # ------------------------------------------------ warp 0: union, schedule, producer
@@ -663,6 +674,7 @@ class Nvfp4MoeSmallM16:
         if cutlass.const_expr(self.trace):
             if lane == 0:
                 self.tr_since(err, block, TR_PDL, t0k)
+                C.st_global_u64(self.tr_addr(err, block, TR_PDL_ABS), P.globaltimer())
         # lane l holds (token l >> 3, slot l & 7) of each request; per-request bitmaps
         # by shared atomics
         badid = Int32(0)
@@ -687,6 +699,9 @@ class Nvfp4MoeSmallM16:
         if badid != 0:
             P.atom_or_global(err, ERR_BAD_ID)
         cute.arch.sync_warp()
+        if cutlass.const_expr(self.trace):
+            if lane == 0:
+                self.tr_since(err, block, TR_IDS, t0k)
         wq0 = Uint32(0)
         wq1 = Uint32(0)
         wq2 = Uint32(0)
@@ -751,20 +766,40 @@ class Nvfp4MoeSmallM16:
                 src_lane = P.ctz(who)
             e0 = cute.arch.shuffle_sync(e0, src_lane)
             if (lane == 0) & (who != Uint32(0)):
-                C.mbarrier_arrive_expect_tx(misc + B_FULL, BIG)
-                self.fc1_chunk(
-                    tmap_ptr,
-                    sf13,
-                    base + OFF_RING,
-                    e0,
-                    code0 & 3,
-                    crank,
-                    0,
-                    misc + B_FULL,
-                    policy,
-                )
-                pre0 = Int32(1)
+                if cutlass.const_expr(self.pre == 1):
+                    C.mbarrier_arrive_expect_tx(misc + B_FULL, BIG)
+                    self.fc1_chunk(
+                        tmap_ptr,
+                        sf13,
+                        base + OFF_RING,
+                        e0,
+                        code0 & 3,
+                        crank,
+                        0,
+                        misc + B_FULL,
+                        policy,
+                    )
+                else:
+                    # ring slots 0 .. pre - 1 (pre <= 3 < RING; unit 0 of a routed
+                    # cluster, so the ring is empty)
+                    for c in cutlass.range_constexpr(self.pre):
+                        C.mbarrier_arrive_expect_tx(misc + B_FULL + 8 * c, BIG)
+                        self.fc1_chunk(
+                            tmap_ptr,
+                            sf13,
+                            base + OFF_RING + c * BIG,
+                            e0,
+                            code0 & 3,
+                            crank,
+                            c,
+                            misc + B_FULL + 8 * c,
+                            policy,
+                        )
+                pre0 = Int32(self.pre)
             pre0 = cute.arch.shuffle_sync(pre0, 0)
+        if cutlass.const_expr(self.trace):
+            if lane == 0:
+                self.tr_since(err, block, TR_PRE0, t0k)
         # the union list in class order, with group masks
         for c in cutlass.range_constexpr(3):
             bits = wcls[c]
@@ -906,6 +941,10 @@ class Nvfp4MoeSmallM16:
                         if cutlass.const_expr(self.trace):
                             if (it == 0) & (lane == 0):
                                 self.tr_since(err, block, TR_MMA_FIRST, t0k)
+                                C.st_global_u64(
+                                    self.tr_addr(err, block, TR_FIRST_ABS),
+                                    P.globaltimer(),
+                                )
                         self.wait_sfa(
                             misc + self.B_SFA_FULL + 8 * s,
                             (it // nring) & 1,
@@ -948,6 +987,10 @@ class Nvfp4MoeSmallM16:
                         if cutlass.const_expr(self.trace):
                             if (it == 0) & (lane == 0):
                                 self.tr_since(err, block, TR_MMA_FIRST, t0k)
+                                C.st_global_u64(
+                                    self.tr_addr(err, block, TR_FIRST_ABS),
+                                    P.globaltimer(),
+                                )
                         self.wait_sfa(
                             misc + self.B_SFA_FULL + 8 * s,
                             (it // nring) & 1,
@@ -1010,6 +1053,10 @@ class Nvfp4MoeSmallM16:
                         if cutlass.const_expr(self.trace):
                             if (it == 0) & (lane == 0):
                                 self.tr_since(err, block, TR_MMA_FIRST, t0k)
+                                C.st_global_u64(
+                                    self.tr_addr(err, block, TR_FIRST_ABS),
+                                    P.globaltimer(),
+                                )
                         self.wait_sfa(
                             misc + self.B_SFA_FULL + 8 * s,
                             (it // nring) & 1,
@@ -1053,6 +1100,10 @@ class Nvfp4MoeSmallM16:
                         if cutlass.const_expr(self.trace):
                             if (it == 0) & (lane == 0):
                                 self.tr_since(err, block, TR_MMA_FIRST, t0k)
+                                C.st_global_u64(
+                                    self.tr_addr(err, block, TR_FIRST_ABS),
+                                    P.globaltimer(),
+                                )
                         self.wait_sfa(
                             misc + self.B_SFA_FULL + 8 * s,
                             (it // nring) & 1,
