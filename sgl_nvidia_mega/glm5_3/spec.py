@@ -37,6 +37,7 @@ from __future__ import annotations
 import importlib.util
 
 try:
+    from sglang.kernels.plugin_kernels.nvidia import spec as _host_spec
     from sglang.kernels.plugin_kernels.nvidia.spec import (
         Feature,
         MegakernelSpec,
@@ -45,6 +46,7 @@ try:
         Requirements,
     )
 except ModuleNotFoundError:  # SGLang before sgl-project/sglang#45389
+    from sglang.srt.megakernels import spec as _host_spec
     from sglang.srt.megakernels.spec import (
         Feature,
         MegakernelSpec,
@@ -140,8 +142,10 @@ SGLANG_READS = {
 }
 
 ARCHITECTURE = "GlmMoeDsaForCausalLM"
-# the SGLang megakernel contract this spec is written against
-API_VERSION = 3
+# The SGLang megakernel contract this spec is written against: API 3 changed only
+# verify sampling penalties (VerifyPenaltiesView), which GB300 steps do not read and
+# sm107 checks via getattr, so API 2 hosts remain compatible alongside API 3 (main).
+API_VERSION = 3 if hasattr(_host_spec, "VerifyPenaltiesView") else 2
 
 # The co-resident cooperative grid the served kernels need at one CTA per SM: the
 # 9-16-row MoE fold hop (sm103/hop/moe_fold.py, MoeFoldArBsum) launches rows x CLUSTER
