@@ -134,7 +134,7 @@ class RowParallelEhFamily:
             "eh_proj",
             self.rp,
             widths,
-            sm=self.profile.sm,
+            target=self.profile.target,
             sms=self.profile.sms,
         )
         self.rp._use_ll = True
