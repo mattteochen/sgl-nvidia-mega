@@ -954,7 +954,7 @@ class AttentionFamily:
         if (
             not p16_on
             or self.profile is None
-            or tuple(self.profile.sm) != SM
+            or tuple(self.profile.sm) != (10, 3)
             or not (has_le8 or (has_mid and (midband_prologue_on or midband_iq_on)))
         ):
             return
