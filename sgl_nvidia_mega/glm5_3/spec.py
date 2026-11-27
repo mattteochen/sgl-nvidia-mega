@@ -487,8 +487,13 @@ def pd_reasons(cfg) -> list[str]:
     tokens = tokens_per_request(cfg)
     if mode == "null" or (tp, tokens) in UNITS:
         return []
-    if mode == "decode" and (tp, tokens) in TP8:
-        return []
+    if (tp, tokens) in TP8:
+        if mode == "decode":
+            return []
+        return [
+            f"PD disaggregation ({mode} role) is served at TP{tp} only in the decode "
+            f"role; launch the {mode} role without --enable-nvidia-megakernel"
+        ]
     return [
         f"PD disaggregation ({mode} role) is served at the TP4 profiles and at the "
         f"decode role of the TP8 profiles, not at TP{tp} with {tokens} tokens per "

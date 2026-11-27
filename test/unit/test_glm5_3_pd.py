@@ -47,8 +47,6 @@ def test_served(tp, tokens, mode):
     [
         (8, 5, "decode"),
         (8, 3, "decode"),
-        (8, 6, "prefill"),
-        (8, 4, "prefill"),
         (2, 6, "decode"),
     ],
 )
@@ -56,6 +54,15 @@ def test_refused(tp, tokens, mode):
     (why,) = spec.pd_reasons(cfg(tp, tokens, mode))
     assert f"PD disaggregation ({mode} role)" in why
     assert f"not at TP{tp} with {tokens} tokens per request" in why
+
+
+@pytest.mark.parametrize("tokens", sorted(t for _, t in TP8))
+def test_the_tp8_prefill_role_is_refused_by_role(tokens):
+    (why,) = spec.pd_reasons(cfg(8, tokens, "prefill"))
+    assert "PD disaggregation (prefill role)" in why
+    assert "only in the decode role" in why
+    assert "without --enable-nvidia-megakernel" in why
+    assert "tokens per request" not in why
 
 
 @pytest.mark.parametrize(
