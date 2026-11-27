@@ -479,9 +479,10 @@ def covers(profile, rows: int, mode: str) -> Optional[str]:
 
 
 def covers_uv(profile, rows: int, mode: str) -> Optional[str]:
-    """None when ``ll.uv_proj`` serves ``rows`` rows (8..32) at 16 heads on GB300."""
-    if tuple(profile.sm) != MEASURED_SM:
-        return f"SM {profile.sm[0]}.{profile.sm[1]} (measured on sm_103 only)"
+    """None when ``ll.uv_proj`` serves ``rows`` rows (8..32) at 16 heads."""
+    why = ll_target.reason(profile)
+    if why is not None:
+        return why
     if profile.heads != 16:
         return f"{profile.heads} heads per rank (16 heads only)"
     if os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_UV_PROJ", "1") == "0":
@@ -771,8 +772,10 @@ class SparseMlaFdFamily:
         return reasons
 
     def provider(self, candidate, rows: int, mode: str) -> SparseMlaFdSteps:
-        if candidate.name == UV_NAME:
+        if candidate is not None and candidate.name == UV_NAME:
             if self.uv16_fn32 is None:
+                if derived_caps(self.profile):
+                    raise Decline(f"{UV_NAME}: not compiled for derived target")
                 raise RuntimeError(f"{UV_NAME}: provider before compile")
             return SparseMlaFdSteps(self, rows, mode)
         if self.plan is None:

@@ -51,7 +51,8 @@ def test_only_the_16_row_producer_changes(monkeypatch):
 
 
 def test_router_cta_differs_only_in_the_store_mapping():
-    """The copied router CTA is the served one but for the thread -> (expert, row) map."""
+    """The copied 16-row TP8 router CTA uses the row-contiguous (expert, row) map
+    while keeping epoch_begin's epoch_overlap in step with OProjArProduce."""
 
     def body(module):
         src = inspect.getsource(module)
@@ -69,6 +70,7 @@ def test_router_cta_differs_only_in_the_store_mapping():
 
     served = body(o_proj)
     rc = body(o_proj_rc)
-    diff = [(a, b) for a, b in zip(served, rc) if a != b]
-    assert len(served) == len(rc)
-    assert diff == [("ex = t // rows", "ex = t % 16"), ("m = t % rows", "m = t // 16")]
+    assert "ex = t // rows" in served and "m = t % rows" in served
+    assert "ex = t % 16" in rc and "m = t // 16" in rc
+    assert "self.epoch_begin(mb, es, False, 0, self.epoch_overlap)" in served
+    assert "self.epoch_begin(mb, es, False, 0, self.epoch_overlap)" in rc

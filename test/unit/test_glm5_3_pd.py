@@ -24,7 +24,10 @@ def cfg(tp, tokens, mode):
     "tp, tokens, mode",
     [
         (8, 4, "decode"),
+        (8, 5, "decode"),
         (8, 6, "decode"),
+        (8, 7, "decode"),
+        (8, 8, "decode"),
         (4, 6, "decode"),
         (4, 3, "decode"),
         (8, 6, "null"),
@@ -38,7 +41,7 @@ def test_served(tp, tokens, mode):
 @pytest.mark.parametrize(
     "tp, tokens, mode",
     [
-        (8, 5, "decode"),
+        (8, 9, "decode"),
         (8, 3, "decode"),
         (8, 6, "prefill"),
         (8, 4, "prefill"),

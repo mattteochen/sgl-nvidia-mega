@@ -37,10 +37,6 @@ def test_engine_forms():
         assert Nvfp4MoeSmallM(mode).knobs() == {}
         assert Nvfp4MoeSmallM(mode, pre=1).knobs() == {}
         assert Nvfp4MoeSmallM(mode, pre=3).knobs() == {"pre": 3}
-        w = api.G12_SHARED_WEIGHT
-        assert Nvfp4MoeSmallM(mode, localize=w).knobs() == {"localize": w}
-        with pytest.raises(ValueError):
-            Nvfp4MoeSmallM(mode, localize=w, pre=3)
     with pytest.raises(ValueError):
         Nvfp4MoeSmallM("g2", merge=False, pre=3)
     with pytest.raises(ValueError):
@@ -48,17 +44,15 @@ def test_engine_forms():
 
 
 @pytest.mark.parametrize("on", [False, True])
-@pytest.mark.parametrize("localize", [False, True])
-def test_compile_specs(monkeypatch, on, localize):
+def test_compile_specs(monkeypatch, on):
     pytest.importorskip("cutlass")
     if on:
         monkeypatch.setenv(api.MOE_PRE3_ENV, "1")
     else:
         monkeypatch.delenv(api.MOE_PRE3_ENV, raising=False)
-    specs = api.compile_specs(shared=True, localize=localize)
-    want = 3 if on and not localize else 1
+    specs = api.compile_specs(shared=True)
+    want = 3 if on else 1
     for mode in ("g1", "g2"):
         kernel = specs[mode][0]
         assert kernel.mode == mode and kernel.pre == want
-        loc = {"localize": api.G12_SHARED_WEIGHT} if localize else {}
-        assert kernel.knobs() == {**loc, **({"pre": 3} if want == 3 else {})}
+        assert kernel.knobs() == ({"pre": 3} if want == 3 else {})
