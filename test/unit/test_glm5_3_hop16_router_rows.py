@@ -72,5 +72,5 @@ def test_router_cta_differs_only_in_the_store_mapping():
     rc = body(o_proj_rc)
     assert "ex = t // rows" in served and "m = t % rows" in served
     assert "ex = t % 16" in rc and "m = t // 16" in rc
-    assert "self.epoch_begin(mb, es, False, 0, self.epoch_overlap)" in served
-    assert "self.epoch_begin(mb, es, False, 0, self.epoch_overlap)" in rc
+    assert "self.epoch_begin(mb, es, True, 0, self.epoch_overlap)" in served
+    assert "self.epoch_begin(mb, es, True, 0, self.epoch_overlap)" in rc

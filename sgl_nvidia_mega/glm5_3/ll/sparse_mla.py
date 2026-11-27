@@ -480,6 +480,8 @@ def covers(profile, rows: int, mode: str) -> Optional[str]:
 
 def covers_uv(profile, rows: int, mode: str) -> Optional[str]:
     """None when ``ll.uv_proj`` serves ``rows`` rows (8..32) at 16 heads."""
+    from sgl_nvidia_mega.glm5_3.ll import target as ll_target
+
     why = ll_target.reason(profile)
     if why is not None:
         return why
