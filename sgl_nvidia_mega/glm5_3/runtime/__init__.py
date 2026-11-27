@@ -63,6 +63,9 @@ LL_SLOTS = (
     "ll.gemm.eh_proj",
     "ll.gemm.lm_head",
     "ll.gemm.q_b",
+    "ll.gemm.wq_b",
+    "ll.gemm.shared_gate_up",
+    "ll.gemm.shared_down",
 )
 SHIPPED_SLOTS += LL_SLOTS
 # Slots that run only when listed in SLOTS_ENV. ll.moe.alt_stream_priority: the TP4

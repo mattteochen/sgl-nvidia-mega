@@ -492,12 +492,15 @@ class AttentionStep:
         key, _ = self._index_kw(attn.indexer, x, step)
         _store_index_k(attn, key, positions, step)
 
+    def _wq_b(self, indexer, q_lora: torch.Tensor) -> torch.Tensor:
+        return indexer.wq_b(q_lora)[0]
+
     def index_q(self, attn, x, q_lora: torch.Tensor, step: StepContext) -> IndexQ:
         """The indexer query (``wq_b``, RoPE, FP8) and its head gates."""
         # _fused_q_prepare_and_store (main af856717), single-stream query half.
         indexer = attn.indexer
         _, weights_raw = self._index_kw(indexer, x, step)
-        q = indexer.wq_b(q_lora)[0].view(-1, indexer.n_heads, indexer.head_dim)
+        q = self._wq_b(indexer, q_lora).view(-1, indexer.n_heads, indexer.head_dim)
         return IndexQ(*_index_q_quant(indexer, q, weights_raw, step.positions))
 
     def _stock_index_steps(self) -> bool:
@@ -524,7 +527,7 @@ class AttentionStep:
         indexer.alt_stream.wait_stream(current_stream)
         key, weights_raw = self._index_kw(indexer, x, step)
         with torch.cuda.stream(indexer.alt_stream):
-            q = indexer.wq_b(q_lora)[0].view(-1, indexer.n_heads, indexer.head_dim)
+            q = self._wq_b(indexer, q_lora).view(-1, indexer.n_heads, indexer.head_dim)
         current_stream.wait_stream(indexer.alt_stream)
         indexer.alt_stream.wait_stream(current_stream)
         q_fp8, weights = _index_q_quant(indexer, q, weights_raw, positions)

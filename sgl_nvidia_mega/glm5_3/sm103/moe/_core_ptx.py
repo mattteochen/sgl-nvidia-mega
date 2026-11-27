@@ -120,6 +120,16 @@ def atom_or_global(address, bits):
 
 
 @ptx_op()
+def red_global_add_f32(address, value):
+    """Relaxed global FP32 reduction add (no return value; L2-resident accumulate)."""
+    return (
+        "red.global.add.f32 [$0], $1;",
+        "l,f",
+        (Int64(address), Float32(value)),
+    )
+
+
+@ptx_op()
 def atom_or_shared(addr, bits):
     """Atomic ``or`` into a shared word through its generic address (the old value is
     discarded)."""

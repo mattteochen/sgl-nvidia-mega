@@ -39,7 +39,7 @@ from typing import Any, Dict, Optional
 
 import torch
 
-from sgl_nvidia_mega.glm5_3.ll.hops import DeferredFinalize, Nvfp4Input
+from sgl_nvidia_mega.glm5_3.ll.hops import DeferredFinalize, DeferredFp32, Nvfp4Input
 from sgl_nvidia_mega.glm5_3.moe.step import MlpSteps
 from sgl_nvidia_mega.glm5_3.registry import Candidate, Decline, DeclinedFamily
 
@@ -312,23 +312,40 @@ class LlMoeFamily:
         # the shared expert's stream (PRIORITY_UNIT), None: each layer's alt stream
         self.shared_stream: Optional[torch.cuda.Stream] = None
         # SM103 TP4 (quarters=8, INTER=512, rows <= 8) persistent NVFP4 MoE engine
+        # + v7 Nvfp4MoePacked (quarters=8, INTER=512, 9 <= rows <= 32)
         self.derived: Any = None
         self.tp: int = 0
         self.sm103_engine = None
         self.sm103_layers: Dict[int, object] = {}
         self.sm103_fn: Dict[str, object] = {}
         self._sm103_keep: list = []
+        self.sm103_packed_fn: Dict[str, object] = {}
+        self.sm103_packed_nc: int = 36
+        self.sm103_packed_out: Optional[torch.Tensor] = None
+        self.sm103_packed_ids: Optional[torch.Tensor] = None
+        self.sm103_packed_wts: Optional[torch.Tensor] = None
 
     def _compile_sm103(self) -> None:
+        want_small = (
+            os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_SM103_HOP_MOE", "1") == "1"
+            and any(1 <= w <= 8 for w in self.widths)
+        )
+        want_packed = (
+            os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_SM103_PACKED_MOE", "1")
+            == "1"
+            and any(9 <= w <= 32 for w in self.widths)
+        )
         if (
-            os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_SM103_HOP_MOE", "1") != "1"
+            (not want_small and not want_packed)
             or self.tp != 4
             or self.sm != (10, 3)
             or not self.layers
-            or not any(1 <= w <= 8 for w in self.widths)
         ):
             return
         import cutlass.cute as cute
+        from cutlass import Float32, Int32, Int64
+        from cutlass.cute.runtime import make_fake_stream
+        from sglang.srt.layers.moe.utils import RoutingMethodType
 
         from sgl_nvidia_mega.glm5_3.moe import (
             EXPERTS,
@@ -341,11 +358,13 @@ class LlMoeFamily:
         )
         from sgl_nvidia_mega.glm5_3.runtime.compile import compile_cached
         from sgl_nvidia_mega.glm5_3.sm103.moe import api
+        from sgl_nvidia_mega.glm5_3.sm103.moe import engine_packed as sm103_pack
+        from sgl_nvidia_mega.glm5_3.sm103.moe import routing as sm103_route
         from sgl_nvidia_mega.glm5_3.sm103.moe import weights as W
 
         inter = 512
         quarters = 8
-        for lid, (mlp, _) in self.layers.items():
+        for lid, (mlp, rargs) in self.layers.items():
             ex = mlp.experts
             for name, shape in (
                 ("w13_weight", (EXPERTS, 2 * inter, HIDDEN // 2)),
@@ -392,25 +411,38 @@ class LlMoeFamily:
                 or getattr(cfg, "gemm1_alpha", None) is not None
             ):
                 return
-            gu = mlp.shared_experts.gate_up_proj.weight
-            dn = mlp.shared_experts.down_proj.weight
-            if _bad(gu, torch.bfloat16, (2 * inter, HIDDEN), contiguous=False):
-                return
-            if _bad(dn, torch.bfloat16, (HIDDEN, inter), contiguous=False):
-                return
+            if want_small:
+                gu = mlp.shared_experts.gate_up_proj.weight
+                dn = mlp.shared_experts.down_proj.weight
+                if _bad(gu, torch.bfloat16, (2 * inter, HIDDEN), contiguous=False):
+                    want_small = False
+                if _bad(dn, torch.bfloat16, (HIDDEN, inter), contiguous=False):
+                    want_small = False
             bias = mlp.gate.e_score_correction_bias
             if _bad(bias, torch.float32, (EXPERTS,), contiguous=False):
                 return
+            if want_packed and (
+                rargs.n_group not in (None, 1)
+                or rargs.routing_method_type != int(RoutingMethodType.DeepSeekV3)
+                or rargs.top_k != TOP_K
+                or not bias.is_contiguous()
+            ):
+                want_packed = False
+
+        if not want_small and not want_packed:
+            return
 
         first_mlp = next(iter(self.layers.values()))[0]
         dev = first_mlp.experts.w13_weight.device
+        specs = None
         try:
-            specs = api.compile_specs(
-                shared=True,
-                quarters=quarters,
-                include_g4=False,
-                pre3_default=True,
-            )
+            if want_small:
+                specs = api.compile_specs(
+                    shared=True,
+                    quarters=quarters,
+                    include_g4=False,
+                    pre3_default=True,
+                )
             W.layout_self_test(_process_like_server, dev, inter=inter)
         except Exception as e:  # noqa: BLE001
             logger.warning("GLM LL MoE SM103 TP4 declined: %s", e)
@@ -425,13 +457,20 @@ class LlMoeFamily:
                 _u8(ex.w2_weight_scale.data).reshape(EXPERTS, -1),
                 inter=inter,
             )
-            pack = W.shared_pack(
-                sh.gate_up_proj.weight.data, sh.down_proj.weight.data, inter=inter
+            pack = (
+                W.shared_pack(
+                    sh.gate_up_proj.weight.data, sh.down_proj.weight.data, inter=inter
+                )
+                if want_small
+                else None
             )
             if self.derived is not None:
                 records = self.derived.add("ll.moe.fc2_records", records)
-                pack = self.derived.add("ll.moe.shared_pack", pack)
-            keep.extend((records, pack))
+                if pack is not None:
+                    pack = self.derived.add("ll.moe.shared_pack", pack)
+            keep.append(records)
+            if pack is not None:
+                keep.append(pack)
             lt = api.LayerTensors(
                 w13=ex.w13_weight.data,
                 w13_scales=_u8(ex.w13_weight_scale.data).reshape(EXPERTS, -1),
@@ -445,34 +484,86 @@ class LlMoeFamily:
             lt.check(quarters=quarters)
             sm103_layers[lid] = lt
 
-        modes = {api.mode_for(moe_split(w)) for w in self.widths if 1 <= w <= 8}
-        fn: Dict[str, object] = {}
-        for name in sorted({"route", "finalize"} | modes):
-            kernel, args = specs[name]
-            constexprs = {"unit": name, "shared": True}
-            if hasattr(kernel, "knobs"):
-                constexprs.update(kernel.knobs())
-            fn[name] = compile_cached(
-                kernel,
-                constexprs,
-                lambda k=kernel, a=args: cute.compile(k, *a),
-            )
         nclusters = api.default_clusters(dev)
-        self.sm103_fn = fn
         self.sm103_layers = sm103_layers
-        self.sm103_engine = api.SmallMMoe(
-            fn, nclusters, dev, shared=True, quarters=quarters
-        )
         self._sm103_keep = keep
-        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
-            logger.info(
-                "GLM LL MoE: SM103 TP4 persistent Nvfp4MoeSmallM (quarters=%d, inter=%d, modes=%s, nclusters=%d) compiled for %d layers (rows <= 8)",
-                quarters,
-                inter,
-                sorted(modes),
-                nclusters,
-                len(sm103_layers),
+
+        if want_small and specs is not None:
+            modes = {api.mode_for(moe_split(w)) for w in self.widths if 1 <= w <= 8}
+            fn: Dict[str, object] = {}
+            for name in sorted({"route", "finalize"} | modes):
+                kernel, args = specs[name]
+                constexprs = {"unit": name, "shared": True}
+                if hasattr(kernel, "knobs"):
+                    constexprs.update(kernel.knobs())
+                fn[name] = compile_cached(
+                    kernel,
+                    constexprs,
+                    lambda k=kernel, a=args: cute.compile(k, *a),
+                )
+            self.sm103_fn = fn
+            self.sm103_engine = api.SmallMMoe(
+                fn, nclusters, dev, shared=True, quarters=quarters
             )
+            if (
+                not torch.distributed.is_initialized()
+                or torch.distributed.get_rank() == 0
+            ):
+                logger.info(
+                    "GLM LL MoE: SM103 TP4 persistent Nvfp4MoeSmallM (quarters=%d, inter=%d, modes=%s, nclusters=%d) compiled for %d layers (rows <= 8)",
+                    quarters,
+                    inter,
+                    sorted(modes),
+                    nclusters,
+                    len(sm103_layers),
+                )
+
+        if want_packed:
+            z = Int64(0)
+            one = Float32(1.0)
+            fstr = make_fake_stream()
+            nc_env = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_PACKED_NC", "")
+            nc_packed = int(nc_env) if nc_env else nclusters
+            pfn: Dict[str, object] = {}
+            k_route = sm103_route.MoeRouteTop8(max_rows=32, multi_cta=True)
+            a_route = (z, z, one, z, z, Int32(28), fstr)
+            pfn["route32"] = compile_cached(
+                k_route,
+                {"unit": "route32", **k_route.knobs()},
+                lambda k=k_route, a=a_route: cute.compile(k, *a),
+            )
+            for qa in (1, 2):
+                k_pk = sm103_pack.Nvfp4MoePacked(quarters=quarters, q_acc=qa, pre=3)
+                a_pk = (
+                    z, z, z, z, z, z, z, one, Int32(28), z, z, z, Int32(nc_packed), fstr
+                )
+                pfn[f"packed_q{qa}"] = compile_cached(
+                    k_pk,
+                    {"unit": f"packed_q{qa}", **k_pk.knobs()},
+                    lambda k=k_pk, a=a_pk: cute.compile(k, *a),
+                )
+            self.sm103_packed_fn = pfn
+            self.sm103_packed_nc = nc_packed
+            self.sm103_packed_out = torch.zeros(
+                (32, HIDDEN), dtype=torch.float32, device=dev
+            )
+            self.sm103_packed_ids = torch.empty(
+                (32, TOP_K), dtype=torch.int32, device=dev
+            )
+            self.sm103_packed_wts = torch.empty(
+                (32, TOP_K), dtype=torch.float32, device=dev
+            )
+            if (
+                not torch.distributed.is_initialized()
+                or torch.distributed.get_rank() == 0
+            ):
+                logger.info(
+                    "GLM LL MoE: SM103 TP4 Nvfp4MoePacked (quarters=%d, inter=%d, q_acc=1/2, nclusters=%d) compiled for %d layers (9 <= rows <= 32)",
+                    quarters,
+                    inter,
+                    nc_packed,
+                    len(sm103_layers),
+                )
 
     def sm103_records(self, m: int):
         from sgl_nvidia_mega.glm5_3.moe import HIDDEN, TOP_K, MoeRecords
@@ -496,6 +587,10 @@ class LlMoeFamily:
         facts = dict(target=self.target, sms=self.sms)
         for mlp, _ in self.layers.values():
             ll.build_linear("router", mlp.gate, self.widths, **facts)
+            sh = getattr(mlp, "shared_experts", None)
+            if _bf16_shared_mlp(sh):
+                ll.build_linear("shared_gate_up", sh.gate_up_proj, self.widths, **facts)
+                ll.build_linear("shared_down", sh.down_proj, self.widths, **facts)
         for mlp in self.dense.values():
             ll.build_linear("dense_down", mlp.down_proj, self.widths, **facts)
         self._compile_sm103()
@@ -587,6 +682,31 @@ def priority_stream(device=None) -> torch.cuda.Stream:
     return stream
 
 
+def _bf16_shared_mlp(sh) -> bool:
+    """Whether ``shared_experts`` is a plain un-reduced BF16 SwiGLU MLP eligible for
+    ``ll.linear("shared_gate_up" / "shared_down")``."""
+    if sh is None:
+        return False
+    gu = getattr(sh, "gate_up_proj", None)
+    dn = getattr(sh, "down_proj", None)
+    if gu is None or dn is None or getattr(sh, "act_fn", None) is None:
+        return False
+    if (
+        getattr(sh, "swiglu_limit", None) is not None
+        or getattr(sh, "_enable_nvfp4_gemm_swiglu_fusion", False)
+        or getattr(dn, "reduce_results", False)
+    ):
+        return False
+    return (
+        getattr(gu, "weight", None) is not None
+        and gu.weight.dtype == torch.bfloat16
+        and getattr(gu, "bias", None) is None
+        and getattr(dn, "weight", None) is not None
+        and dn.weight.dtype == torch.bfloat16
+        and getattr(dn, "bias", None) is None
+    )
+
+
 def moe_forward(
     mlp,
     args: RoutedArgs,
@@ -609,10 +729,91 @@ def moe_forward(
     else:
         fp4, sf = quantize_input(x, args)
     gemm2_out, weights, idx = routed_deferred(args, logits, fp4, sf)
+    sh = mlp.shared_experts
     with torch.cuda.stream(side):
-        shared = mlp.shared_experts(x)
+        if _bf16_shared_mlp(sh):
+            gu = ll.linear("shared_gate_up", sh.gate_up_proj, x)
+            shared = ll.linear("shared_down", sh.down_proj, sh.act_fn(gu))
+        else:
+            shared = sh(x)
     current.wait_stream(side)
     return DeferredFinalize(gemm2_out, weights, idx, shared, args.top_k)
+
+
+def moe_forward_packed(
+    family: LlMoeFamily,
+    lid: int,
+    mlp,
+    args: RoutedArgs,
+    x: torch.Tensor,
+    nvfp4: Optional[Nvfp4Input],
+    packed_key: str,
+    stream: Optional[torch.cuda.Stream] = None,
+):
+    """One MoE layer's ``DeferredFp32`` using SM103 ``MoeRouteTop8(multi_cta=True)``
+    + ``Nvfp4MoePacked`` (9 <= rows <= 32), overlapped with ``shared_experts`` on
+    ``stream`` (default ``mlp.alt_stream``). The next hop's ``GlmLLMnnvlFp32ZeroOneshot``
+    reads and zeroes ``family.sm103_packed_out[:rows]`` in place and adds ``shared``."""
+    from cutlass import Float32, Int32, Int64
+
+    from sgl_nvidia_mega.glm5_3 import ll
+    from sgl_nvidia_mega.glm5_3.runtime.compile import cu_stream
+
+    rows = x.shape[0]
+    side = mlp.alt_stream if stream is None else stream
+    current = torch.cuda.current_stream()
+    side.wait_stream(current)
+
+    logits = ll.linear("router", mlp.gate, x)
+    if nvfp4 is not None:
+        fp4, sf = nvfp4.fp4, nvfp4.sf
+    else:
+        fp4, sf = quantize_input(x, args)
+
+    cstr = cu_stream(x.device)
+    ids_buf = family.sm103_packed_ids
+    wts_buf = family.sm103_packed_wts
+    out_fp32 = family.sm103_packed_out
+    rscale = float(
+        args.routed_scaling_factor if args.routed_scaling_factor is not None else 1.0
+    )
+    bias = mlp.gate.e_score_correction_bias
+    family.sm103_packed_fn["route32"](
+        Int64(logits.data_ptr()),
+        Int64(bias.data_ptr()),
+        Float32(rscale),
+        Int64(ids_buf.data_ptr()),
+        Int64(wts_buf.data_ptr()),
+        Int32(rows),
+        cstr,
+    )
+    lt = family.sm103_layers[lid]
+    family.sm103_packed_fn[packed_key](
+        Int64(lt.w13.data_ptr()),
+        Int64(fp4.data_ptr()),
+        Int64(sf.data_ptr()),
+        Int64(ids_buf.data_ptr()),
+        Int64(wts_buf.data_ptr()),
+        Int64(lt.g1_alpha.data_ptr()),
+        Int64(lt.g2_alpha.data_ptr()),
+        Float32(lt.gs2),
+        Int32(rows),
+        Int64(out_fp32.data_ptr()),
+        Int64(lt.w13_scales.data_ptr()),
+        Int64(lt.fc2_records.data_ptr()),
+        Int32(family.sm103_packed_nc),
+        cstr,
+    )
+
+    sh = mlp.shared_experts
+    with torch.cuda.stream(side):
+        if _bf16_shared_mlp(sh):
+            gu = ll.linear("shared_gate_up", sh.gate_up_proj, x)
+            shared = ll.linear("shared_down", sh.down_proj, sh.act_fn(gu))
+        else:
+            shared = sh(x)
+    current.wait_stream(side)
+    return DeferredFp32(out_fp32[:rows], shared)
 
 
 class LlMlp(MlpSteps):
@@ -624,6 +825,12 @@ class LlMlp(MlpSteps):
         # PRIORITY_MAX_ROWS rows (when on), else the layer's alternate stream
         self.shared_stream = family.shared_stream if rows <= PRIORITY_MAX_ROWS else None
         self.use_sm103 = rows <= 8 and family.sm103_engine is not None
+        self.use_sm103_packed = (9 <= rows <= 32) and bool(family.sm103_packed_fn)
+        qa_env = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_PACKED_QACC", "auto")
+        if qa_env in ("1", "2"):
+            self._packed_key = f"packed_q{qa_env}"
+        else:
+            self._packed_key = "packed_q1" if (19 <= rows <= 25) else "packed_q2"
         if self.use_sm103:
             from sgl_nvidia_mega.glm5_3.moe import moe_split
 
@@ -652,6 +859,17 @@ class LlMlp(MlpSteps):
             raise RuntimeError(
                 f"GLM LL MoE layer {lid}: the NVFP4 input of layer {nvfp4.layer_id} "
                 "is not this layer's input"
+            )
+        if self.use_sm103_packed and lid in self.f.sm103_layers:
+            return moe_forward_packed(
+                self.f,
+                lid,
+                mlp,
+                args,
+                x,
+                nvfp4,
+                self._packed_key,
+                self.shared_stream,
             )
         return moe_forward(mlp, args, x, nvfp4, self.shared_stream)
 

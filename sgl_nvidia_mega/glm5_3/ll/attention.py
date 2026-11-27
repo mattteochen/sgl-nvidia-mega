@@ -454,7 +454,7 @@ class LLAttention(AttentionStep):
                 qkv = fused_a_wide(x, w, form[1])
         if (
             self.family.prologue32_fn is not None
-            and 9 <= x.shape[0] <= 32
+            and 9 <= x.shape[0] <= self.family.prologue_mid_max
             and self._runs_indexer(attn, step)
             and step.index_kw is None
         ):
@@ -467,9 +467,65 @@ class LLAttention(AttentionStep):
         """``q_b_proj_forward`` (``[rows, heads, qk_head_dim]``)."""
         form = self.forms.q_b
         if form is None:
+            qb = getattr(attn, "q_b_proj", None)
+            if qb is not None and getattr(qb, "weight", None) is not None:
+                return ll.linear("q_b", qb, q).view(
+                    -1, attn.num_local_heads, attn.qk_head_dim
+                )
             return attn.q_b_proj_forward(q)
         out = fused_a_ll(q, attn.q_b_proj.weight, ilp=form[1], deep=False)
         return out.view(-1, attn.num_local_heads, attn.qk_head_dim)
+
+    def _wq_b(self, indexer, q_lora: torch.Tensor) -> torch.Tensor:
+        return ll.linear("wq_b", indexer.wq_b, q_lora)
+
+    def indexer_split(
+        self, attn, step: StepContext, run_indexer: bool
+    ) -> Optional[str]:
+        if (
+            self.rows > max(8, self.family.prologue_mid_max)
+            and run_indexer
+            and self._runs_indexer(attn, step)
+            and attn.alt_stream is not None
+            and os.environ.get(
+                "SGLANG_NVIDIA_MEGAKERNEL_GLM_TP4_INDEXER_SPLIT", "1"
+            )
+            == "1"
+        ):
+            return "qkv"
+        return None
+
+    def split_stream(self, attn):
+        return attn.alt_stream
+
+    def prologue_front(
+        self, attn, x, qkv_latent: torch.Tensor, step: StepContext
+    ) -> torch.Tensor:
+        q = qkv_latent[..., : attn.q_lora_rank]
+        q_lora = attn.q_a_layernorm(q)
+        self._split_q_lora = q_lora
+        attn.alt_stream.wait_stream(torch.cuda.current_stream())
+        self.index_k(attn, x, step.positions, step)
+        return q_lora
+
+    def prologue_back(
+        self, attn, qkv_latent: torch.Tensor, step: StepContext, side
+    ) -> PrologueOut:
+        q_lora = self._split_q_lora
+        self._split_q_lora = None
+        latent_cache = qkv_latent[..., attn.q_lora_rank :]
+        k_nope = latent_cache[..., : attn.kv_lora_rank]
+        with torch.cuda.stream(side):
+            if not self.fold:
+                k_nope = attn.kv_a_layernorm(k_nope)
+            k_nope = k_nope.unsqueeze(1)
+            q = self._q_b(attn, q_lora)
+            q_nope, q_pe, k_pe = attn._split_q_nope_pe(q, latent_cache)
+            q_nope_out = super().q_absorb(attn, q_nope, step)
+            step.q_fp8 = self.rope_cache(
+                attn, q_nope_out, q_pe, k_nope, k_pe, step
+            )
+        return PrologueOut(q_lora, None, None, None, None)
 
     def prologue(
         self, attn, qkv_latent: torch.Tensor, step: StepContext
@@ -1220,6 +1276,11 @@ class AttentionFamily:
             for a in self.attns
             if getattr(a, "indexer", None) is not None
         }
+        for a in self.attns:
+            if getattr(a, "q_b_proj", None) is not None:
+                ll.build_linear("q_b", a.q_b_proj, widths, target=target, sms=sms)
+            if getattr(a, "indexer", None) is not None and getattr(a.indexer, "wq_b", None) is not None:
+                ll.build_linear("wq_b", a.indexer.wq_b, widths, target=target, sms=sms)
         self.kw_gemm = "; ".join(sorted(d for d in kw if d))
         self.fold = self._decide_fold(widths)
         _kv_half_module(self.fold.fold, False, pdl, self.trigger_at_entry)

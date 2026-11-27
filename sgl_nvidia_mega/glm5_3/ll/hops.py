@@ -304,6 +304,19 @@ class DeferredFinalize:
 
 
 @dataclass
+class DeferredFp32:
+    """Atomic-accumulated [M, H] fp32 MoE partial (+ optional [M, H] bf16 shared
+    output) consumed and zeroed in place by the next hop (GlmLLMnnvlFp32ZeroOneshot)."""
+
+    fp32_acc: torch.Tensor
+    shared_output: Optional[torch.Tensor] = None
+
+    @property
+    def rows(self) -> int:
+        return int(self.fp32_acc.shape[0])
+
+
+@dataclass
 class Nvfp4Input:
     """The NVFP4 quant of a MoE layer's input (P10), handed from its post-attention
     hop to its routed experts: ``fp4`` ``[M, H / 2]`` uint8, ``sf`` ``[M, H / 16]``
@@ -734,6 +747,28 @@ class LlHopFamily:
             identity_rows=fin.identity_rows,
         )
 
+    def fp32_zero(self, df: DeferredFp32, residual, gamma, *, site: int):
+        """``(norm, residual out)`` consuming an atomic-accumulated [M, H] fp32 MoE
+        partial (zeroed in place) + optional bf16 shared partial."""
+        rows = residual.shape[0]
+        if df.rows != rows:
+            raise RuntimeError(f"MoE fp32 handoff of {df.rows} rows at a {rows}-row hop")
+        plan = self._need(
+            plain_plan(self.world, rows, self.hidden, self.sm_count),
+            rows,
+            "fp32_zero",
+        )
+        return transport.fp32_zero_ar_rmsnorm(
+            self.buffer,
+            df.fp32_acc,
+            df.shared_output,
+            residual,
+            gamma,
+            self.eps,
+            plan,
+            site=site,
+        )
+
     def sm103_o_proj(self, layer, o_input, residual, step=None):
         i = layer.layer_id - self.sm103_first
         site = self.site(layer.layer_id, 0)
@@ -819,7 +854,7 @@ class LlHops(HopSteps):
 
     def _hop(self, mlp_out, residual, gamma, site: int, layer_id: Optional[int] = None, step=None):
         if self.use_sm103:
-            if not isinstance(mlp_out, (torch.Tensor, DeferredFinalize)):
+            if not isinstance(mlp_out, (torch.Tensor, DeferredFinalize, DeferredFp32)):
                 if (
                     step is not None
                     and layer_id is not None
@@ -835,6 +870,8 @@ class LlHops(HopSteps):
                 return self.f.sm103_allreduce_norm(
                     mlp_out, residual, gamma, site=site
                 )
+        if isinstance(mlp_out, DeferredFp32):
+            return self.f.fp32_zero(mlp_out, residual, gamma, site=site)
         if isinstance(mlp_out, DeferredFinalize):
             return self.f.finalize(mlp_out, residual, gamma, site=site)
         if isinstance(mlp_out, torch.Tensor):

@@ -152,6 +152,9 @@ GEMM_UNITS = tuple(
         "eh_proj",
         "lm_head",
         "q_b",
+        "wq_b",
+        "shared_gate_up",
+        "shared_down",
     )
 )
 OPTIONS: Tuple[str, ...] = (
