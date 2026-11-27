@@ -13,11 +13,11 @@ MODEL = os.environ.get(
 )
 # An already running server, so the same checks can score one arm launched elsewhere
 URL = os.environ.get("SGLANG_NVIDIA_MEGAKERNEL_E2E_URL")
-# Both arms' environment, as docs/models/glm5_3.md launches it: the candidate's NextN
-# draft step (slot draft) reads the replicated embedding table, and the flag does not
-# set the variable (the spec checks its environment per TP size, outside
-# Requirements.env, so SGLang's FLAG_SETS_ENV skips it). The baseline gets it too, so
-# the arms differ only in the flag; SGLang's defaults give the rest of spec.ENV.
+# Both arms' environment: the candidate's NextN draft step (slot draft) reads the
+# replicated embedding table. The baseline runs without the flag, so nothing would set
+# the variable for it; setting it here for both arms keeps their embedding layout the
+# same, so the arms differ only in the flag. SGLang's defaults give the rest of
+# spec.ENV.
 ENV = {"SGLANG_ENABLE_EMBED_REPLICATION": "1"}
 # Tokens per request of the MTP chain (--speculative-num-draft-tokens)
 TOKENS = 6

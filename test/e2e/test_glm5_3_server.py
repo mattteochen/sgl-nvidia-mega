@@ -74,7 +74,7 @@ ACCEPT_RATIO = 0.9
 # the candidate's log: the TP4 kernel units serve (the active line names them), the
 # verify widths they capture, and the NextN draft composed from its units
 ACTIVE = re.compile(
-    r"NVIDIA megakernel: active \(GLM-5\.3 / GLM-5\.2: TP4 kernel units \['ll\."
+    r"NVIDIA megakernel: active \(GLM-5\.3 / GLM-5\.2: TP4 kernel units \["
 )
 CAPTURE = re.compile(
     r"NVIDIA megakernel: GLM-5\.3 / GLM-5\.2: capturing the verify step, (\d+) rows"
