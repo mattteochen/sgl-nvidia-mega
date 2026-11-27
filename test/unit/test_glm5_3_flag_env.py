@@ -24,7 +24,11 @@ NAME = "SGLANG_ENABLE_EMBED_REPLICATION"
 
 @pytest.fixture(autouse=True)
 def _unset(monkeypatch):
-    monkeypatch.delenv(NAME, raising=False)
+    # setenv first so that monkeypatch records the variable even when it is absent:
+    # teardown then restores its original state, including the value the spec writes
+    # straight to os.environ during a test, so it does not reach later test files.
+    monkeypatch.setenv(NAME, "")
+    monkeypatch.delenv(NAME)
 
 
 @pytest.fixture
